@@ -697,3 +697,172 @@ def test_main_refuses_cpu_device_on_a_runpod_pod(tmp_path: Path, clock: Any, poo
 
 def test_main_allows_cpu_device_off_pod(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
     assert _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory) == 0
+
+
+# --- deadline, SIGTERM and offline report (final-review I2) ---------------------------------------
+
+
+def test_settings_read_deadline_and_report_reserve(tmp_path: Path) -> None:
+    s = load_settings(_env(tmp_path))
+    assert (s.deadline_epoch, s.report_reserve_s) == (None, 300.0)
+
+    s = load_settings(_env(tmp_path, SWEEP_DEADLINE_EPOCH="1800000000", SWEEP_REPORT_RESERVE_S="60"))
+    assert (s.deadline_epoch, s.report_reserve_s) == (1_800_000_000.0, 60.0)
+
+
+def test_settings_reject_bad_deadline(tmp_path: Path) -> None:
+    with pytest.raises(SettingsError, match="^SWEEP_DEADLINE_EPOCH"):
+        load_settings(_env(tmp_path, SWEEP_DEADLINE_EPOCH="soon"))
+
+
+def _deadline_run(tmp_path: Path, clock: Any, pool_factory: Any, deadline: float) -> int:
+    # Cap 100: the deadline (about 17 USD of fake pod time away), not cap - margin, binds.
+    env = _env(
+        tmp_path,
+        SWEEP_CAP_USD="100",
+        SWEEP_R0_STEPS="10000000",
+        SWEEP_DEADLINE_EPOCH=str(deadline),
+    )
+    return main(
+        [],
+        environ=env,
+        clock=clock,
+        epoch_clock=clock,
+        pool_factory=pool_factory,
+        report_sink_factory=lambda project, group, mode: RecordingSink(),
+        device="cpu",
+    )
+
+
+def test_deadline_refuses_jobs_that_would_run_past_it_and_writes_the_report(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    # Fake epoch = fake clock. Calibration ends near t = 1150; the first four 783 s jobs end
+    # near 1933; four more would end near 2716 > 3000 - 300, so the guard refuses them.
+    deadline = clock.t + 2000.0
+
+    code = _deadline_run(tmp_path, clock, pool_factory, deadline)
+
+    report = json.loads((tmp_path / "sweep" / "report.json").read_text())
+    assert code == 0
+    assert report["extra"]["stop_reason"].startswith("deadline: the next job would run past")
+    assert clock.t <= deadline - 300.0
+    assert (tmp_path / "sweep" / "report.md").exists()
+
+
+def test_deadline_kills_jobs_still_running_and_writes_the_report(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    # Jobs take 3x their estimate, so the four started near 1150 are still running at the
+    # stop time (deadline - 300 = 2700): they are killed and stay in flight for a resume.
+    world.slowdown = lambda spec: 3.0
+    world.enforce_timeouts = False
+    deadline = clock.t + 2000.0
+    state = tmp_path / "sweep"
+
+    code = _deadline_run(tmp_path, clock, pool_factory, deadline)
+
+    report = json.loads((state / "report.json").read_text())
+    assert code == 0
+    assert report["extra"]["stop_reason"] == (
+        "deadline: stopped SWEEP_REPORT_RESERVE_S before SWEEP_DEADLINE_EPOCH"
+    )
+    assert clock.t <= deadline - 300.0 + 5.0  # one 5 s poll of slack
+    assert json.loads((state / "scheduler.json").read_text())["running"]
+    assert (state / "report.md").exists()
+
+
+def test_sweep_report_rebuilds_the_report_from_saved_state(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    from resetsweep.sweep.main import report_main
+
+    state = tmp_path / "sweep"
+    assert _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory) == 0
+    original = json.loads((state / "report.json").read_text())
+    (state / "report.json").unlink()
+    (state / "report.md").unlink()
+
+    assert report_main(["--state-dir", str(state)]) == 0
+
+    rebuilt = json.loads((state / "report.json").read_text())
+    assert {k: v for k, v in rebuilt.items() if k != "extra"} == {
+        k: v for k, v in original.items() if k != "extra"
+    }
+    assert rebuilt["extra"]["stop_reason"] == "rebuilt offline by sweep-report"
+    assert (state / "report.md").exists()
+
+
+def test_sweep_report_refuses_a_dir_without_state(tmp_path: Path) -> None:
+    from resetsweep.sweep.main import report_main
+
+    assert report_main(["--state-dir", str(tmp_path)]) == 2
+
+
+def test_sweep_report_is_a_console_script() -> None:
+    import tomllib
+
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())
+    assert pyproject["project"]["scripts"]["sweep-report"] == "resetsweep.sweep.main:report_main"
+
+
+CHILD = '''
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from conftest import FakeClock, FakePool, FakeWorld
+from resetsweep.sweep import main as m
+
+state = Path(sys.argv[2])
+world = FakeWorld(clock=FakeClock(1000.0))
+
+class BlockingPool(FakePool):
+    """Calibration runs in fake time; sweep jobs never finish, so the loop blocks in poll."""
+    def poll(self, timeout_s):
+        if any(j.rung >= 0 for j in self.running()):
+            (state / "READY").write_text("1")
+            time.sleep(0.05)
+            return []
+        return super().poll(timeout_s)
+
+sys.exit(m.main([], clock=world.clock, device="cpu",
+    pool_factory=lambda n, d, c: BlockingPool(world, n, d, c),
+    report_sink_factory=lambda p, g, mode: m.NullReportSink()))
+'''
+
+
+def test_sigterm_kills_workers_saves_state_and_writes_the_report(tmp_path: Path) -> None:
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    state = tmp_path / "sweep"
+    state.mkdir()
+    env = {**os.environ, **_env(tmp_path, SWEEP_SMOKE="1", SWEEP_R0_STEPS="10000000")}
+    env.pop("RUNPOD_POD_ID", None)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", CHILD, str(Path(__file__).parent), str(state)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        for _ in range(1200):  # at most 60 s for imports and fake calibration
+            if (state / "READY").exists() or proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert (state / "READY").exists(), proc.communicate(timeout=30)[0]
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert proc.returncode == 128 + signal.SIGTERM, out
+    report = json.loads((state / "report.json").read_text())
+    assert report["extra"]["stop_reason"] == "terminated by SIGTERM"
+    assert (state / "report.md").exists()
+    assert json.loads((state / "scheduler.json").read_text())["running"]

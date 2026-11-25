@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 sweep-launch = "resetsweep.launch.launcher:main"
 sweep-run = "resetsweep.sweep.main:main"
+sweep-report = "resetsweep.sweep.main:report_main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]

@@ -14,6 +14,10 @@ survives pod restarts (Review Focus 2).
   will still pay for, at the current price) would pass ``cap - margin``. The caller decides how
   jobs map to pod-seconds (the sweep loop: in_flight_s = the longest remaining in-flight wall
   clock, est_job_s = how far the new job reaches past it).
+- Work deadline (final-review I2): with `stop_at` (a time on the guard's clock), the limit is
+  ``min(cap - margin, spend at stop_at)``, so `can_start` refuses a job that would run past it
+  and `remaining()` reaches 0 at `stop_at`: the sweep loop then kills every job and writes the
+  report while the pod still has its report reserve.
 - A torn last ledger line (a crash mid-append) is truncated with a warning; any earlier bad
   line, or a spend that goes down, raises `LedgerError`: the ledger is the record of money.
 
@@ -80,6 +84,7 @@ class BudgetGuard:
         ledger_path: Path,
         clock: Callable[[], float] = time.monotonic,
         utc_now: Callable[[], str] = _utc_now,
+        stop_at: float | None = None,
     ) -> None:
         _check_price("cap_usd", cap_usd, allow_zero=False)
         _check_price("margin_usd", margin_usd, allow_zero=True)
@@ -92,6 +97,9 @@ class BudgetGuard:
         self._clock = clock
         self._utc_now = utc_now
         self._t0 = clock()
+        if stop_at is not None and not math.isfinite(stop_at):
+            raise ValueError(f"stop_at must be finite, got {stop_at}")
+        self._stop_at = stop_at
         last = self._read_last_spent()
         self._prior = 0.0 if last is None else last + LEDGER_GAP_S * self.usd_per_s
         self._last_write = -math.inf
@@ -111,8 +119,20 @@ class BudgetGuard:
         return self._prior + self.elapsed_s() * self.usd_per_s
 
     def limit_usd(self) -> float:
-        """The spend that scheduling may not pass: cap - margin."""
-        return self.cap_usd - self.margin_usd
+        """The spend that scheduling may not pass: cap - margin, or the spend at `stop_at` if
+        that is lower."""
+        limit = self.cap_usd - self.margin_usd
+        if self._stop_at is not None:
+            limit = min(limit, self._prior + (self._stop_at - self._t0) * self.usd_per_s)
+        return limit
+
+    def deadline_bound(self) -> bool:
+        """True when `stop_at`, not cap - margin, sets the limit."""
+        return self.limit_usd() < self.cap_usd - self.margin_usd
+
+    def deadline_reached(self) -> bool:
+        """True once the clock has reached `stop_at` (never without one)."""
+        return self._stop_at is not None and self._clock() >= self._stop_at
 
     def remaining(self) -> float:
         """USD left before `limit_usd`; negative once passed."""

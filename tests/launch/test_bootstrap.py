@@ -33,6 +33,9 @@ if [[ $name == curl ]]; then
   printf '%s\n' "$header" >> "$CALLS_LOG.curl-stdin"
   if [[ -n ${CURL_FAIL_MATCH:-} && $header == *"$CURL_FAIL_MATCH"* ]]; then exit 22; fi
 fi
+if [[ $name == uv && "$*" == *sweep-run* ]]; then
+  printf '%s\n' "${SWEEP_DEADLINE_EPOCH:-unset}" >> "$CALLS_LOG.deadline"
+fi
 if [[ $name == runpodctl ]]; then exit "${RUNPODCTL_RC:-0}"; fi
 if [[ $name == sleep ]]; then /bin/sleep 0.05; exit 0; fi
 if [[ $name != curl && -n ${FAIL_STEP:-} && "$name $*" == *"$FAIL_STEP"* ]]; then exit 7; fi
@@ -632,3 +635,13 @@ def test_g5_cuda_gate_program_passes_on_the_pod() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_sweep_run_gets_the_work_deadline_epoch(tmp_path: Path) -> None:
+    """Final-review I2: sweep-run stops (and writes its report) before the TERM at this time."""
+    code, _, _ = _run(tmp_path)
+
+    start = int((tmp_path / "state" / "START-pod-xyz").read_text())
+    seen = (tmp_path / "calls.log.deadline").read_text().split()
+    assert code == 0
+    assert seen == [str(start + 3600 - 600)]  # SWEEP_MAX_HOURS=1, 600 s reserve

@@ -121,7 +121,10 @@ and the volume delete command.
   done, arms by status, current rung per group) and, at the end, the arm table and ranking.
 - **Network volume**, mounted at `/workspace`:
   - `/workspace/sweep/` for a full sweep, `/workspace/sweep-smoke/` for a smoke run
-  - `report.md` and `report.json`: arm table (mean, CI, LCB/UCB, rung, status) and final ranking
+  - `report.md` and `report.json`: arm table (mean, CI, LCB/UCB, rung, status) and final ranking.
+    If the final rung was not reached, the ranking is marked "provisional: ranked at rung k".
+    To rebuild both from the saved state (no W&B, while no `sweep-run` uses the dir):
+    `uv run sweep-report --state-dir /workspace/sweep`
   - `sweep_metrics.jsonl`: a local copy of every live sweep metric (also holds `sink_errors`
     if W&B logging failed)
   - `bootstrap.log`, scheduler state, calibration record, and the pod's spend ledger
@@ -196,7 +199,9 @@ launcher as orphaned, with the same command.
 | 2 | No pod could be created, no data center fits, an earlier pod still exists, or a usage error |
 | 3 | Refused by the budget check |
 
-`sweep-run` (on the pod): 0 finished; 2 bad settings; 3 budget already spent, or calibration
+`sweep-run` (on the pod): 0 finished (also when it stopped at the budget or 300 s before the
+bootstrap's deadline, `SWEEP_DEADLINE_EPOCH`, having written the report); 128 + signal number
+after SIGTERM/SIGINT (workers killed, state saved, report written); 2 bad settings; 3 budget already spent, or calibration
 produced no usable measurement; 4 state dir made by another mode or arm set, or scheduler state
 without its calibration; 5 the rung-0 budget would be below `SWEEP_MIN_R0_STEPS` (the log names
 the numbers and the knobs: fewer tasks, fewer arms, fewer seeds); 6 the device is the CPU on a

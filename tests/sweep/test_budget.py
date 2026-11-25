@@ -235,3 +235,44 @@ def test_every_ledger_line_carries_a_utc_timestamp(tmp_path: Path) -> None:
 
 def test_heartbeat_interval_is_15_s() -> None:
     assert HEARTBEAT_S == 15.0
+
+
+# --- work deadline (final-review I2) -------------------------------------------------------------
+
+
+def test_stop_at_lowers_the_limit_to_the_spend_at_that_time(tmp_path: Path) -> None:
+    # 1 USD per second; the stop is 30 s after the guard starts -> limit 30 USD, below 95.
+    clock = FakeClock(1000.0)
+    guard = BudgetGuard(
+        cap_usd=100.0,
+        margin_usd=5.0,
+        gpu_usd_per_h=3600.0,
+        volume_usd_per_h=0.0,
+        ledger_path=tmp_path / "ledger.jsonl",
+        clock=clock,
+        stop_at=1030.0,
+    )
+
+    assert guard.limit_usd() == pytest.approx(30.0)
+    assert not guard.deadline_reached()
+    assert guard.can_start(29.0, 0.0)
+    assert not guard.can_start(31.0, 0.0)
+    clock.t = 1030.0
+    assert guard.deadline_reached()
+    assert guard.remaining() == pytest.approx(0.0)
+
+
+def test_stop_at_after_the_cap_leaves_the_cap_limit(tmp_path: Path) -> None:
+    clock = FakeClock(1000.0)
+    guard = BudgetGuard(
+        cap_usd=100.0,
+        margin_usd=5.0,
+        gpu_usd_per_h=3600.0,
+        volume_usd_per_h=0.0,
+        ledger_path=tmp_path / "ledger.jsonl",
+        clock=clock,
+        stop_at=10_000.0,
+    )
+
+    assert guard.limit_usd() == pytest.approx(95.0)
+    assert not guard.deadline_reached()

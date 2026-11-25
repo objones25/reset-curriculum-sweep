@@ -27,6 +27,16 @@ Steps:
    by another mode or arm set (`sweep_meta.json`), or a scheduler state without its
    calibration.json, returns 4.
 
+Stopping before the pod's deadline (final-review I2): the bootstrap exports
+`SWEEP_DEADLINE_EPOCH`, the epoch second at which it TERMs this process. The guard's limit
+becomes min(cap - margin, the spend at deadline - `SWEEP_REPORT_RESERVE_S` (default 300 s)): no
+job starts that would run past that time, and at that time every running job is killed (it
+reruns on resume) and the report is written. SIGTERM or SIGINT at any point after calibration
+kills the workers, saves the scheduler state, writes the report (stop reason "terminated by
+SIGTERM") and returns 128 + the signal number; scheduler writes run with both signals blocked,
+so a signal never splits a result from its state save. `sweep-report --state-dir DIR`
+(`report_main`) rebuilds report.md and report.json offline from the saved state.
+
 Live per-sweep metrics (spec 5.6) go to `state_dir/sweep_metrics.jsonl` and the sweep-level W&B
 run every `HEARTBEAT_S` and when the loop stops. A W&B failure, at start or mid-run, is logged,
 counted in `sink_errors` (in the JSONL) and never stops the sweep (`GuardedSweepSink`). Metrics: spend, projected spend (spend + the pod time owed to jobs in flight), jobs
@@ -68,6 +78,7 @@ import json
 import logging
 import math
 import os
+import signal
 import statistics
 import time
 from collections import Counter
@@ -75,7 +86,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, Protocol, get_args
+from types import FrameType
+from typing import Final, NoReturn, Protocol, get_args
 
 from resetsweep.metrics import JsonlSink, WandbMode
 from resetsweep.sweep.arms import Arm, arm_space
@@ -115,6 +127,7 @@ from resetsweep.sweep.report import (
     GuardedSweepSink,
     NullReportSink,
     ReportSink,
+    ReportSource,
     WandbReportSink,
     group_label,
     write_report,
@@ -138,6 +151,7 @@ STATE_DIR_DEFAULT: Final = "/workspace/sweep"
 PROJECT_DEFAULT: Final = "reset-curriculum-sweep"
 LADDER_SHARE: Final = 0.9  # the expected ladder may use 90% of what calibration left
 MIN_R0_STEPS_DEFAULT: Final = 2_000_000
+REPORT_RESERVE_S_DEFAULT: Final = 300.0  # stop this long before SWEEP_DEADLINE_EPOCH
 SEEDS_PER_RUNG: Final = (1, 3, 5)
 ETA: Final = 3
 EVALS_PER_RUN: Final = 20  # eval points per run: the AUC's resolution
@@ -155,6 +169,62 @@ _MAX_EVENTS: Final = 1_000_000  # loop passes that handle a result or a submissi
 
 class SettingsError(ValueError):
     """A sweep setting in the environment is missing or invalid."""
+
+
+class SweepTerminated(BaseException):  # like KeyboardInterrupt: not an Exception
+    """SIGTERM or SIGINT arrived; raised by the signal handler `main` installs."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+        self.name = signal.Signals(signum).name
+
+
+_STOP_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
+
+
+def _on_stop_signal(signum: int, frame: FrameType | None) -> NoReturn:
+    del frame
+    for sig in _STOP_SIGNALS:  # one stop is enough: ignore repeats while the report is written
+        signal.signal(sig, signal.SIG_IGN)
+    raise SweepTerminated(signum)
+
+
+class _SignalSafeScheduler:
+    """Blocks SIGTERM/SIGINT around the scheduler calls that write its state, so a stop
+    signal never lands between appending a result and saving the state that reflects it
+    (`signal.pthread_sigmask`, Unix; a pending signal is delivered when the mask is restored)."""
+
+    def __init__(self, inner: Scheduler) -> None:
+        self.inner = inner
+
+    def _masked[T](self, fn: Callable[[], T]) -> T:
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, set(_STOP_SIGNALS))
+        try:
+            return fn()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+    def next_jobs(self, k: int) -> list[Job]:
+        return self._masked(lambda: self.inner.next_jobs(k))
+
+    def report(self, result: RunResult) -> None:
+        self._masked(lambda: self.inner.report(result))
+
+    def promotions(self) -> None:
+        self._masked(self.inner.promotions)
+
+    def save(self) -> None:
+        self._masked(self.inner.save)
+
+    def is_live(self, job: Job) -> bool:
+        return self.inner.is_live(job)
+
+    def done(self) -> bool:
+        return self._masked(self.inner.done)
+
+    def states(self) -> tuple[ArmState, ...]:
+        return self.inner.states()
 
 
 class BudgetTooSmallError(RuntimeError):
@@ -180,6 +250,8 @@ class Settings:
     eval_n: int
     r0_steps: int | None
     min_r0_steps: int
+    deadline_epoch: float | None
+    report_reserve_s: float
 
 
 def _positive_float(env: Mapping[str, str], name: str) -> float:
@@ -247,6 +319,16 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         eval_n=required_int("SWEEP_EVAL_N", 512),
         r0_steps=_positive_int(environ, "SWEEP_R0_STEPS", None),
         min_r0_steps=required_int("SWEEP_MIN_R0_STEPS", MIN_R0_STEPS_DEFAULT),
+        deadline_epoch=(
+            _positive_float(environ, "SWEEP_DEADLINE_EPOCH")
+            if environ.get("SWEEP_DEADLINE_EPOCH")
+            else None
+        ),
+        report_reserve_s=(
+            _positive_float(environ, "SWEEP_REPORT_RESERVE_S")
+            if environ.get("SWEEP_REPORT_RESERVE_S")
+            else REPORT_RESERVE_S_DEFAULT
+        ),
     )
 
 
@@ -580,7 +662,11 @@ class SweepLoop:
             self._status()
             if self.guard.remaining() <= 0:
                 self._kill_all()
-                reason = "budget exhausted: spend reached cap - margin"
+                reason = (
+                    "deadline: stopped SWEEP_REPORT_RESERVE_S before SWEEP_DEADLINE_EPOCH"
+                    if self.guard.deadline_reached()
+                    else "budget exhausted: spend reached cap - margin"
+                )
                 break
             running = bool(self._pool.running())
             if stopping is not None:
@@ -595,7 +681,12 @@ class SweepLoop:
                 reason = "done"
                 break
             if self._submit_free():
-                stopping = "budget: the next job would pass cap - margin"
+                stopping = (
+                    "deadline: the next job would run past SWEEP_DEADLINE_EPOCH - "
+                    "SWEEP_REPORT_RESERVE_S"
+                    if self.guard.deadline_bound()
+                    else "budget: the next job would pass cap - margin"
+                )
             elif not self._pool.running() and not self._sched.done():
                 raise RuntimeError("no job running, none to start, and the scheduler is not done")
         else:
@@ -748,11 +839,48 @@ def _plan_rungs(
     return rungs
 
 
+def _stop_at(
+    settings: Settings, clock: Callable[[], float], epoch_clock: Callable[[], float]
+) -> float | None:
+    """`SWEEP_DEADLINE_EPOCH - SWEEP_REPORT_RESERVE_S` on the guard's (monotonic) clock."""
+    if settings.deadline_epoch is None:
+        return None
+    left_s = settings.deadline_epoch - settings.report_reserve_s - epoch_clock()
+    _log.info(
+        "work deadline: stop scheduling and kill jobs in %.0f s (%.0f s before epoch %.0f)",
+        left_s,
+        settings.report_reserve_s,
+        settings.deadline_epoch,
+    )
+    return clock() + left_s
+
+
+def _final_report(
+    scheduler: ReportSource,
+    state: Path,
+    sink: ReportSink,
+    *,
+    smoke: bool,
+    extra: Mapping[str, float | str],
+    tick: Callable[[], None] = lambda: None,
+) -> None:
+    write_report(
+        scheduler,
+        state / "report.md",
+        state / "report.json",
+        sink,
+        rank_rung=0 if smoke else None,
+        extra=extra,
+        tick=tick,
+    )
+
+
 def _sweep(
     settings: Settings,
     *,
     device: str,
     clock: Callable[[], float],
+    epoch_clock: Callable[[], float],
     pool_factory: PoolFactory,
     report_sink_factory: ReportSinkFactory,
 ) -> int:
@@ -771,6 +899,7 @@ def _sweep(
         volume_usd_per_h=volume_usd_per_h(NETWORK_VOLUME_GB),
         ledger_path=state / "ledger.jsonl",
         clock=clock,
+        stop_at=_stop_at(settings, clock, epoch_clock),
     )
     _log.info(
         "sweep %s on %s: cap %.2f USD, %.2f spent before this session, smoke=%s",
@@ -881,10 +1010,12 @@ def _run_sweep(
         scheduler = Scheduler(arms=arms, rung_budgets=rungs, state_dir=state, arm_id_of=arm_id_of)
         _log.info("new scheduler: %d arms, rung budgets %s", len(arms), rungs)
 
+    safe = _SignalSafeScheduler(scheduler)
     pool = pool_factory(plan.n_workers, device, runner_cfg)
+    stopped: SweepTerminated | None = None
     try:
         reason = SweepLoop(
-            scheduler=scheduler,
+            scheduler=safe,
             pool=pool,
             guard=guard,
             plan=plan,
@@ -893,9 +1024,16 @@ def _run_sweep(
             smoke=settings.smoke,
             sink=sink,
         ).run()
+    except SweepTerminated as e:
+        # Workers die in pool.close below; their jobs stay in flight in the saved state, so a
+        # resumed sweep reruns them.
+        stopped, reason = e, f"terminated by {e.name}"
+        _log.warning("%s: killing workers, saving state, writing the report", e.name)
     finally:
         pool.close()
         guard.flush()
+    if stopped is not None:
+        safe.save()
 
     extra: dict[str, float | str] = {
         "sweep_id": sweep_id,
@@ -905,14 +1043,8 @@ def _run_sweep(
         "calibration_usd": record.spent_usd,
         "n_workers": float(plan.n_workers),
     }
-    write_report(
-        scheduler,
-        state / "report.md",
-        state / "report.json",
-        sink,
-        rank_rung=0 if settings.smoke else None,
-        extra=extra,
-        tick=guard.heartbeat,
+    _final_report(
+        scheduler, state, sink, smoke=settings.smoke, extra=extra, tick=guard.heartbeat
     )
     guard.flush()
     _log.info(
@@ -922,7 +1054,7 @@ def _run_sweep(
         guard.spent(),
         settings.cap_usd,
     )
-    return 0
+    return 0 if stopped is None else 128 + stopped.signum
 
 
 def _configure_logging() -> None:
@@ -941,6 +1073,7 @@ def main(
     pool_factory: PoolFactory = default_pool_factory,
     report_sink_factory: ReportSinkFactory = _wandb_sweep_sink,
     device: str | None = None,
+    epoch_clock: Callable[[], float] = time.time,
 ) -> int:
     """`sweep-run`. Settings come from the environment (see the module docstring)."""
     parser = argparse.ArgumentParser(
@@ -967,10 +1100,61 @@ def main(
             env.get("RUNPOD_POD_ID"),
         )
         return 6
-    return _sweep(
-        settings,
-        device=device,
-        clock=clock,
-        pool_factory=pool_factory,
-        report_sink_factory=report_sink_factory,
+    previous = {sig: signal.signal(sig, _on_stop_signal) for sig in _STOP_SIGNALS}
+    try:
+        return _sweep(
+            settings,
+            device=device,
+            clock=clock,
+            epoch_clock=epoch_clock,
+            pool_factory=pool_factory,
+            report_sink_factory=report_sink_factory,
+        )
+    except SweepTerminated as e:
+        _log.warning("%s before the sweep loop started: no report to write", e.name)
+        return 128 + e.signum
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _saved_arm_ids(state: Path) -> Callable[[Arm, int], str]:
+    """`arm_id_of` that returns the ids `scheduler.json` recorded, for an offline rebuild that
+    has neither the calibration plan nor the run settings."""
+    from resetsweep.sweep.scheduler import _arm_from_json  # pyright: ignore[reportPrivateUsage] # the state's own codec
+
+    saved = json.loads((state / STATE_FILE).read_text(encoding="utf-8"))
+    arms = [_arm_from_json(row["arm"]) for row in saved["arms"]]
+    budgets = saved["config"]["rung_budgets"]
+    ids = {(arms[i], budgets[rung]): arm_id for i, rung, arm_id in saved["arm_ids"]}
+
+    def arm_id_of(arm: Arm, step_budget: int) -> str:
+        return ids[(arm, step_budget)]
+
+    return arm_id_of
+
+
+def report_main(argv: list[str] | None = None) -> int:
+    """`sweep-report --state-dir DIR`: rebuild report.md and report.json from saved state
+    (no W&B). Run it only while no `sweep-run` uses DIR: loading the scheduler rewrites its
+    scheduler.json (same content, in-flight jobs kept) and truncates a torn results.jsonl tail."""
+    parser = argparse.ArgumentParser(
+        prog="sweep-report", description="Rebuild the sweep report from a state dir."
     )
+    parser.add_argument("--state-dir", required=True, type=Path)
+    args = parser.parse_args(argv)
+    _configure_logging()
+    state: Path = args.state_dir
+    if not (state / STATE_FILE).exists():
+        _log.error("%s has no %s: nothing to rebuild", state, STATE_FILE)
+        return 2
+    meta_path = state / META_FILE
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    scheduler = Scheduler.load(state, arm_id_of=_saved_arm_ids(state))
+    sweep_id_path = state / "sweep_id.txt"
+    extra: dict[str, float | str] = {"stop_reason": "rebuilt offline by sweep-report"}
+    if sweep_id_path.exists():
+        extra["sweep_id"] = sweep_id_path.read_text(encoding="utf-8").strip()
+    _final_report(scheduler, state, NullReportSink(), smoke=meta.get("mode") == "smoke", extra=extra)
+    _log.info("report rebuilt in %s", state / "report.md")
+    return 0

@@ -283,6 +283,9 @@ main() {
   run_step uv sync --frozen
   run_step uv run python -c "$CUDA_GATE"
   run_step uv run pytest -m gpu -q
+  # sweep-run stops scheduling SWEEP_REPORT_RESERVE_S (300 s) before this, kills its workers
+  # and writes the report, so the TERM at the deadline never costs the report.
+  export SWEEP_DEADLINE_EPOCH="$work_deadline"
   run_step uv run sweep-run
   log "sweep finished"
 }
