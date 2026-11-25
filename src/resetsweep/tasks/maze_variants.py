@@ -246,6 +246,13 @@ class MazeCoinflip(Maze):
         base = super().sample_start(n, gen)
         return StartStates(base.qpos, base.qvel, self.init_extra(base, gen))
 
+    def canonical_start(self) -> StartStates:
+        # Draw 0: `init_extra` makes the real draw at every episode start.
+        base = super().canonical_start()
+        started_in_block = self._in_block(base.qpos).float().unsqueeze(1)
+        extra = torch.cat([torch.zeros_like(started_in_block), started_in_block], dim=1)
+        return StartStates(base.qpos, base.qvel, extra)
+
     def init_extra(self, states: StartStates, gen: torch.Generator) -> Tensor:
         draw = (torch.rand(states.n, generator=gen, device=gen.device) < _P_COIN).to(
             states.qpos.device

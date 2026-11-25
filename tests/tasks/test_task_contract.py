@@ -158,3 +158,16 @@ def test_dense_sibling_is_a_registered_task(name: str) -> None:
 
     assert task.dense_sibling in TASKS.names()
     assert task.name == name
+
+
+@pytest.mark.parametrize("name", TASKS.names())
+def test_start_states_extra_width_matches_extra_dim(name: str) -> None:
+    task = _make(name)
+
+    sampled = task.sample_start(N, _gen())
+    canonical = task.canonical_start()
+    evaluated = task.eval_states(N, seed=0)
+
+    assert sampled.extra.shape == (N, task.extra_dim)
+    assert canonical.extra.shape == (1, task.extra_dim)
+    assert evaluated.extra.shape == (N, task.extra_dim)
