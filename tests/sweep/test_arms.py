@@ -137,9 +137,8 @@ def test_uniform_and_point_on_every_task(rung0: list[Arm]) -> None:
         assert {a.task for a in rung0 if a.method == name} == set(SPARSE_TASKS)
     r1 = arm_space("rung1_expand", survivors=[])
     for name in ("uniform", "point"):
-        assert {a.task for a in r1 if a.method == name} == set(SPARSE_TASKS) | set(
-            DENSE_TASKS
-        )
+        # Sparse copies already ran at rung 0; rung 1 adds only the dense tasks.
+        assert {a.task for a in r1 if a.method == name} == set(DENSE_TASKS)
 
 
 def _survivor(rung0: list[Arm], *, task: str, method: str, score: str | None) -> Arm:
@@ -151,17 +150,14 @@ def _survivor(rung0: list[Arm], *, task: str, method: str, score: str | None) ->
 def test_rung1_expand_adds_inverted_and_dense_for_survivors_only(
     rung0: list[Arm],
 ) -> None:
-    survivor = _survivor(rung0, task="maze", method="walk", score="critic_value")
+    survivor = _survivor(rung0, task="maze", method="walk", score="rnd")
     expanded = arm_space("rung1_expand", survivors=[survivor])
     inverted = [a for a in expanded if a.score == "inverted"]
     assert [(a.task, a.method) for a in inverted] == [("maze", "walk")]
-    assert inverted[0].score_kwargs() == {
-        "inner": "critic_value",
-        "inner_kw": {"temperature": 0.01},
-    }
+    assert inverted[0].score_kwargs() == {"inner": "rnd", "inner_kw": {}}
     dense = [a for a in expanded if a.task in DENSE_TASKS and a.method == "walk"]
     assert {a.task for a in dense} == set(DENSE_TASKS)
-    assert {a.score for a in dense} == {"critic_value"}
+    assert {a.score for a in dense} == {"rnd"}
     # No other method gets an inverted or dense arm beyond uniform/point.
     extras = [a for a in expanded if a.method not in {"walk", "uniform", "point"}]
     assert extras == []
@@ -238,3 +234,57 @@ def test_rung0_arm_count_printed(rung0: list[Arm]) -> None:
     assert len(SPARSE_TASKS) == 11
     assert len(rung0) == per_task * 11 == 704
     print(f"rung0 arms: {len(rung0)}")
+
+
+def test_inverted_wraps_the_survivors_score_kw(rung0: list[Arm]) -> None:
+    survivor = _survivor(rung0, task="maze", method="walk", score="critic_value")
+    inverted = [
+        a
+        for a in arm_space("rung1_expand", survivors=[survivor])
+        if a.score == "inverted"
+    ]
+    assert [a.score_kwargs() for a in inverted] == [
+        {"inner": "critic_value", "inner_kw": {"temperature": 0.01}}
+    ]
+
+
+def test_rung1_expand_never_repeats_rung0_arms(rung0: list[Arm]) -> None:
+    survivors = [a for a in rung0 if a.task in {"maze", "maze_trap"}]
+    expanded = arm_space("rung1_expand", survivors=survivors)
+    assert set(expanded) & set(rung0) == set()
+    assert set(expanded) & set(survivors) == set()
+    assert len(expanded) == len(set(expanded))
+
+
+def test_visited_survivor_adds_no_p_task_variants(rung0: list[Arm]) -> None:
+    visited = _survivor_where(rung0, "visited", p_task=0.0)
+    expanded = arm_space("rung1_expand", survivors=[visited])
+    p_variants = [
+        a
+        for a in expanded
+        if a.method == "visited" and (a.task, a.task_kw) == ("maze", ())
+    ]
+    assert p_variants == []
+    # Beyond the maze variant (task_kw set), visited appears only on the dense tasks.
+    plain = {a.task for a in expanded if a.method == "visited" and not a.task_kw}
+    assert plain == set(DENSE_TASKS)
+
+
+def _survivor_where(rung0: list[Arm], method: str, *, p_task: float) -> Arm:
+    return next(
+        a
+        for a in rung0
+        if a.task == "maze"
+        and a.method == method
+        and _kw(a.method_kw).get("p_task") == p_task
+    )
+
+
+def test_critic_value_never_runs_on_dense_tasks(rung0: list[Arm]) -> None:
+    # arm_dense and claw rewards are mostly negative, so V * (vmax - V) is meaningless there.
+    survivors = [a for a in rung0 if a.task == "maze" and a.score == "critic_value"]
+    assert survivors
+    expanded = arm_space("rung1_expand", survivors=survivors)
+    on_dense = [a for a in expanded if a.task in DENSE_TASKS]
+    assert [a for a in on_dense if a.score in {"critic_value", "inverted"}] == []
+    assert [a for a in on_dense if a.method == "walk"] == []

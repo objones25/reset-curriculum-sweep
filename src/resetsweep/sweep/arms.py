@@ -7,6 +7,17 @@ rulings on spec 5.4); `_check_plans_cover_methods` makes a newly registered meth
 until it has a plan.
 
 `score_kw` never carries `seed`: `train.py` injects the score seed itself.
+
+`rung1_expand` notes:
+- Each expansion changes one setting at a time (p_task, own_success order, inverted score,
+  task variant, dense task); they are not crossed.
+- Task variants exist for `maze` (lanes=5) and `maze_trap` (trap_scale 0.5, 2.0) only.
+- It returns only arms that rung 0 did not run, deduplicated in `arm_space`: `visited` gets
+  no p_task variants (rung 0 ran the whole sweep), and `uniform`/`point` are added on the
+  dense tasks only.
+- `critic_value` arms are never put on the dense tasks: the `arm_dense` and `claw` rewards are
+  mostly negative, so `V * (vmax - V)` (scores/critic.py) is meaningless there.
+- The smoke test (tests/test_smoke.py) covers 32 envs on CPU only, not the sweep's sizes.
 """
 
 from collections.abc import Sequence
@@ -185,7 +196,7 @@ def _with_method_kw(arm: Arm, **changes: Any) -> Arm:
 def _expand(arm: Arm) -> list[Arm]:
     """Everything rung 1 adds for one rung-0 survivor, one change at a time."""
     out: list[Arm] = []
-    if arm.method not in _NO_P_TASK:
+    if arm.method not in _NO_P_TASK and arm.method != "visited":
         out += [_with_method_kw(arm, p_task=p) for p in P_TASK_RUNG1]
     if arm.method == "own_success":
         other = [o for o in get_args(Order) if o != arm.method_kwargs()["order"]]
@@ -195,8 +206,13 @@ def _expand(arm: Arm) -> list[Arm]:
         inverted_kw: Kw = (("inner", arm.score), ("inner_kw", arm.score_kw))
         out.append(replace(arm, score="inverted", score_kw=inverted_kw))
     out += [replace(arm, task_kw=kw) for kw in _TASK_VARIANTS.get(arm.task, ())]
-    out += [replace(arm, task=t) for t in DENSE_TASKS]
+    if not _uses_critic_value(arm):
+        out += [replace(arm, task=t) for t in DENSE_TASKS]
     return out
+
+
+def _uses_critic_value(arm: Arm) -> bool:
+    return "critic_value" in (arm.score, dict(arm.score_kw).get("inner"))
 
 
 def _unique(arms: Sequence[Arm]) -> list[Arm]:
@@ -215,11 +231,11 @@ def arm_space(stage: Stage, *, survivors: Sequence[Arm] = ()) -> list[Arm]:
     for s in survivors:
         if s.task not in SPARSE_TASKS or s.task_kw:
             raise ValueError(f"survivor must be a rung 0 arm, got {s.label()}")
-    controls = [
+    dense_controls = [
         a
-        for t in (*SPARSE_TASKS, *DENSE_TASKS)
-        for a in _rung0_arms_for(t)
+        for a in (arm for t in DENSE_TASKS for arm in _rung0_arms_for(t))
         if a.method in _NO_P_TASK
     ]
     added = [a for s in survivors for a in _expand(s)]
-    return [a for a in _unique(controls + added) if a not in set(survivors)]
+    already_run = set(arm_space("rung0")) | set(survivors)
+    return [a for a in _unique(dense_controls + added) if a not in already_run]
