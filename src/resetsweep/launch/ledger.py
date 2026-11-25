@@ -7,8 +7,16 @@ and before each new launch `settle` replaces every entry's `spent_usd` with what
 billing API reports for that pod and that volume since the hour it was created.
 
 File format: `{"version": 1, "launches": [{pod_id, volume_id, gpu_id, gpu_usd_per_h,
-created_at (ISO 8601 with offset), spent_usd, smoke, name, unresolved}, ...]}`. `name` and
-`unresolved` default to null/false so older files still load.
+created_at (ISO 8601 with offset), spent_usd, smoke, name, unresolved, max_hours, repo_sha},
+...]}`. `name`, `unresolved`, `max_hours` and `repo_sha` default to null/false so older files
+still load. `gpu_usd_per_h` is the pod's price per hour (the price the floor uses).
+
+Spend floor (final-review I3): billing runs behind, and reads 0 for a pod that has deleted
+itself, so `settle` never lets a launch's spend fall below
+``gpu_usd_per_h * min(hours since created_at, max_hours)`` for its pod (when both are known)
+plus ``volume_usd_per_h(volume GB) * hours since created_at`` for the launch that first used its
+volume. Billing replaces the floor only once it reports at least as much. The floor is
+deliberately pessimistic: a pod that ended early still counts up to `max_hours` of pod time.
 
 An `unresolved` launch is one whose pod create failed ambiguously (a 5xx or a read timeout
 after sending):
@@ -27,6 +35,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from resetsweep.launch.runpod_client import RunPodClient
+from resetsweep.sweep.budget import NETWORK_VOLUME_GB, volume_usd_per_h
 
 LEDGER_VERSION: Final = 1
 LEDGER_PATH_DEFAULT: Final = Path.home() / ".resetsweep" / "ledger.json"
@@ -48,6 +57,8 @@ class Launch:
     smoke: bool
     name: str | None = None
     unresolved: bool = False
+    max_hours: float | None = None  # the SWEEP_MAX_HOURS the pod got
+    repo_sha: str | None = None  # the commit the pod checked out
 
     def created(self) -> datetime:
         return datetime.fromisoformat(self.created_at)
@@ -84,12 +95,27 @@ def save(path: Path, launches: list[Launch]) -> None:
         raise AssertionError(f"ledger {path} did not read back what was written")
 
 
-def settle(client: RunPodClient, launches: list[Launch]) -> list[Launch]:
-    """Each launch with `spent_usd` set to its pod + volume spend from the billing API.
+def _floor_usd(launch: Launch, *, now: datetime, first_on_volume: bool) -> float:
+    """The least this launch can have cost by `now` (see the module docstring)."""
+    hours = max(0.0, (now - launch.created()).total_seconds() / 3600.0)
+    floor = 0.0
+    pod_may_exist = launch.pod_id is not None or launch.unresolved
+    if pod_may_exist and launch.gpu_usd_per_h is not None and launch.max_hours is not None:
+        floor += launch.gpu_usd_per_h * min(hours, launch.max_hours)
+    if first_on_volume:
+        floor += volume_usd_per_h(NETWORK_VOLUME_GB) * hours
+    return floor
+
+
+def settle(client: RunPodClient, launches: list[Launch], *, now: datetime) -> list[Launch]:
+    """Each launch with `spent_usd` set to its pod + volume spend from the billing API, but
+    never below the spend floor at `now` (see the module docstring).
 
     A volume reused by later launches (`--volume-id`) is billed once, to the earliest launch
     that used it, from that launch's creation hour. Never lowered: billing runs every few
     minutes, so a fresh read can lag an earlier one."""
+    if now.utcoffset() is None:
+        raise ValueError("now must carry a UTC offset")
     first_use: dict[str, int] = {}
     for i, launch in enumerate(launches):
         j = first_use.get(launch.volume_id)
@@ -105,7 +131,8 @@ def settle(client: RunPodClient, launches: list[Launch]) -> list[Launch]:
             spent += client.volume_spend_usd(launch.volume_id, since=since)
         if launch.pod_id is not None:
             spent += client.pod_spend_usd(launch.pod_id, since=since)
-        settled.append(replace(launch, spent_usd=max(spent, launch.spent_usd)))
+        floor = _floor_usd(launch, now=now, first_on_volume=first_use[launch.volume_id] == i)
+        settled.append(replace(launch, spent_usd=max(spent, floor, launch.spent_usd)))
     if len(settled) != len(launches):
         raise AssertionError("settle must keep every launch")
     return settled
@@ -174,4 +201,13 @@ def _parse(path: Path, index: int, item: Any) -> Launch:
         raise LedgerError(f"{where}: unresolved must be true or false")
     if launch.unresolved and (launch.name is None or launch.pod_id is not None):
         raise LedgerError(f"{where}: an unresolved launch needs a name and no pod_id")
+    for field, value in (("gpu_usd_per_h", launch.gpu_usd_per_h), ("max_hours", launch.max_hours)):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int | float) or not value >= 0
+        ):
+            raise LedgerError(f"{where}: {field} must be null or a non-negative number")
+    if launch.repo_sha is not None and (
+        not isinstance(launch.repo_sha, str) or not launch.repo_sha
+    ):
+        raise LedgerError(f"{where}: repo_sha must be null or a non-empty string")
     return launch

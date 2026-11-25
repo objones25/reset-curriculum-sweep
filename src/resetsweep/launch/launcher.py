@@ -234,7 +234,7 @@ def _launch(
     ref: str,
     created: datetime,
 ) -> int:
-    launches = ledger.settle(client, launches)
+    launches = ledger.settle(client, launches, now=created)
     pending = ledger.unresolved(launches)
     if pending:
         names = ", ".join(str(x.name) for x in pending)
@@ -370,7 +370,11 @@ def _launch(
     outcome, pod, gpu = _create_pod(client, plan, volume_id, pod_args)
     if outcome == "ambiguous":
         pending_launch = replace(
-            record, gpu_id=gpu.id, gpu_usd_per_h=gpu.secure_usd_per_h, unresolved=True
+            record,
+            gpu_id=gpu.id,
+            gpu_usd_per_h=gpu.secure_usd_per_h,
+            unresolved=True,
+            max_hours=_sent_max_hours(remaining, gpu, volume.size_gb),
         )
         saved = _save_ledger(
             ledger_path,
@@ -408,7 +412,13 @@ def _launch(
         _err(
             f"sweep-launch: warning: pod cost {usd_per_h} USD/h differs from the catalog's {gpu.secure_usd_per_h}"
         )
-    launch = replace(record, pod_id=pod_id, gpu_id=gpu.id, gpu_usd_per_h=usd_per_h)
+    launch = replace(
+        record,
+        pod_id=pod_id,
+        gpu_id=gpu.id,
+        gpu_usd_per_h=usd_per_h,
+        max_hours=_sent_max_hours(remaining, gpu, volume.size_gb),
+    )
     if not _save_ledger(
         ledger_path,
         [*launches, launch],
@@ -738,6 +748,11 @@ def _print_cost(gpu: GpuType, volume_gb: int) -> None:
     print(
         f"{gpu.id}: {total:.3f} USD/h (gpu {gpu.secure_usd_per_h} + {volume_gb} GB volume {volume:.4f})"
     )
+
+
+def _sent_max_hours(remaining: float, gpu: GpuType, volume_gb: int) -> float:
+    """The SWEEP_MAX_HOURS value the pod body carries, as a number (for the ledger floor)."""
+    return float(_floor2(_max_hours(remaining, gpu, volume_gb)))
 
 
 def _print_max_hours(remaining: float, gpu: GpuType, volume_gb: int) -> None:

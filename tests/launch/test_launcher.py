@@ -342,6 +342,9 @@ def test_launch_recorded_in_ledger_with_pod_id_price_and_time(
                 "smoke": True,
                 "name": "resetsweep-smoke-20261125-103000",
                 "unresolved": False,
+                # I3: the SWEEP_MAX_HOURS sent, (100 - 5) / (0.69 + 20 * 0.07 / 730) rounded down
+                "max_hours": 137.29,
+                "repo_sha": None,
             }
         ],
     }
@@ -1132,3 +1135,23 @@ def test_dry_run_reports_running_pod(
     assert code == 2
     assert {r.method for r in fake_runpod.requests} == {"GET"}
     assert "pod-old (RUNNING)" in err
+
+
+def test_billing_that_reads_zero_is_floored_by_the_earlier_pods_max_hours(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    # Final-review I3. The old pod (0.40 USD/h, max_hours 10) was created 25.25 h before NOW and
+    # billing reads 0: its spend is floored at 0.4 * 10 = 4.00 plus 25.25 h of 20 GB storage
+    # (20 * 0.07 / 730 * 25.25 = 0.048) -> SWEEP_CAP_USD = floor2(100 - 4.048) = 95.95.
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch() | {"max_hours": 10.0}])
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    env = pod["env"]
+    assert isinstance(env, dict)
+    assert code == 0
+    assert env["SWEEP_CAP_USD"] == "95.95"
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert saved["launches"][0]["spent_usd"] == pytest.approx(4.0 + 20 * 0.07 / 730 * 25.25)
