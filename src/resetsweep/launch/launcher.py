@@ -11,7 +11,10 @@ Steps:
 4. Pick a data center with STANDARD network volumes where `--gpu` (or else a fallback) has
    stock. With `--volume-id`, the data center is that volume's. Candidates there are tried in
    order: `--gpu` first, then the fallbacks by ascending live price; GPUs without stock are
-   skipped.
+   skipped. Automatic picks (the default GPU and the fallbacks) must cost at most
+   `--max-usd-per-h` (default 1.20); a GPU named with `--gpu` ignores that ceiling. If nothing
+   at or under the ceiling has stock, exit 2 listing the in-stock GPUs above it, their prices
+   and the command that picks each.
 5. `max_hours = (remaining - margin) / (gpu_usd_per_h + volume_usd_per_h)`, printed.
 6. `--dry-run`: print the request bodies with secrets as "***" and stop (GETs only).
    Otherwise create one 20 GB volume (or reuse `--volume-id`), then the pod. A pod-create 400
@@ -44,6 +47,7 @@ import argparse
 import copy
 import json
 import math
+import shlex
 import subprocess
 import sys
 import time
@@ -72,6 +76,9 @@ from resetsweep.sweep.budget import (
 
 IMAGE: Final = "runpod/pytorch:2.2.0-cu1290-torch291-ubuntu2404"
 GPU_DEFAULT: Final = "NVIDIA GeForce RTX 4090"
+# Automatic picks (the default GPU and every fallback) must cost at most this per hour; a GPU
+# above it runs only when named with --gpu, so the user, not the launcher, accepts the price.
+MAX_USD_PER_H_DEFAULT: Final = 1.20
 # NVIDIA, on CUDA >= 13.2 hosts (mujoco-warp). Exact ids from GET /v2/catalog/gpus,
 # 2026-11-25; listed by that day's Secure price, and re-sorted by the live price at launch.
 GPU_FALLBACKS: Final = (
@@ -166,6 +173,7 @@ def main(
         return _launch(
             client,
             args,
+            argv=list(sys.argv[1:] if argv is None else argv),
             secrets=secrets,
             launches=launches,
             ledger_path=ledger_path or ledger.LEDGER_PATH_DEFAULT,
@@ -187,6 +195,7 @@ def _launch(
     client: RunPodClient,
     args: argparse.Namespace,
     *,
+    argv: list[str],
     secrets: Secrets,
     launches: list[ledger.Launch],
     ledger_path: Path,
@@ -211,17 +220,33 @@ def _launch(
             f"account balance {balance:.2f} USD is below the {remaining:.2f} USD this launch may spend"
         )
     volume = _volume(client, args.volume_id)
+    gpu_id = args.gpu or GPU_DEFAULT
+    gpus, datacenters = client.gpu_types(), client.datacenters()
     plan = _plan(
-        args.gpu, client.gpu_types(), client.datacenters(), only_dc=volume.datacenter
+        gpu_id,
+        gpus,
+        datacenters,
+        only_dc=volume.datacenter,
+        max_usd_per_h=args.max_usd_per_h,
+        explicit=args.gpu is not None,
     )
     if plan is None:
         where = (
             f"data center {volume.datacenter} (volume {volume.id})"
             if volume.reused
-            else (f"no data center with {VOLUME_TYPE} network volumes")
+            else f"no data center with {VOLUME_TYPE} network volumes"
         )
         _err(
-            f"sweep-launch: {where} has no stock of {', '.join(_candidate_ids(args.gpu))}"
+            f"sweep-launch: {where} has stock of {', '.join(_candidate_ids(gpu_id))} "
+            f"at or under {args.max_usd_per_h:.2f} USD/h"
+        )
+        _print_options_over_ceiling(
+            gpu_id,
+            gpus,
+            datacenters,
+            only_dc=volume.datacenter,
+            ceiling=args.max_usd_per_h,
+            argv=argv,
         )
         return 2
     mode = "smoke" if args.smoke else "sweep"
@@ -405,34 +430,95 @@ def _plan(
     datacenters: list[DataCenter],
     *,
     only_dc: str | None,
+    max_usd_per_h: float,
+    explicit: bool,
 ) -> Plan | None:
     """Where to launch and which GPUs to try there, in order; None if nothing fits.
 
     Candidates are `gpu_id` first, then the fallbacks by ascending live price (ties keep
-    `GPU_FALLBACKS` order); only GPUs with stock in the data center are kept. With `only_dc`
+    `GPU_FALLBACKS` order); only GPUs with stock in the data center are kept, and only those at
+    or under `max_usd_per_h` unless it is `gpu_id` named explicitly. With `only_dc`
     (a reused volume's data center) that data center is the only choice. Otherwise the
     STANDARD-volume data center whose best candidate ranks earliest wins, ties broken by how
     many candidates it has in stock (more fallbacks)."""
+    ranked = [
+        g
+        for g in _ranked(gpu_id, gpus)
+        if g.secure_usd_per_h <= max_usd_per_h or (explicit and g.id == gpu_id)
+    ]
+    if only_dc is not None:
+        here = tuple(g for g in ranked if only_dc in g.available_datacenters)
+        return Plan(datacenter=only_dc, candidates=here) if here else None
+    best: tuple[tuple[int, int], Plan] | None = None
+    for dc_id in _eligible_dcs(datacenters):
+        here = tuple(g for g in ranked if dc_id in g.available_datacenters)
+        if not here:
+            continue
+        key = (ranked.index(here[0]), -len(here))
+        if best is None or key < best[0]:
+            best = (key, Plan(datacenter=dc_id, candidates=here))
+    return None if best is None else best[1]
+
+
+def _ranked(gpu_id: str, gpus: list[GpuType]) -> list[GpuType]:
+    """`gpu_id` first, then the fallbacks by ascending live price (stable: ties keep list order)."""
     by_id = {g.id: g for g in gpus}
     fallbacks = sorted(
         (by_id[c] for c in _candidate_ids(gpu_id)[1:] if c in by_id),
         key=lambda g: g.secure_usd_per_h,
     )
-    ranked = ([by_id[gpu_id]] if gpu_id in by_id else []) + fallbacks
-    if only_dc is not None:
-        here = tuple(g for g in ranked if only_dc in g.available_datacenters)
-        return Plan(datacenter=only_dc, candidates=here) if here else None
-    best: tuple[tuple[int, int], Plan] | None = None
-    for dc in datacenters:
-        if VOLUME_TYPE not in dc.network_volume_types:
+    return ([by_id[gpu_id]] if gpu_id in by_id else []) + fallbacks
+
+
+def _eligible_dcs(datacenters: list[DataCenter]) -> list[str]:
+    return [dc.id for dc in datacenters if VOLUME_TYPE in dc.network_volume_types]
+
+
+def _print_options_over_ceiling(
+    gpu_id: str,
+    gpus: list[GpuType],
+    datacenters: list[DataCenter],
+    *,
+    only_dc: str | None,
+    ceiling: float,
+    argv: list[str],
+) -> None:
+    """The in-stock candidates above the ceiling, cheapest first, each with the command that
+    picks it explicitly (the user's other flags kept)."""
+    dcs = [only_dc] if only_dc is not None else _eligible_dcs(datacenters)
+    over = sorted(
+        (g for g in _ranked(gpu_id, gpus) if g.secure_usd_per_h > ceiling),
+        key=lambda g: g.secure_usd_per_h,
+    )
+    rest = _without_gpu_flag(argv)
+    shown = 0
+    for g in over:
+        where = [dc for dc in dcs if dc in g.available_datacenters]
+        if not where:
             continue
-        here = tuple(g for g in ranked if dc.id in g.available_datacenters)
-        if not here:
-            continue
-        key = (ranked.index(here[0]), -len(here))
-        if best is None or key < best[0]:
-            best = (key, Plan(datacenter=dc.id, candidates=here))
-    return None if best is None else best[1]
+        shown += 1
+        command = shlex.join(["uv", "run", "sweep-launch", "--gpu", g.id, *rest])
+        _err(f"  {g.id}: {g.secure_usd_per_h} USD/h in {', '.join(where)}")
+        _err(f"    {command}")
+    if shown:
+        _err(
+            f"(above the {ceiling:.2f} USD/h ceiling: naming one with --gpu accepts its price)"
+        )
+    else:
+        _err("  no candidate GPU has stock at any price")
+
+
+def _without_gpu_flag(argv: list[str]) -> list[str]:
+    rest: list[str] = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg == "--gpu":
+            skip = True
+        elif not arg.startswith("--gpu="):
+            rest.append(arg)
+    return rest
 
 
 def _candidate_ids(gpu_id: str) -> tuple[str, ...]:
@@ -524,6 +610,16 @@ def _cap(text: str) -> float:
     return value
 
 
+def _price_ceiling(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from e
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError(f"must be a positive finite USD/h, got {text}")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sweep-launch",
@@ -531,8 +627,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--gpu",
-        default=GPU_DEFAULT,
-        help=f"GPU type id (fallbacks, cheapest first: {', '.join(GPU_FALLBACKS)})",
+        default=None,
+        help=f"GPU type id, used even above --max-usd-per-h (default {GPU_DEFAULT}; "
+        f"fallbacks, cheapest first: {', '.join(GPU_FALLBACKS)})",
+    )
+    p.add_argument(
+        "--max-usd-per-h",
+        type=_price_ceiling,
+        default=MAX_USD_PER_H_DEFAULT,
+        help=f"price ceiling for automatic GPU picks (default {MAX_USD_PER_H_DEFAULT})",
     )
     p.add_argument(
         "--cap",

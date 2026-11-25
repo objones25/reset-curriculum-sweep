@@ -133,7 +133,9 @@ class FakeRunPod:
             return httpx.Response(status, json={"detail": f"fake {status}"})
         self._pods_created += 1
         body = json.loads(request.content)
-        price = PRICES[body["gpu"]["id"]]
+        [price] = [
+            g["price"]["secure"] for g in self.gpus if g["id"] == body["gpu"]["id"]
+        ]  # type: ignore[index]
         return httpx.Response(
             201,
             json={

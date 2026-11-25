@@ -517,8 +517,7 @@ def test_fallbacks_are_tried_in_ascending_live_price_and_unavailable_ones_skippe
         "NVIDIA L4",
         "NVIDIA RTX A6000",
         "NVIDIA RTX 6000 Ada Generation",
-        "NVIDIA A100-SXM4-80GB",
-    ]
+    ]  # the A100 (2.19) is above the 1.20 USD/h automatic-pick ceiling
 
 
 def test_fallback_list_holds_the_ruled_catalog_ids() -> None:
@@ -662,3 +661,133 @@ def test_prints_how_to_resume_on_the_same_volume(
     _run(fake_runpod, env_file, tmp_path, "--smoke")
 
     assert "sweep-launch --volume-id vol-1 --smoke" in capsys.readouterr().out
+
+
+def _priced_catalog(
+    fake: FakeRunPod, prices: dict[str, float], out_of_stock: set[str]
+) -> None:
+    fake.gpus = [
+        {
+            "id": g,
+            "price": {"secure": p, "community": p},
+            "dataCenters": [
+                {"id": DC, "availability": "NONE" if g in out_of_stock else "LOW"}
+            ],
+        }
+        for g, p in prices.items()
+    ]
+
+
+def test_auto_pick_skips_gpus_above_price_ceiling(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    _priced_catalog(
+        fake_runpod,
+        {
+            "NVIDIA GeForce RTX 4090": 0.89,
+            "NVIDIA RTX A5000": 0.27,
+            "NVIDIA A100-SXM4-80GB": 2.19,
+        },
+        out_of_stock=set(),
+    )
+    fake_runpod.pod_create_statuses = [400, 400, 400]
+
+    code = _run(fake_runpod, env_file, tmp_path)
+
+    gpu_ids = [b["gpu"]["id"] for b in fake_runpod.bodies("POST", "/v2/pods")]  # type: ignore[index]
+    assert code == 2
+    assert gpu_ids == ["NVIDIA GeForce RTX 4090", "NVIDIA RTX A5000"]
+
+
+def test_lower_price_ceiling_drops_the_default_gpu_too(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    _priced_catalog(
+        fake_runpod,
+        {"NVIDIA GeForce RTX 4090": 0.89, "NVIDIA RTX A5000": 0.27},
+        out_of_stock=set(),
+    )
+
+    _run(fake_runpod, env_file, tmp_path, "--max-usd-per-h", "0.5")
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    assert pod["gpu"]["id"] == "NVIDIA RTX A5000"  # type: ignore[index]
+
+
+def test_explicit_gpu_overrides_price_ceiling(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    _priced_catalog(
+        fake_runpod,
+        {"NVIDIA A100-SXM4-80GB": 2.19, "NVIDIA RTX A5000": 0.27, "NVIDIA L40S": 1.5},
+        out_of_stock=set(),
+    )
+
+    code = _run(fake_runpod, env_file, tmp_path, "--gpu", "NVIDIA A100-SXM4-80GB")
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    env = pod["env"]
+    assert isinstance(env, dict)
+    assert code == 0
+    assert pod["gpu"]["id"] == "NVIDIA A100-SXM4-80GB"  # type: ignore[index]
+    assert env["SWEEP_GPU_USD_PER_H"] == "2.19"
+
+
+def test_fallbacks_after_explicit_gpu_still_respect_the_ceiling(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    _priced_catalog(
+        fake_runpod,
+        {"NVIDIA A100-SXM4-80GB": 2.19, "NVIDIA RTX A5000": 0.27, "NVIDIA L40S": 1.5},
+        out_of_stock=set(),
+    )
+    fake_runpod.pod_create_statuses = [400, 400]
+
+    code = _run(fake_runpod, env_file, tmp_path, "--gpu", "NVIDIA A100-SXM4-80GB")
+
+    gpu_ids = [b["gpu"]["id"] for b in fake_runpod.bodies("POST", "/v2/pods")]  # type: ignore[index]
+    assert code == 2
+    assert gpu_ids == ["NVIDIA A100-SXM4-80GB", "NVIDIA RTX A5000"]
+
+
+def test_no_stock_under_ceiling_exits_2_with_options(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _priced_catalog(
+        fake_runpod,
+        {
+            "NVIDIA GeForce RTX 4090": 0.89,
+            "NVIDIA RTX A5000": 0.27,
+            "NVIDIA A100-SXM4-80GB": 2.19,
+            "NVIDIA L40S": 1.5,
+        },
+        out_of_stock={"NVIDIA GeForce RTX 4090", "NVIDIA RTX A5000"},
+    )
+
+    code = _run(fake_runpod, env_file, tmp_path, "--smoke")
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert [r.method for r in fake_runpod.requests if r.method != "GET"] == []
+    assert "1.20 USD/h" in err
+    assert f"NVIDIA L40S: 1.5 USD/h in {DC}" in err
+    assert f"NVIDIA A100-SXM4-80GB: 2.19 USD/h in {DC}" in err
+    assert err.index("NVIDIA L40S") < err.index("NVIDIA A100-SXM4-80GB")
+    assert (
+        "uv run sweep-launch --gpu 'NVIDIA L40S' --repo-url "
+        f"{REPO} --ref feat/sweep --smoke"
+    ) in err
+
+
+@pytest.mark.parametrize("ceiling", ["0", "-1", "nan", "inf"])
+def test_price_ceiling_must_be_positive_and_finite(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path, ceiling: str
+) -> None:
+    with pytest.raises(SystemExit) as info:
+        _run(fake_runpod, env_file, tmp_path, "--max-usd-per-h", ceiling)
+
+    assert info.value.code == 2
+    assert fake_runpod.requests == []
