@@ -8,8 +8,12 @@ import dataclasses
 import math
 import os
 import signal
+import subprocess
+import sys
+import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -92,6 +96,18 @@ def orphaning_runner(spec: RunSpec) -> RunResult:
         threading.Event().wait(20.0)
         os._exit(0)
     os._exit(1)
+
+
+def _grandchild_pid_file(seed: int) -> Path:
+    return Path(tempfile.gettempdir()) / f"resetsweep-test-grandchild-{seed}.pid"
+
+
+def grandchild_runner(spec: RunSpec) -> RunResult:
+    """Starts a long-lived grandchild (like wandb-core), records its pid, then hangs."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    _grandchild_pid_file(spec.seed).write_text(str(proc.pid))
+    threading.Event().wait(600.0)
+    raise AssertionError("not killed")
 
 
 def wrong_id_runner(spec: RunSpec) -> RunResult:
@@ -232,3 +248,50 @@ def test_worker_death_is_seen_even_if_a_grandchild_holds_the_pipe() -> None:
 
     assert result.error == "worker died without a result: exit code 1"
     assert waited < 15.0  # not the 20 s until the grandchild lets go of the pipe
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_until(cond: Callable[[], bool], limit_s: float) -> bool:
+    deadline = time.monotonic() + limit_s
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        threading.Event().wait(0.1)
+    return cond()
+
+
+def test_kill_also_kills_the_workers_grandchildren() -> None:
+    seed = os.getpid()  # unique per test process: names the pid file
+    pid_file = _grandchild_pid_file(seed)
+    pid_file.unlink(missing_ok=True)
+    with WorkerPool(n_workers=1, device="cpu", runner=grandchild_runner) as pool:
+        pool.submit(_job(seed), _spec(seed), timeout_s=POLL_LIMIT_S)
+        assert _wait_until(lambda: pid_file.exists() and pid_file.read_text() != "", POLL_LIMIT_S)
+        grandchild = int(pid_file.read_text())
+
+        pool.kill(_job(seed))
+
+    pid_file.unlink(missing_ok=True)
+    assert _wait_until(lambda: not _alive(grandchild), 10.0)
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def test_failed_start_leaks_no_pipe_and_no_slot() -> None:
+    pool = WorkerPool(n_workers=1, device="cpu", runner=lambda spec: _ok_result(spec))
+    before = _open_fds()
+
+    with pytest.raises(AttributeError, match="Can.t get local object"):
+        pool.submit(_job(), _spec(), timeout_s=1.0)
+
+    assert (_open_fds(), pool.running(), pool.free_slots()) == (before, [], 1)
+    pool.close()

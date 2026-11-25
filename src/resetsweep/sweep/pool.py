@@ -19,6 +19,14 @@ Outcomes, all of which end as exactly one `RunResult` from `poll` (except `kill`
 Every wait is bounded: `poll` waits at most `timeout_s` (`multiprocessing.connection.wait`,
 checked against the Python 3.12 docs), joins wait at most `_JOIN_S`.
 
+Process groups: `multiprocessing.Process` has no `start_new_session` (only `subprocess.Popen`
+does, per the Python 3.12 docs), and spawn execs the child, so the parent cannot `setpgid` it.
+So the child calls `os.setsid()` first thing and leads its own group; stopping a job sends
+SIGKILL to that whole group (`os.killpg`), which also takes down what the job started (e.g.
+wandb-core). A job killed before its `setsid` ran has no group yet; then only the process is
+killed, and it has started nothing. The group is also killed after a normal exit, to reap any
+leftover descendant. Limit: a descendant that calls `setsid` itself leaves the group.
+
 `train_job` is the real runner: it trains one spec with a JSONL sink (`run_log_path`) and a
 W&B sink, and closes both. Workers are daemonic, so they die with the sweep process.
 """
@@ -27,6 +35,7 @@ import functools
 import logging
 import math
 import multiprocessing
+import os
 import signal
 import time
 from collections.abc import Callable
@@ -125,6 +134,7 @@ def train_job(cfg: RunnerConfig, spec: RunSpec) -> RunResult:
 
 def _child_main(runner: Runner, spec: RunSpec, conn: Connection) -> None:
     """Worker process body: send ("ok", result) or ("err", repr(exc)), then exit."""
+    os.setsid()  # lead a new process group, so the pool can kill everything the job starts
     try:
         try:
             message: tuple[str, object] = ("ok", runner(spec))
@@ -146,6 +156,19 @@ def _exit_text(exitcode: int | None) -> str:
             name = "unknown signal"
         return f"exit code {exitcode} ({name})"
     return f"exit code {exitcode}"
+
+
+def _kill_group(pid: int | None) -> None:
+    """SIGKILL the process group led by `pid`, if it exists (see the module docstring)."""
+    if pid is None:
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # obs: allow LOG007 (no such group: setsid not reached yet, or all exited)
+    except PermissionError:
+        # pid was recycled into a group we do not own: never signal it.
+        _log.warning("process group %d is not ours; not killed", pid)
 
 
 @dataclass
@@ -219,7 +242,12 @@ class WorkerPool:
         proc = self._ctx.Process(
             target=_child_main, args=(self._runner, spec, send), daemon=True
         )
-        proc.start()
+        try:
+            proc.start()
+        except BaseException:
+            recv.close()
+            send.close()
+            raise
         send.close()  # the child holds the only write end: EOF means it is gone
         self._running[key] = _Running(
             job=job,
@@ -325,6 +353,7 @@ class WorkerPool:
         sent its result gets `_JOIN_S` to exit on its own before it is killed."""
         if expect_exit:
             r.process.join(_JOIN_S)
+        _kill_group(r.process.pid)
         if r.process.is_alive():
             r.process.kill()
             r.process.join(_JOIN_S)

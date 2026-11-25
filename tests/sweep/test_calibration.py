@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from resetsweep.sweep.budget import BudgetGuard
 from resetsweep.sweep.calibration import (
     CalibrationError,
@@ -161,20 +162,74 @@ def test_calibration_saved_and_reused_on_restart(
 def test_calibration_stops_at_calibration_cap(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:
-    # One config batch costs 4000 / (128 * 100 / sqrt 2) + 2 = 2.44 s = 0.0244 USD, so a
-    # 0.03 USD cap is reached after the first batch... the second batch starts below the cap
-    # (0.0244 < 0.03) and the third does not.
-    record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense", "arm_dense"), cap_usd=0.03)
+    # One config batch costs 4000 / (128 * 100 / sqrt 2) + 2 = 2.44 s = 0.0244 USD. With a
+    # 0.06 USD cap the first batch fits; 0.0356 USD (3.56 s) is then left, less than one 5 s
+    # poll, so the second batch does not start.
+    record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense", "arm_dense"), cap_usd=0.06)
 
     assert record.capped is True
-    assert sorted(record.batch_keys()) == ["config/arm_dense", "config/pendulum_dense"]
-    assert record.spent_usd >= 0.03
+    assert record.batch_keys() == ["config/pendulum_dense"]
+    assert record.spent_usd <= 0.06
+
+
+def test_calibration_job_timeout_is_cut_to_what_the_cap_can_pay(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    # Calibration jobs run 50x slower than modelled (122 s each); the cap pays for 50 s, so the
+    # jobs get a 50 s timeout instead of 600 s and are killed there.
+    world.slowdown = lambda spec: 50.0
+    record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=0.5)
+
+    assert record.capped is True
+    assert record.spent_usd <= 0.5 + 1e-9
+    assert {m.status for m in record.config("pendulum_dense")} == {"failed"}
+
+
+def test_calibration_closes_pool_when_cap_reached_mid_batch(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    # A pool that never kills: the batch loop itself must stop paying at the cap.
+    world.slowdown = lambda spec: 50.0
+    world.enforce_timeouts = False
+    record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=0.5)
+
+    assert record.capped is True
+    assert record.spent_usd <= 0.5 + 1e-9
+    assert record.batch_keys() == []  # a batch cut short is not a measurement
+
+
+def test_calibration_stops_when_the_sweep_budget_runs_out(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    world.slowdown = lambda spec: 50.0
+    world.enforce_timeouts = False
+    guard = BudgetGuard(
+        cap_usd=5.3,  # cap - margin leaves 0.3 USD: below the 10 USD calibration cap
+        margin_usd=5.0,
+        gpu_usd_per_h=GPU_USD_PER_H,
+        volume_usd_per_h=0.0,
+        ledger_path=tmp_path / "ledger.jsonl",
+        clock=clock,
+    )
+
+    record = calibrate(
+        families=("pendulum_dense",),
+        settings=_settings(),
+        guard=guard,
+        pool_factory=pool_factory,
+        runner_cfg=_runner_cfg(tmp_path),
+        path=tmp_path / "calibration.json",
+        clock=clock,
+    )
+
+    assert record.capped is True
+    assert guard.remaining() >= -1e-9
 
 
 def test_calibration_resumes_where_the_cap_stopped_it(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:
-    _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=0.01)
+    _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=0.06)
     n_first = len(world.submissions)  # the config batch only
 
     record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=10.0)

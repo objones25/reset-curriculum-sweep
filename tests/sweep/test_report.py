@@ -14,7 +14,12 @@ from pathlib import Path
 import pytest
 
 from resetsweep.sweep.arms import Arm, arm_space
-from resetsweep.sweep.report import NullReportSink, WandbReportSink, write_report
+from resetsweep.sweep.report import (
+    NullReportSink,
+    WandbReportSink,
+    build_report,
+    write_report,
+)
 from resetsweep.sweep.scheduler import Job, Scheduler
 from resetsweep.train import RunResult
 
@@ -98,6 +103,9 @@ class RecordingSink:
         self.tables: dict[str, tuple[list[str], list[list[object]]]] = {}
         self.summaries: list[dict[str, float | str]] = []
         self.closed = False
+
+    def log(self, elapsed_s: float, data: dict[str, float]) -> None:
+        del elapsed_s, data
 
     def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
         self.tables[name] = (columns, rows)
@@ -250,7 +258,7 @@ def test_report_logs_wandb_tables_to_sink(tmp_path: Path) -> None:
 
     write_report(_finished(tmp_path), tmp_path / "r.md", tmp_path / "r.json", sink)
 
-    assert sorted(sink.tables) == ["overall", "per_task", "unranked"]
+    assert sorted(sink.tables) == ["arms", "overall", "per_task", "unranked"]
     columns, rows = sink.tables["per_task"]
     assert columns[:3] == ["group", "arm", "iqm_auc"]
     assert {f"{TASK_A}/point/-", f"{TASK_B}/point/-"} <= {row[1] for row in rows}
@@ -270,6 +278,7 @@ def test_report_group_where_uniform_is_best_has_no_scale(tmp_path: Path) -> None
 def test_wandb_report_sink_logs_tables_in_disabled_mode(tmp_path: Path) -> None:
     sink = WandbReportSink(project="p", group="sweep-test", mode="disabled", config={"sweep_id": "x"})
     try:
+        sink.log(1.0, {"spent_usd": 0.5, "jobs_running": 2.0})
         report = write_report(_finished(tmp_path), tmp_path / "r.md", tmp_path / "r.json", sink)
     finally:
         sink.close()
@@ -280,3 +289,80 @@ def test_wandb_report_sink_logs_tables_in_disabled_mode(tmp_path: Path) -> None:
 def test_wandb_report_sink_rejects_secret_like_config_keys() -> None:
     with pytest.raises(ValueError, match=r"secret-like keys \['api_key'\]"):
         WandbReportSink(project="p", group="g", mode="disabled", config={"api_key": "***"})
+
+
+def _to_final_rung(tmp_path: Path) -> tuple[Scheduler, list[Job]]:
+    """Drive every rung below the last; return the scheduler and its first final-rung jobs."""
+    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    for _ in range(50):
+        jobs = s.next_jobs(1000)
+        final = [j for j in jobs if j.rung == 2]
+        if final:
+            return s, final
+        for job in jobs:
+            s.report(_result(job, AUC.get(job.arm.label(), DEFAULT_AUC)))
+    raise AssertionError("never reached the final rung")
+
+
+def test_report_ranks_on_common_seed_count_after_budget_stop_mid_final_rung(
+    tmp_path: Path,
+) -> None:
+    # The budget stops the sweep with uniform at 3 final seeds, point at 4, visited[0.0] at 5.
+    s, final = _to_final_rung(tmp_path)
+    v00 = _arm(TASK_A, "visited[p_task=0.0]/-")
+    seeds = {_arm(TASK_A, "uniform/-"): 3, _arm(TASK_A, "point/-"): 4, v00: 5}
+    v00_auc = {0: 0.9, 1: 0.9, 2: 0.9, 3: 0.1, 4: 0.1}  # seeds 3 and 4 must not count
+    for job in final:
+        if job.arm in seeds and job.seed < seeds[job.arm]:
+            auc = v00_auc[job.seed] if job.arm == v00 else AUC[job.arm.label()]
+            s.report(_result(job, auc))
+
+    report = _write(tmp_path, s)
+
+    group_a = next(g for g in report["groups"] if g["task"] == TASK_A)
+    rows = {a["label"]: (a["seeds_ok"], a["seeds_used"], a["iqm_auc"]) for a in group_a["arms"]}
+    assert (group_a["common_seeds"], group_a["insufficient_seeds"]) == (3, False)
+    # With all 5 seeds the IQM would be mean(0.1, 0.9, 0.9) = 0.633; on seeds 0-2 it is 0.9.
+    assert rows == {
+        v00.label(): (5, 3, pytest.approx(0.9)),
+        f"{TASK_A}/point/-": (4, 3, pytest.approx(0.3)),
+        f"{TASK_A}/uniform/-": (3, 3, pytest.approx(0.1)),
+    }
+
+
+def test_report_flags_group_with_fewer_than_two_common_seeds(tmp_path: Path) -> None:
+    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    for job in s.next_jobs(1000):
+        s.report(_result(job, AUC.get(job.arm.label(), DEFAULT_AUC)))
+
+    report = _write(tmp_path, s, rank_rung=0)
+
+    group_a = next(g for g in report["groups"] if g["task"] == TASK_A)
+    md = (tmp_path / "report.md").read_text()
+    assert (group_a["common_seeds"], group_a["insufficient_seeds"]) == (1, True)
+    assert "insufficient seeds: ranked on 1 seed per arm" in md
+
+
+def test_report_arm_table_has_mean_ci_bounds_rung_and_status(tmp_path: Path) -> None:
+    sink = RecordingSink()
+
+    report = write_report(_finished(tmp_path), tmp_path / "r.md", tmp_path / "r.json", sink)
+
+    columns, rows = sink.tables["arms"]
+    by_arm = {row[0]: dict(zip(columns, row, strict=True)) for row in rows}
+    v00 = by_arm[f"{TASK_A}/visited[p_task=0.0]/-"]
+    pruned = by_arm[f"{TASK_A}/visited[p_task=0.5]/-"]
+    assert columns == ["arm", "group", "status", "rung", "mean_auc", "ci_low", "ci_high", "lcb", "ucb", "seeds_ok"]
+    # 5 seeds at 0.9: sd 0 floored at 0.05, half = 2 * 0.05 / sqrt(5)
+    assert (v00["status"], v00["rung"], v00["mean_auc"]) == ("final", 2, pytest.approx(0.9))
+    assert v00["ucb"] == pytest.approx(0.9 + 0.1 / math.sqrt(5))
+    assert (pruned["status"], pruned["rung"], pruned["lcb"], pruned["ucb"]) == ("pruned", 0, None, None)
+    assert len(report["arms"]) == len(rows)
+
+
+def test_build_report_calls_tick_for_each_group(tmp_path: Path) -> None:
+    ticks: list[int] = []
+
+    report = build_report(_finished(tmp_path), tick=lambda: ticks.append(1))
+
+    assert len(ticks) >= len(report["groups"]) > 0

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from resetsweep.sweep.budget import (
     HEARTBEAT_S,
     LEDGER_GAP_S,
@@ -40,8 +41,10 @@ def _guard(
 
 
 def _ledger(tmp_path: Path) -> list[dict[str, float]]:
+    """Ledger rows without their wall-clock `utc` stamp (tested on its own below)."""
     lines = (tmp_path / "ledger.jsonl").read_text().splitlines()
-    return [json.loads(line) for line in lines]
+    rows = [json.loads(line) for line in lines]
+    return [{k: v for k, v in row.items() if k != "utc"} for row in rows]
 
 
 def test_volume_cost_per_hour() -> None:
@@ -210,3 +213,25 @@ def test_constructor_rejects_bad_prices(tmp_path: Path, field: str, value: float
 
     with pytest.raises(ValueError, match=field):
         BudgetGuard(**kw, ledger_path=tmp_path / "ledger.jsonl", clock=FakeClock())
+
+
+def test_every_ledger_line_carries_a_utc_timestamp(tmp_path: Path) -> None:
+    clock = FakeClock()
+    guard = BudgetGuard(
+        cap_usd=100.0,
+        margin_usd=5.0,
+        gpu_usd_per_h=3600.0,
+        volume_usd_per_h=0.0,
+        ledger_path=tmp_path / "ledger.jsonl",
+        clock=clock,
+        utc_now=lambda: "2026-11-25T12:00:00+00:00",
+    )
+    clock.t += HEARTBEAT_S
+    guard.heartbeat()
+
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert [row["utc"] for row in rows] == ["2026-11-25T12:00:00+00:00"] * 2
+
+
+def test_heartbeat_interval_is_15_s() -> None:
+    assert HEARTBEAT_S == 15.0

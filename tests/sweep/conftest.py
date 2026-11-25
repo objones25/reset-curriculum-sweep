@@ -47,6 +47,7 @@ class FakeWorld:
     overhead_s: float = 2.0
     fails: Callable[[RunSpec], bool] = lambda spec: False
     slowdown: Callable[[RunSpec], float] = lambda spec: 1.0  # actual / modelled duration
+    enforce_timeouts: bool = True  # False: a pool that never kills, to test callers' own stops
     submissions: list[Submission] = field(default_factory=list)
     session: int = 0
 
@@ -108,7 +109,8 @@ class FakePool:
         self._n = n_workers
         self._device = device
         self._cfg = cfg
-        self._running: dict[tuple[str, int], tuple[Job, RunSpec, float]] = {}
+        # (arm_id, seed) -> (job, spec, end time, timed out)
+        self._running: dict[tuple[str, int], tuple[Job, RunSpec, float, bool]] = {}
         self.closed = False
 
     def submit(self, job: Job, spec: RunSpec, *, timeout_s: float) -> None:
@@ -121,32 +123,38 @@ class FakePool:
         self._world.submissions.append(
             Submission(job=job, spec=spec, n_workers=self._n, session=self._world.session)
         )
-        finish = self._world.clock.t + self._world.duration_s(spec, self._n)
-        self._running[key] = (job, spec, finish)
+        now = self._world.clock.t
+        finish = now + self._world.duration_s(spec, self._n)
+        timed_out = self._world.enforce_timeouts and finish > now + timeout_s
+        end = now + timeout_s if timed_out else finish
+        self._running[key] = (job, spec, end, timed_out)
 
     def poll(self, timeout_s: float) -> list[RunResult]:
         clock = self._world.clock
         if not self._running:
             clock.t += timeout_s
             return []
-        t_next = min(finish for _, _, finish in self._running.values())
+        t_next = min(end for _, _, end, _ in self._running.values())
         if t_next > clock.t + timeout_s:
             clock.t += timeout_s
             return []
         clock.t = max(clock.t, t_next)
-        done = [key for key, (_, _, finish) in self._running.items() if finish <= clock.t]
+        done = [key for key, (_, _, end, _) in self._running.items() if end <= clock.t]
         out: list[RunResult] = []
         for key in done:
-            _, spec, _ = self._running.pop(key)
-            out.append(self._world.finish(spec, self._n, self._cfg))
+            _, spec, end, timed_out = self._running.pop(key)
+            if timed_out:
+                out.append(failed_result(spec, "timed out; worker killed", wall_s=end))
+            else:
+                out.append(self._world.finish(spec, self._n, self._cfg))
         return out
 
     def kill(self, job: Job) -> None:
-        (key,) = [k for k, (j, _, _) in self._running.items() if j == job]
+        (key,) = [k for k, (j, _, _, _) in self._running.items() if j == job]
         self._running.pop(key)
 
     def running(self) -> list[Job]:
-        return [job for job, _, _ in self._running.values()]
+        return [job for job, _, _, _ in self._running.values()]
 
     def free_slots(self) -> int:
         return self._n - len(self._running)

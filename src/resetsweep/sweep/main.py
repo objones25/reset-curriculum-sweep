@@ -1,9 +1,9 @@
 """`sweep-run`: the in-pod sweep entry point (spec sections 6 to 8).
 
 Steps:
-1. Settings from the environment (`load_settings`). `SWEEP_CAP_USD` and `SWEEP_GPU_USD_PER_H`
-   are required (the launcher sets them); a missing or bad value raises `SettingsError`
-   naming the variable, never echoing a value. The W&B key is read by wandb itself and never
+1. Settings from the environment (`load_settings`). `SWEEP_CAP_USD` (at most
+   `CAP_USD_DEFAULT`, 100) and `SWEEP_GPU_USD_PER_H` are required (the launcher sets them); a
+   missing or bad value raises `SettingsError` naming the variable, never echoing a value. The W&B key is read by wandb itself and never
    touched here.
 2. Calibrate (`calibration.calibrate`), or reuse `state_dir/calibration.json`. Once a scheduler
    exists in the state dir, calibration is never re-run: the plan, and so every arm id, must
@@ -15,7 +15,14 @@ Steps:
    done or the guard refuses a job; then wait for the jobs in flight.
 5. Write the report (`report.write_report`) and log it to a sweep-level W&B run.
 6. Return 0. Bad settings return 2; a new sweep whose budget is already spent, a budget too
-   small to size rung 0, or calibration with no usable measurement returns 3.
+   small to size rung 0, or calibration with no usable measurement returns 3; a state dir made
+   by another mode or arm set (`sweep_meta.json`), or a scheduler state without its
+   calibration.json, returns 4.
+
+Live per-sweep metrics (spec 5.6) go to the sweep-level W&B run every `HEARTBEAT_S` and when
+the loop stops: spend, projected spend (spend + the pod time owed to jobs in flight), jobs
+running and done, arms by status, and the current rung per group. The report adds the arm
+table (mean, CI, LCB/UCB, rung, status) and the final ranking to the same run.
 
 `SWEEP_SMOKE=1`: calibrate the pendulum family only, then run only `uniform` and `visited`
 (p_task 0.5) on `pendulum_sparse` for one rung of r0, and rank that rung in the report.
@@ -45,6 +52,8 @@ Tunable sizes for tests and CPU smoke runs (not needed on the pod): `SWEEP_NUM_E
 
 import argparse
 import dataclasses
+import hashlib
+import json
 import logging
 import math
 import os
@@ -61,6 +70,8 @@ from resetsweep.metrics import WandbMode
 from resetsweep.sweep.arms import Arm, arm_space
 from resetsweep.sweep.budget import (
     CALIBRATION_CAP_USD,
+    CAP_USD_DEFAULT,
+    HEARTBEAT_S,
     MARGIN_USD,
     NETWORK_VOLUME_GB,
     BudgetGuard,
@@ -88,7 +99,12 @@ from resetsweep.sweep.pool import (
     default_pool_factory,
     failed_result,
 )
-from resetsweep.sweep.report import ReportSink, WandbReportSink, write_report
+from resetsweep.sweep.report import (
+    ReportSink,
+    WandbReportSink,
+    group_label,
+    write_report,
+)
 from resetsweep.sweep.scheduler import (
     LIVE_STATUSES,
     STATE_FILE,
@@ -97,6 +113,7 @@ from resetsweep.sweep.scheduler import (
     Job,
     RunDefaults,
     Scheduler,
+    Status,
     spec_for,
 )
 from resetsweep.train import RunResult, RunSpec
@@ -195,8 +212,11 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         assert value is not None
         return value
 
+    cap_usd = _positive_float(environ, "SWEEP_CAP_USD")
+    if cap_usd > CAP_USD_DEFAULT:
+        raise SettingsError(f"SWEEP_CAP_USD must be <= {CAP_USD_DEFAULT} (CAP_USD_DEFAULT)")
     return Settings(
-        cap_usd=_positive_float(environ, "SWEEP_CAP_USD"),
+        cap_usd=cap_usd,
         gpu_usd_per_h=_positive_float(environ, "SWEEP_GPU_USD_PER_H"),
         state_dir=Path(environ.get("SWEEP_STATE_DIR") or STATE_DIR_DEFAULT),
         wandb_project=environ.get("WANDB_PROJECT") or PROJECT_DEFAULT,
@@ -284,9 +304,12 @@ class SweepLoop:
         make_spec: Callable[[Job], RunSpec],
         clock: Callable[[], float],
         smoke: bool,
+        sink: ReportSink,
         poll_s: float = POLL_S,
     ) -> None:
         self.guard = guard
+        self._sink = sink
+        self._last_live = -math.inf
         self._sched = scheduler
         self._pool = pool
         self._plan = plan
@@ -332,6 +355,7 @@ class SweepLoop:
         if entry is not None and result.status == "ok" and entry.est_wall_s > 0:
             self._ratios.append((self._clock() - entry.start_s) / entry.est_wall_s)
         self._n_results += 1
+        self.guard.heartbeat()  # a slow scheduler save must not starve the ledger
         log = _log.info if result.status == "ok" else _log.warning
         log(
             "result %s seed %d: %s auc=%.3f wall=%.0fs%s",
@@ -409,7 +433,36 @@ class SweepLoop:
             self._inflight[(spec.arm_id(), spec.seed)] = _InFlight(job, spec, self._clock(), raw)
         return False
 
+    def _live_metrics(self) -> dict[str, float]:
+        """Per-sweep metrics (spec 5.6): spend, projection, jobs, arms by status, rung per group."""
+        spent = self.guard.spent()
+        owed_usd = self._in_flight_left_s() * self.guard.usd_per_s
+        states = self._sched.states()
+        counts = Counter(st.status for st in states)
+        data: dict[str, float] = {
+            "spent_usd": spent,
+            "projected_usd": spent + owed_usd,
+            "remaining_usd": self.guard.remaining(),
+            "jobs_running": float(len(self._inflight)),
+            "jobs_done": float(self._n_results),
+        }
+        data.update({f"arms/{status}": float(counts[status]) for status in get_args(Status)})
+        rungs: dict[str, int] = {}
+        for st in states:
+            if st.status in LIVE_STATUSES:
+                label = group_label((st.arm.task, st.arm.task_kw))
+                rungs[label] = max(rungs.get(label, 0), st.rung)
+        data.update({f"rung/{label}": float(r) for label, r in rungs.items()})
+        return data
+
+    def _log_live(self, *, force: bool = False) -> None:
+        if not force and self.guard.elapsed_s() - self._last_live < HEARTBEAT_S:
+            return
+        self._last_live = self.guard.elapsed_s()
+        self._sink.log(self._last_live, self._live_metrics())
+
     def _status(self) -> None:
+        self._log_live()
         now = self._clock()
         if now - self._last_status < STATUS_EVERY_S:
             return
@@ -454,6 +507,7 @@ class SweepLoop:
         else:
             raise RuntimeError(f"sweep loop passed its bound of {self._max_iters} iterations")
         self.guard.flush()
+        self._log_live(force=True)
         _log.info("sweep loop stopped: %s", reason)
         return reason
 
@@ -464,7 +518,7 @@ class SweepLoop:
 ReportSinkFactory = Callable[[str, str, WandbMode], ReportSink]
 
 
-def _wandb_report_sink(project: str, group: str, mode: WandbMode) -> ReportSink:
+def _wandb_sweep_sink(project: str, group: str, mode: WandbMode) -> ReportSink:
     return WandbReportSink(project=project, group=group, mode=mode, config={"sweep_id": group})
 
 
@@ -511,6 +565,39 @@ def _calibration_settings(settings: Settings, device: str, cap_usd: float) -> Ca
     )
 
 
+META_FILE: Final = "sweep_meta.json"
+CALIBRATION_FILE: Final = "calibration.json"
+
+
+def _arms_sha256(arms: list[Arm]) -> str:
+    return hashlib.sha256("\n".join(sorted(a.label() for a in arms)).encode()).hexdigest()
+
+
+def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
+    """Why `state` cannot be used for this sweep, or None (and the sweep's meta is saved).
+
+    `sweep_meta.json` records the mode and a hash of the initial arm set on first start; a later
+    start with another mode or arm set would resume a different sweep's state. A scheduler
+    state without its calibration.json cannot rebuild the arm ids."""
+    meta = {"version": 1, "mode": "smoke" if smoke else "full", "arms_sha256": _arms_sha256(arms)}
+    path = state / META_FILE
+    if path.exists():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if saved != meta:
+            return (
+                f"{path} is for a {saved.get('mode')} sweep with arm set {saved.get('arms_sha256')}, "
+                f"this start is {meta['mode']} with arm set {meta['arms_sha256']}; use another "
+                "SWEEP_STATE_DIR or the settings the state was made with"
+            )
+    elif any((state / name).exists() for name in (STATE_FILE, CALIBRATION_FILE, "results.jsonl")):
+        return f"{state} holds sweep state but no {META_FILE}; refusing to guess what it is"
+    if (state / STATE_FILE).exists() and not (state / CALIBRATION_FILE).exists():
+        return f"{state / STATE_FILE} exists but {CALIBRATION_FILE} is missing: arm ids cannot be rebuilt"
+    if not path.exists():
+        path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+    return None
+
+
 def _sweep(
     settings: Settings,
     *,
@@ -521,6 +608,11 @@ def _sweep(
 ) -> int:
     state = settings.state_dir
     state.mkdir(parents=True, exist_ok=True)
+    arms = _smoke_arms() if settings.smoke else arm_space("rung0")
+    problem = _check_state(state, smoke=settings.smoke, arms=arms)
+    if problem is not None:
+        _log.error("state dir mismatch: %s", problem)
+        return 4
     sweep_id = _sweep_id(state)
     guard = BudgetGuard(
         cap_usd=settings.cap_usd,
@@ -538,24 +630,52 @@ def _sweep(
         guard.spent(),
         settings.smoke,
     )
-    runner_cfg = RunnerConfig(
-        project=settings.wandb_project,
-        group=sweep_id,
-        wandb_mode=settings.wandb_mode,
-        runs_dir=state / "runs",
-    )
-    arms = _smoke_arms() if settings.smoke else arm_space("rung0")
-    families = (SMOKE_FAMILY,) if settings.smoke else sparse_families()
-    arms_per_family = Counter(family_of(a.task) for a in arms)
-    calib_path = state / "calibration.json"
-    resuming = (state / STATE_FILE).exists()
-    if not resuming and guard.remaining() <= 0:
+    if not (state / STATE_FILE).exists() and guard.remaining() <= 0:
         _log.error(
             "budget already spent: %.2f USD of the %.2f allowed (cap - margin); nothing started",
             guard.spent(),
             guard.limit_usd(),
         )
         return 3
+    sink = report_sink_factory(settings.wandb_project, sweep_id, settings.wandb_mode)
+    try:
+        return _run_sweep(
+            settings,
+            arms=arms,
+            sweep_id=sweep_id,
+            guard=guard,
+            sink=sink,
+            device=device,
+            clock=clock,
+            pool_factory=pool_factory,
+        )
+    finally:
+        sink.close()
+        guard.flush()
+
+
+def _run_sweep(
+    settings: Settings,
+    *,
+    arms: list[Arm],
+    sweep_id: str,
+    guard: BudgetGuard,
+    sink: ReportSink,
+    device: str,
+    clock: Callable[[], float],
+    pool_factory: PoolFactory,
+) -> int:
+    state = settings.state_dir
+    runner_cfg = RunnerConfig(
+        project=settings.wandb_project,
+        group=sweep_id,
+        wandb_mode=settings.wandb_mode,
+        runs_dir=state / "runs",
+    )
+    families = (SMOKE_FAMILY,) if settings.smoke else sparse_families()
+    arms_per_family = Counter(family_of(a.task) for a in arms)
+    calib_path = state / CALIBRATION_FILE
+    resuming = (state / STATE_FILE).exists()
     prior_calib = CalibrationRecord.load(calib_path).spent_usd if calib_path.exists() else 0.0
     calib_cap = min(CALIBRATION_CAP_USD, prior_calib + max(guard.remaining(), 0.0))
     calib_settings = _calibration_settings(settings, device, max(calib_cap, 1e-9))
@@ -576,6 +696,7 @@ def _sweep(
     except CalibrationError:
         _log.exception("calibration gave nothing to size the sweep from")
         return 3
+    sink.log(guard.elapsed_s(), {"calibration_usd": record.spent_usd, "spent_usd": guard.spent()})
     _log.info(
         "plan: %d workers; %s",
         plan.n_workers,
@@ -624,6 +745,7 @@ def _sweep(
             make_spec=make_spec,
             clock=clock,
             smoke=settings.smoke,
+            sink=sink,
         ).run()
     finally:
         pool.close()
@@ -637,18 +759,15 @@ def _sweep(
         "calibration_usd": record.spent_usd,
         "n_workers": float(plan.n_workers),
     }
-    sink = report_sink_factory(settings.wandb_project, sweep_id, settings.wandb_mode)
-    try:
-        write_report(
-            scheduler,
-            state / "report.md",
-            state / "report.json",
-            sink,
-            rank_rung=0 if settings.smoke else None,
-            extra=extra,
-        )
-    finally:
-        sink.close()
+    write_report(
+        scheduler,
+        state / "report.md",
+        state / "report.json",
+        sink,
+        rank_rung=0 if settings.smoke else None,
+        extra=extra,
+        tick=guard.heartbeat,
+    )
     guard.flush()
     _log.info(
         "report written to %s; stopped: %s; spent %.2f of %.2f USD",
@@ -674,7 +793,7 @@ def main(
     environ: Mapping[str, str] | None = None,
     clock: Callable[[], float] = time.monotonic,
     pool_factory: PoolFactory = default_pool_factory,
-    report_sink_factory: ReportSinkFactory = _wandb_report_sink,
+    report_sink_factory: ReportSinkFactory = _wandb_sweep_sink,
     device: str | None = None,
 ) -> int:
     """`sweep-run`. Settings come from the environment (see the module docstring)."""

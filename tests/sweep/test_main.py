@@ -56,7 +56,11 @@ class RecordingSink:
     def __init__(self) -> None:
         self.tables: dict[str, Any] = {}
         self.summaries: list[dict[str, Any]] = []
+        self.logs: list[tuple[float, dict[str, float]]] = []
         self.closed = False
+
+    def log(self, elapsed_s: float, data: dict[str, float]) -> None:
+        self.logs.append((elapsed_s, data))
 
     def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
         self.tables[name] = (columns, rows)
@@ -288,7 +292,7 @@ def test_main_logs_report_to_sweep_level_sink(
 
     _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory, sink)
 
-    assert sorted(sink.tables) == ["overall", "per_task", "unranked"]
+    assert sorted(sink.tables) == ["arms", "overall", "per_task", "unranked"]
     assert sink.summaries[-1]["spent_usd"] > 0
     assert sink.closed is True
 
@@ -356,7 +360,9 @@ class StubScheduler:
         return ()
 
 
-def _loop(tmp_path: Path, sched: StubScheduler, pool_factory: Any, clock: Any) -> SweepLoop:
+def _loop(
+    tmp_path: Path, sched: StubScheduler, pool_factory: Any, clock: Any, sink: Any = None
+) -> SweepLoop:
     guard = BudgetGuard(
         cap_usd=1000.0,
         margin_usd=5.0,
@@ -375,6 +381,7 @@ def _loop(tmp_path: Path, sched: StubScheduler, pool_factory: Any, clock: Any) -
         make_spec=_spec,
         clock=clock,
         smoke=False,
+        sink=sink or RecordingSink(),
     )
 
 
@@ -474,3 +481,83 @@ def test_main_returns_3_when_budget_already_spent(
 
     assert code == 3
     assert world.submissions == []
+
+
+# --- fix round 1: state checks, cap ceiling, live logging ----------------------------------------
+
+
+def test_settings_reject_cap_above_the_default_cap(tmp_path: Path) -> None:
+    with pytest.raises(SettingsError, match=r"^SWEEP_CAP_USD must be <= 100.0 \(CAP_USD_DEFAULT\)$"):
+        load_settings(_env(tmp_path, SWEEP_CAP_USD="150"))
+
+
+def test_main_refuses_to_resume_a_smoke_state_dir_as_a_full_sweep(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory)
+    n_before = len(world.submissions)
+
+    code = _run(_env(tmp_path), clock, pool_factory)
+
+    meta = json.loads((tmp_path / "sweep" / "sweep_meta.json").read_text())
+    assert code == 4
+    assert meta["mode"] == "smoke"
+    assert len(world.submissions) == n_before
+
+
+def test_main_refuses_state_dir_whose_arm_set_changed(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory)
+    meta_path = tmp_path / "sweep" / "sweep_meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta_path.write_text(json.dumps({**meta, "arms_sha256": "0" * 64}))
+
+    assert _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory) == 4
+
+
+def test_main_refuses_scheduler_state_without_calibration_json(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory)
+    (tmp_path / "sweep" / "calibration.json").unlink()
+    n_before = len(world.submissions)
+
+    code = _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory)
+
+    assert code == 4
+    assert len(world.submissions) == n_before
+
+
+def test_main_logs_live_sweep_metrics(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+    sink = RecordingSink()
+
+    _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory, sink)
+
+    live = [d for _, d in sink.logs if "jobs_done" in d]  # the first log is calibration's
+    assert len(live) >= 2
+    assert "calibration_usd" in sink.logs[0][1]
+    first, last = live[0], live[-1]
+    keys = {"spent_usd", "projected_usd", "remaining_usd", "jobs_running", "jobs_done"}
+    assert keys <= set(first)
+    assert (last["jobs_done"], last["jobs_running"]) == (2, 0)
+    # after rung 0 both arms are promoted to rung 1 (uniform outside the quota, visited inside)
+    assert (last["arms/promoted"], last["arms/pruned"], last["rung/pendulum_sparse"]) == (2, 0, 1)
+    assert last["projected_usd"] >= last["spent_usd"]
+    elapsed = [t for t, _ in sink.logs]
+    assert elapsed == sorted(elapsed)
+
+
+def test_loop_logs_projected_spend_including_jobs_in_flight(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    sched = StubScheduler(_jobs(1, step_budget=10**6))
+    sink = RecordingSink()
+    loop = _loop(tmp_path, sched, pool_factory, clock, sink=sink)
+
+    loop.run()
+
+    # one job of 10^6 / (1000 / 2) = 2000 s: while it runs, projected = spent + what is left
+    running = [d for _, d in sink.logs if d["jobs_running"] == 1]
+    assert running
+    assert all(d["projected_usd"] > d["spent_usd"] for d in running)

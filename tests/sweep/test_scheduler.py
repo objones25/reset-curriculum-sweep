@@ -1140,3 +1140,21 @@ def test_rung_results_rejects_unknown_rung(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="rung 3 out of range"):
         s.rung_results(UNIFORM_A, 3)
+
+
+def test_bounds_match_ucb_of_current_rung_results(tmp_path: Path) -> None:
+    s = _finish_rung0_small(tmp_path)
+    jobs = [j for j in s.next_jobs(1000) if j.arm == V00_A]
+    for job, auc in zip(jobs, (0.6, 0.8, 0.7), strict=True):
+        s.report(_result(job, auc))
+
+    lcb, ucb = s.bounds(V00_A)
+
+    # IQM of [0.6, 0.7, 0.8] = 0.7 (3 runs keep all); sd = 0.1; half = 2 * 0.1 / sqrt(3)
+    assert (lcb, ucb) == (pytest.approx(0.7 - 0.2 / math.sqrt(3)), pytest.approx(0.7 + 0.2 / math.sqrt(3)))
+
+
+def test_bounds_are_none_at_rung0(tmp_path: Path) -> None:
+    s = _new(tmp_path, SMALL_A)
+
+    assert s.bounds(UNIFORM_A) is None

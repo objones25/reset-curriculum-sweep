@@ -457,6 +457,14 @@ class Scheduler:
             raise ValueError(f"rung {rung} out of range 0..{self._last_rung}")
         return list(self._rung_results(self._index[arm], rung))
 
+    def bounds(self, arm: Arm) -> tuple[float, float] | None:
+        """(LCB, UCB) the scheduler uses for `arm` on its current rung (+-inf without results);
+        None at rung 0, where arms are ranked by `rung0_key`, and for a stopped arm."""
+        i = self._index[arm]
+        if self._states[i].rung == 0 or not self._is_live(i):
+            return None
+        return self._bounds([i])[i]
+
     # --- arms, ids, slots ----------------------------------------------------------------------
 
     def _add_arm(self, arm: Arm, *, rung: int, status: Status) -> None:

@@ -3,11 +3,13 @@ survives pod restarts (Review Focus 2).
 
 - Spend is pod time, not job time: the pod is billed whether one worker or four are busy, so a
   job that gets killed still counted, through the wall clock, for every second it ran.
-- The ledger (`ledger_path`, JSON lines ``{"t": session seconds, "spent": cumulative USD}``)
+- The ledger (`ledger_path`, JSON lines ``{"t": session seconds, "spent": cumulative USD,
+  "utc": ISO wall-clock time}``)
   holds the cumulative spend of every session in this state dir. A new session starts from the
   last line plus `LEDGER_GAP_S` worth of spend: the time between the last heartbeat before a
-  crash and the crash itself is unrecorded, and that is at most one heartbeat interval plus one
-  poll (`HEARTBEAT_S` 30 s + a 5 s poll < 60 s). It then writes a session-start line at once.
+  crash and the crash itself is unrecorded, and that is at most one heartbeat interval plus
+  the longest gap between heartbeat calls (`HEARTBEAT_S` 15 s + a 5 s poll, or one result
+  report, < 60 s). It then writes a session-start line at once.
 - `can_start` refuses a job once ``spent + est_job_s + in_flight_s`` (pod-seconds the sweep
   will still pay for, at the current price) would pass ``cap - margin``. The caller decides how
   jobs map to pod-seconds (the sweep loop: in_flight_s = the longest remaining in-flight wall
@@ -26,6 +28,7 @@ import math
 import os
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
@@ -37,7 +40,7 @@ CALIBRATION_CAP_USD: Final = 10.0
 NETWORK_VOLUME_USD_PER_GB_MONTH: Final = 0.07
 NETWORK_VOLUME_GB: Final = 20
 HOURS_PER_MONTH: Final = 730.0
-HEARTBEAT_S: Final = 30.0
+HEARTBEAT_S: Final = 15.0
 LEDGER_GAP_S: Final = 60.0
 
 
@@ -51,6 +54,10 @@ def volume_usd_per_h(gb: float) -> float:
     if not (math.isfinite(gb) and gb >= 0):
         raise ValueError(f"gb must be >= 0, got {gb}")
     return gb * NETWORK_VOLUME_USD_PER_GB_MONTH / HOURS_PER_MONTH
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _check_price(name: str, value: float, *, allow_zero: bool) -> None:
@@ -72,6 +79,7 @@ class BudgetGuard:
         volume_usd_per_h: float,
         ledger_path: Path,
         clock: Callable[[], float] = time.monotonic,
+        utc_now: Callable[[], str] = _utc_now,
     ) -> None:
         _check_price("cap_usd", cap_usd, allow_zero=False)
         _check_price("margin_usd", margin_usd, allow_zero=True)
@@ -82,6 +90,7 @@ class BudgetGuard:
         self.usd_per_s = (gpu_usd_per_h + volume_usd_per_h) / 3600.0
         self._path = ledger_path
         self._clock = clock
+        self._utc_now = utc_now
         self._t0 = clock()
         last = self._read_last_spent()
         self._prior = 0.0 if last is None else last + LEDGER_GAP_S * self.usd_per_s
@@ -125,9 +134,10 @@ class BudgetGuard:
             self.flush()
 
     def flush(self) -> None:
-        """Append ``{t, spent}`` now, fsynced."""
+        """Append ``{t, spent, utc}`` now, fsynced."""
         t = self.elapsed_s()
-        line = json.dumps({"t": t, "spent": self.spent()}, allow_nan=False)
+        row = {"t": t, "spent": self.spent(), "utc": self._utc_now()}
+        line = json.dumps(row, allow_nan=False)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")

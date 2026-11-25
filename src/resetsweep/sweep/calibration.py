@@ -24,8 +24,15 @@ wall clock from submit to result minus ``env_steps / steps_per_s``.
 
 Everything lands in `calibration.json` after each batch (atomic replace), with the spend so far
 (guard spend while calibrating, summed over sessions). On restart, finished batches are reused
-and calibration continues where it stopped; the cap is checked before each batch, so the
-overshoot is at most one batch, and every job has a timeout.
+and calibration continues where it stopped.
+
+The cap is never passed. Each batch gets a budget: what is left of the calibration cap, and
+never more than the sweep's own `guard.remaining()`. A batch starts only if that budget pays
+for at least one poll interval of pod time; its jobs' timeout is cut to what the budget pays
+for (the pod bills at full rate while any job runs, so the budget in seconds is the longest a
+batch may run); and the batch loop polls no further than the budget's end and closes the pool
+(killing its jobs) once the budget is spent. A batch cut short that way is not stored, and
+calibration stops as capped. Jobs killed by their cut timeout are stored as failed.
 
 `choose_plan` picks one worker count for the sweep and, per family, the smallest num_envs whose
 aggregate steps/s is within 10% of that family's best at that worker count (smaller N means
@@ -344,24 +351,40 @@ def _run_batch(
     pool_factory: PoolFactory,
     runner_cfg: RunnerConfig,
     clock: Callable[[], float],
-) -> list[Measurement]:
+    budget_usd: float,
+) -> list[Measurement] | None:
+    """Run one batch within `budget_usd` of pod time; None if the budget ran out first."""
+    budget_s = budget_usd / guard.usd_per_s
+    if not budget_s > 0:
+        raise ValueError(f"batch budget must be > 0, got {budget_usd} USD")
+    timeout_s = min(s.job_timeout_s, budget_s)
     pool = pool_factory(batch.n_workers, s.device, runner_cfg)
     pending = {(spec.arm_id(), spec.seed): (job, spec, lr) for job, spec, lr in batch.jobs}
     if len(pending) != len(batch.jobs):
         raise RuntimeError(f"batch {batch.key} has duplicate (arm_id, seed) jobs")
     done: dict[tuple[str, int], Measurement] = {}
+    start_usd = guard.spent()
     try:
         submitted_at: dict[tuple[str, int], float] = {}
         for key, (job, spec, _) in pending.items():
             run_log_path(runner_cfg.runs_dir, spec).unlink(missing_ok=True)
-            pool.submit(job, spec, timeout_s=s.job_timeout_s)
+            pool.submit(job, spec, timeout_s=timeout_s)
             submitted_at[key] = clock()
-        # The pool kills a job at its timeout, so this ends; the bound is a backstop.
-        max_polls = math.ceil(s.job_timeout_s / s.poll_s) + 100
+        # Each pass waits up to poll_s or until the budget ends, which closes the batch, so
+        # this ends; the bound is a backstop.
+        max_polls = math.ceil(budget_s / s.poll_s) + 100
         for _ in range(max_polls):
             if len(done) == len(pending):
                 break
-            for result in pool.poll(timeout_s=s.poll_s):
+            left_s = (budget_usd - (guard.spent() - start_usd)) / guard.usd_per_s
+            if left_s <= 0 or guard.remaining() <= 0:
+                _log.warning(
+                    "calibration batch %s stopped at its budget (%.2f USD); jobs killed",
+                    batch.key,
+                    budget_usd,
+                )
+                return None
+            for result in pool.poll(timeout_s=min(s.poll_s, left_s)):
                 key = (result.arm_id, result.seed)
                 job, spec, lr = pending[key]
                 elapsed = clock() - submitted_at[key]
@@ -392,21 +415,33 @@ def calibrate(
     for batch in _planned(families, settings, record):
         if batch.key in record.batches:
             continue
-        if record.spent_usd >= settings.cap_usd:
+        budget_usd = min(settings.cap_usd - record.spent_usd, guard.remaining())
+        if budget_usd / guard.usd_per_s < settings.poll_s:
             record.capped = True
             _log.warning(
-                "calibration stopped at its cap: %.2f of %.2f USD spent; next batch %s",
+                "calibration stopped at its cap: %.2f of %.2f USD spent, %.2f USD left in the "
+                "sweep budget; next batch %s",
                 record.spent_usd,
                 settings.cap_usd,
+                guard.remaining(),
                 batch.key,
             )
             break
         start = guard.spent()
         ms = _run_batch(
-            batch, s=settings, guard=guard, pool_factory=pool_factory, runner_cfg=runner_cfg, clock=clock
+            batch,
+            s=settings,
+            guard=guard,
+            pool_factory=pool_factory,
+            runner_cfg=runner_cfg,
+            clock=clock,
+            budget_usd=budget_usd,
         )
-        record.batches[batch.key] = ms
         record.spent_usd += guard.spent() - start
+        if ms is None:
+            record.capped = True
+            break
+        record.batches[batch.key] = ms
         record.save(path)
         _log.info(
             "calibration %s: %s (%.2f USD so far)",
