@@ -148,6 +148,9 @@ class RampDeceptive(_Ramp):
 @TASKS.register("ramp_dense")
 class RampDense(_Ramp):
     name = "ramp_dense"
+    # reward = cart height: at most the far slope's top (1.69 m); the near top is 0.83 m and
+    # the plateau beyond the far slope is flat. There is no cost term.
+    reward_max = FAR_SLOPE_LEN_M * _SIN_FAR
 
     def reward(self, sim: BatchSim, extra: Tensor, action: Tensor) -> Tensor:
         return height_m(sim.qpos[:, 0])

@@ -474,6 +474,10 @@ class MazeDense(_Maze):
     """`maze` plus minus the normalised geodesic distance to the goal (-1 at the start, 0 at the goal)."""
 
     name = "maze_dense"
+    # reward = -(geodesic distance / path length) - action cost <= 0, so the bound is 0.
+    # `build_score` rejects `critic_value` for such a task: vmax would be 0 and the score
+    # V * (vmax - V) is meaningless when every return is negative.
+    reward_max = 0.0
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

@@ -79,6 +79,24 @@ def canonicalize(task: Task, states: StartStates) -> StartStates:
     return states
 
 
+REWARD_MAX_DEFAULT = 1.0
+
+
+@runtime_checkable
+class BoundsReward(Protocol):
+    """Optional attribute: the largest per-step reward the task can give. Sparse tasks pay a
+    success indicator minus a non-negative action cost, so their bound is the default 1.0."""
+
+    reward_max: float
+
+
+def reward_max(task: Task) -> float:
+    """`task.reward_max` for tasks that set it, else `REWARD_MAX_DEFAULT`."""
+    if isinstance(task, BoundsReward):
+        return task.reward_max
+    return REWARD_MAX_DEFAULT
+
+
 def prepare_candidates(task: Task, states: StartStates) -> tuple[StartStates, Tensor]:
     """The one path for reached states kept for later restarts: canonicalize, then mark the
     rows that are finite and accepted by `task.is_valid`. Returns `(states, valid)`."""

@@ -50,7 +50,7 @@ from resetsweep.scores.base import Score
 from resetsweep.sim.batch import BatchSim
 from resetsweep.sim.env import VecEnv
 from resetsweep.sim.rollouts import Rollouts
-from resetsweep.tasks.base import TASKS, Task
+from resetsweep.tasks.base import TASKS, Task, reward_max
 from resetsweep.types import Outcomes, RolloutStats, StartStates, StepCounter
 
 TASKS.load("resetsweep.tasks")
@@ -518,6 +518,37 @@ def _seeded_score_kw(name: str, kw: Mapping[str, Any], seed: int) -> dict[str, A
     return out
 
 
+def _discounted_return_max(task: Task, gamma: float) -> float:
+    """Discounted return of the best possible episode, `reward_max` every step for
+    `max_steps` steps. It is in the critic's units: train.py gives GAE and the critic the raw
+    reward (no reward scaling), so no extra factor applies."""
+    bound = reward_max(task)
+    if bound <= 0.0:
+        raise ValueError(
+            f"task {type(task).__name__} has reward_max {bound} <= 0, so no positive "
+            "value bound (vmax) exists for critic_value"
+        )
+    if gamma == 1.0:
+        return bound * task.max_steps
+    return bound * (1.0 - gamma**task.max_steps) / (1.0 - gamma)
+
+
+def _with_vmax(
+    name: str, kw: Mapping[str, Any], task: Task, gamma: float
+) -> dict[str, Any]:
+    """`kw` plus `vmax` when score `name` takes one and `kw` sets none, applied to an
+    `inner` score's `inner_kw` as well (`inverted` wrapping `critic_value`)."""
+    params = inspect.signature(SCORES.get(name)).parameters
+    out = dict(kw)
+    if "vmax" in params and "vmax" not in out:
+        out["vmax"] = _discounted_return_max(task, gamma)
+    if "inner" in params and "inner" in out:
+        out["inner_kw"] = _with_vmax(
+            str(out["inner"]), out.get("inner_kw") or {}, task, gamma
+        )
+    return out
+
+
 def build_score(spec: RunSpec, task: Task) -> Score | None:
     """The arm's score with the method's IC capacity, seeded with `_score_seed(spec.seed)`
     (inner scores too) when it draws random values; None for scoreless arms."""
@@ -527,7 +558,8 @@ def build_score(spec: RunSpec, task: Task) -> Score | None:
     capacity = score_capacity(
         spec.method, task=task, num_envs=spec.num_envs, method_kw=method_kw
     )
-    kw = _seeded_score_kw(spec.score, spec.score_kw, _score_seed(spec.seed))
+    kw = _with_vmax(spec.score, spec.score_kw, task, spec.ppo.gamma)
+    kw = _seeded_score_kw(spec.score, kw, _score_seed(spec.seed))
     return SCORES.construct(spec.score, capacity=capacity, device=spec.device, **kw)  # pyright: ignore[reportReturnType] # registry returns object
 
 

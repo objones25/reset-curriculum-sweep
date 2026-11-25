@@ -525,3 +525,65 @@ def test_run_logs_update_stats_and_diagnostics_that_share_a_key(
 def test_run_propagates_exceptions() -> None:
     with pytest.raises(KeyError, match="unknown task 'nope'"):
         run(_spec(task="nope"), _Recorder())
+
+
+# --- critic_value vmax ------------------------------------------------------------------------
+
+
+def _critic_score(**overrides: Any) -> Any:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    spec = _spec(
+        method="walk",
+        method_kw={"R": 2},
+        score="critic_value",
+        score_kw={"temperature": 0.01},
+        **overrides,
+    )
+    score = build_score(spec, task)
+    assert score is not None
+    return task, score
+
+
+def test_critic_value_vmax_is_the_discounted_return_of_the_best_episode() -> None:
+    task, score = _critic_score()
+
+    gamma = PPO.gamma
+    expected = 1.0 * (1 - gamma**task.max_steps) / (1 - gamma)
+    assert score._vmax == pytest.approx(expected)  # pyright: ignore[reportAttributeAccessIssue] # private on purpose
+
+
+def test_explicit_vmax_in_score_kw_is_kept() -> None:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    spec = _spec(
+        method="walk",
+        method_kw={"R": 2},
+        score="critic_value",
+        score_kw={"temperature": 0.01, "vmax": 7.5},
+    )
+    score = build_score(spec, task)
+    assert score is not None
+    assert score._vmax == 7.5  # pyright: ignore[reportAttributeAccessIssue] # private on purpose
+
+
+def test_inverted_critic_value_gets_vmax_for_its_inner_score() -> None:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    spec = _spec(
+        method="walk",
+        method_kw={"R": 2},
+        score="inverted",
+        score_kw={"inner": "critic_value", "inner_kw": {"temperature": 0.01}},
+    )
+    assert build_score(spec, task) is not None
+
+
+def test_vmax_is_rejected_for_a_task_with_no_positive_reward() -> None:
+    task: Task = TASKS.construct("maze_dense")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    spec = _spec(
+        task="maze_dense",
+        method="walk",
+        method_kw={"R": 2},
+        score="critic_value",
+        score_kw={"temperature": 0.01},
+    )
+    with pytest.raises(ValueError, match="reward_max"):
+        build_score(spec, task)
