@@ -9,7 +9,7 @@ Row index grows with y, column index with x. `qpos = (x, y)`, in metres.
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
@@ -83,13 +83,32 @@ class MazeGrid:
         ) * self.cell_m
 
     def cell_of(self, xy: Tensor) -> tuple[Tensor, Tensor]:
-        """`(row, col)` of each point, clamped into the grid (callers check `in_free_space`)."""
+        """`(row, col)` of each point, clamped into the grid (callers check `in_free_cell`)."""
         col = (xy[:, 0] / self.cell_m).floor().long().clamp(0, self.cols - 1)
         row = (xy[:, 1] / self.cell_m).floor().long().clamp(0, self.rows - 1)
         return row, col
 
-    def in_free_space(self, xy: Tensor) -> Tensor:
-        """True where a ball of the maze's radius at `xy` touches no wall and is inside the grid."""
+    def in_free_cell(self, xy: Tensor) -> Tensor:
+        """True where `xy` is finite, inside the grid and its centre is in a free cell.
+
+        This is the reachable-state test: soft contacts let the ball press slightly into a wall,
+        so states with the ball touching (even a little overlapping) a wall are reachable.
+        """
+        finite = torch.isfinite(xy).all(dim=1)
+        xy = torch.nan_to_num(xy, nan=0.0, posinf=0.0, neginf=0.0)
+        inside = (
+            (xy[:, 0] >= 0)
+            & (xy[:, 1] >= 0)
+            & (xy[:, 0] < self.cols * self.cell_m)
+            & (xy[:, 1] < self.rows * self.cell_m)
+        )
+        row, col = self.cell_of(xy)
+        return finite & inside & ~self.occupied[row, col]
+
+    def has_clearance(self, xy: Tensor) -> Tensor:
+        """True where a ball of the maze's radius at `xy` touches no wall and is inside the grid.
+
+        Stricter than `in_free_cell`; for spawning starts, not for judging reached states."""
         finite = torch.isfinite(xy).all(dim=1)
         xy = torch.nan_to_num(xy, nan=0.0, posinf=0.0, neginf=0.0)
         inside = (
@@ -340,7 +359,7 @@ class _Maze:
         low = self.start_box.low.to(x.device)
         high = self.start_box.high.to(x.device)
         in_box = ((x >= low) & (x <= high)).all(dim=1) & torch.isfinite(x).all(dim=1)
-        return in_box & self.grid.in_free_space(states.qpos.cpu()).to(x.device)
+        return in_box & self.grid.in_free_cell(states.qpos.cpu()).to(x.device)
 
     def eval_states(self, n: int, seed: int) -> StartStates:
         # A local generator: never touches the global torch RNG.
@@ -387,12 +406,29 @@ class MazeDense(_Maze):
 
     name = "maze_dense"
 
-    def reward(self, sim: BatchSim, extra: Tensor, action: Tensor) -> Tensor:
-        goal = (
-            self.grid.centre(self.grid.goal_cell)
-            .to(sim.qpos.device)
-            .expand_as(sim.qpos)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        grid = self.grid
+        free = (~grid.occupied).flatten().nonzero().squeeze(1)
+        centres = torch.stack(
+            [
+                (torch.arange(grid.rows * grid.cols) % grid.cols + 0.5) * grid.cell_m,
+                (torch.arange(grid.rows * grid.cols) // grid.cols + 0.5) * grid.cell_m,
+            ],
+            dim=1,
         )
-        to_go = path_distance(self, sim.qpos.cpu(), goal.cpu()).to(sim.qpos.device)
-        total = self.grid.shortest_path_cells * self.grid.cell_m
-        return -to_go / total - self._action_cost(action)
+        # A wall cell takes the goal distance of the nearest free cell, so a ball pressed into a
+        # wall by a soft contact (or off the grid, once clamped) still gets a finite reward.
+        nearest = free[torch.cdist(centres, centres[free]).argmin(dim=1)]
+        goal_steps = grid.dist_cells[:, grid.flat(grid.goal_cell)][nearest]
+        self._to_goal_m = goal_steps.float() * grid.cell_m
+        self._goal_xy = grid.centre(grid.goal_cell)
+        self._total_m = grid.shortest_path_cells * grid.cell_m
+
+    def reward(self, sim: BatchSim, extra: Tensor, action: Tensor) -> Tensor:
+        xy = sim.qpos
+        cell = self.grid.cell_index(xy)  # clamped into the grid
+        table = self._to_goal_m.to(xy.device)
+        euclid = (xy - self._goal_xy.to(xy.device)).norm(dim=1)
+        to_go = torch.maximum(table[cell], euclid)
+        return -to_go / self._total_m - self._action_cost(action)

@@ -142,16 +142,43 @@ def test_is_valid_rejects_point_inside_wall() -> None:
     assert valid.tolist() == [False, True]
 
 
-def test_is_valid_rejects_point_overlapping_a_wall_face() -> None:
+def test_is_valid_accepts_ball_touching_wall() -> None:
     task = _task("maze")
     grid = _grid(task)
     x, _y = _centre(grid, 1, 3)
-    touching_wall = [
-        x,
-        2 * grid.cell_m - 0.01,
-    ]  # inside the corridor but within the ball radius
+    # Centre 0.01 m from the wall face: the ball overlaps the wall slightly, as a soft contact allows.
+    touching_wall = [x, 2 * grid.cell_m - 0.01]
 
-    assert task.is_valid(_states([touching_wall])).tolist() == [False]
+    assert task.is_valid(_states([touching_wall])).tolist() == [True]
+
+
+@pytest.mark.parametrize("name", ["maze", "maze_narrow"])
+def test_is_valid_accepts_every_state_reached_pushing_into_walls(name: str) -> None:
+    task = _task(name)
+    sim = BatchSim(task.mjcf, nworld=64, device="cpu", frame_skip=task.frame_skip)
+    starts = task.sample_start(64, torch.Generator().manual_seed(0))
+    sim.set_state(torch.arange(64), starts.qpos, starts.qvel)
+    gen = torch.Generator().manual_seed(1)
+    reached = []
+    for _ in range(300):
+        # Sign actions: full force in a random diagonal, pressing into walls and corners.
+        sim.step(torch.sign(torch.randn(64, 2, generator=gen)))
+        reached.append((sim.qpos.clone(), sim.qvel.clone()))
+    qpos = torch.cat([q for q, _ in reached])
+    qvel = torch.cat([v for _, v in reached])
+
+    valid = task.is_valid(StartStates(qpos, qvel, torch.zeros(qpos.shape[0], 0)))
+
+    assert bool(valid.all())
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_sample_start_keeps_ball_clear_of_walls(name: str) -> None:
+    task = _task(name)
+
+    starts = task.sample_start(256, torch.Generator().manual_seed(0))
+
+    assert bool(_grid(task).has_clearance(starts.qpos).all())
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -267,6 +294,19 @@ def test_dense_reward_prefers_path_progress_over_euclidean_closeness() -> None:
     lane0_start = _dense_reward_at(_centre(grid, 1, 1))
 
     assert lane0_start < lane0_far_end < lane1_start
+
+
+def test_dense_reward_finite_when_centre_in_wall_cell() -> None:
+    task = _task("maze_dense")
+    grid = _grid(task)
+    in_wall = _centre(grid, 2, 3)
+    off_grid = [-1.0, 99.0]
+    sim = _sim_at(task, [in_wall, off_grid])
+
+    reward = task.reward(sim, torch.zeros(2, 0), torch.zeros(2, 2))
+
+    assert bool(torch.isfinite(reward).all())
+    assert bool((reward <= 0).all())
 
 
 def test_sparse_and_dense_share_geometry() -> None:
