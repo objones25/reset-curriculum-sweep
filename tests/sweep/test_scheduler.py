@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -407,40 +408,26 @@ def _run_to_final_rung(s: Scheduler, auc_of: AucOf) -> None:
     raise AssertionError("no arm reached the final rung in 10 rounds")
 
 
-def test_done_when_leader_separated(tmp_path: Path) -> None:
+def test_done_waits_for_all_final_seeds_even_when_separated(tmp_path: Path) -> None:
     s = _finish_rung0_small(tmp_path)
-    # V00_A wins on every task (its dense copies too); controls score 0.0.
+    # The visited arms score 0.9 on every group and the controls 0.0, so every group's
+    # leader separates as soon as it has 2 seeds (sd 0).
     good = lambda job: 0.9 if job.arm.method == "visited" else 0.0
     _run_to_final_rung(s, good)
-    k = _final_live(s)
-    # One seed per final-rung arm: sd comes from the spread, so no separation yet.
-    _step(s, k, good)
+    final = s.next_jobs(1000)
+    (last,) = [
+        j for j in final if j.arm.label() == "pendulum_dense/uniform/-" and j.seed == 4
+    ]
+    for job in [j for j in final if j != last]:
+        s.report(_result(job, good(job)))
+    s.report(_result(last, 0.0, status="failed"))  # its retry is pending, not running
     not_yet = s.done()
 
-    _step(s, k, good)  # two seeds each, sd 0: 0.9 LCB > 0.0 UCB on every task
+    retry = _step(s, 1000, good)
 
     assert not not_yet
+    assert retry == [Job(arm=last.arm, seed=1004, rung=2, step_budget=90)]
     assert s.done()
-    # Seeds remain: done came from the separation rule, not from exhaustion.
-    assert s.next_jobs(1000) != []
-
-
-def test_not_done_while_final_intervals_overlap(tmp_path: Path) -> None:
-    s = _finish_rung0_small(tmp_path)
-
-    def auc_of(job: Job) -> float:
-        if job.arm == UNIFORM_A:
-            return 0.85 if job.seed % 2 == 0 else 0.95
-        return 0.9 if job.arm.method == "visited" else 0.0
-
-    _run_to_final_rung(s, auc_of)
-    k = _final_live(s)
-    _step(s, k, auc_of)
-    _step(s, k, auc_of)
-    # Task A: V00_A [0.9, 0.9] has LCB 0.9; uniform [0.85, 0.95] has
-    # UCB 0.9 + 2 * 0.0707 / sqrt(2) = 1.0 >= 0.9. The dense tasks are separated.
-
-    assert not s.done()
 
 
 def test_not_done_before_any_result(tmp_path: Path) -> None:
@@ -456,6 +443,151 @@ def test_done_when_no_jobs_remain(tmp_path: Path) -> None:
 
     assert s.done()
     assert s.next_jobs(1000) == []
+
+
+def _maze_arms() -> list[Arm]:
+    return [
+        _arm("maze", tail)
+        for tail in (
+            "uniform/-",
+            "point/-",
+            "visited[p_task=0.0]/-",
+            "visited[p_task=0.2]/-",
+            "visited[p_task=0.5]/-",
+        )
+    ]
+
+
+LANES5 = (("lanes", 5),)
+
+
+def _variant(arm: Arm) -> Arm:
+    return replace(arm, task_kw=LANES5)
+
+
+def _finish_rung0_maze(tmp_path: Path) -> tuple[Scheduler, list[Arm]]:
+    """maze through rung 0 with visited[p_task=0.0] on top: rung 1 adds maze[lanes=5]."""
+    arms = _maze_arms()
+    s = _new(tmp_path, arms)
+    _step(s, 100, _by_label({arms[2].label(): 0.9}))
+    s.promotions()
+    return s, arms
+
+
+def test_task_variant_is_pruned_only_within_its_group(tmp_path: Path) -> None:
+    s, arms = _finish_rung0_maze(tmp_path)
+    uniform, v00 = arms[0], arms[2]
+    jobs = {(j.arm, j.seed): j for j in s.next_jobs(1000)}
+    for seed, auc in enumerate((0.80, 0.82, 0.81)):  # maze leader LCB 0.7985
+        s.report(_result(jobs[(uniform, seed)], auc))
+    # maze[lanes=5] visited: UCB 0.115 < 0.7985, but it is in its own group, where it
+    # is the only arm with results.
+    for seed, auc in enumerate((0.10, 0.11)):
+        s.report(_result(jobs[(_variant(v00), seed)], auc))
+
+    assert s.state(_variant(v00)).status == "active"
+
+
+def test_task_variant_gets_its_own_anchors_to_the_final_rung(tmp_path: Path) -> None:
+    s, arms = _finish_rung0_maze(tmp_path)
+    _run_to_final_rung(s, lambda job: 0.5)
+
+    statuses = {s.state(_variant(a)).status for a in arms[:2]}
+
+    assert statuses == {"final"}
+
+
+def test_variant_anchors_enter_at_rung1(tmp_path: Path) -> None:
+    s, arms = _finish_rung0_maze(tmp_path)
+
+    entry = {(s.state(_variant(a)).rung, s.state(_variant(a)).status) for a in arms[:2]}
+
+    assert entry == {(1, "active")}
+
+
+def test_protected_arm_gets_three_retries(tmp_path: Path) -> None:
+    s = _new(tmp_path, SMALL_A)
+    jobs = s.next_jobs(100)
+    for job in jobs:
+        s.report(_result(job, 0.1, status=_fail_if(job, UNIFORM_A)))
+    seeds = []
+    for _ in range(3):
+        (retry,) = s.next_jobs(100)
+        seeds.append(retry.seed)
+        s.report(_result(retry, 0.0, status="failed"))
+
+    assert seeds == [1000, 2000, 3000]
+    assert s.state(UNIFORM_A).status == "failed"
+    assert UNIFORM_A not in {j.arm for j in s.next_jobs(100)}
+
+
+def test_protected_arm_survives_two_failures(tmp_path: Path) -> None:
+    s = _new(tmp_path, SMALL_A)
+    for job in s.next_jobs(100):
+        s.report(_result(job, 0.1, status=_fail_if(job, UNIFORM_A)))
+    (retry1,) = s.next_jobs(100)
+    s.report(_result(retry1, 0.0, status="failed"))
+    (retry2,) = s.next_jobs(100)
+    s.report(_result(retry2, 0.4))
+
+    s.promotions()
+
+    assert (s.state(UNIFORM_A).rung, s.state(UNIFORM_A).status) == (1, "promoted")
+
+
+def _kill_uniform_a(s: Scheduler) -> None:
+    for job in s.next_jobs(100):
+        s.report(_result(job, 0.1, status=_fail_if(job, UNIFORM_A)))
+    for _ in range(3):
+        (retry,) = s.next_jobs(100)
+        s.report(_result(retry, 0.0, status="failed"))
+
+
+def test_anchorless_group_flagged_at_final_rung(tmp_path: Path) -> None:
+    s = _new(tmp_path, SMALL_A)
+    _kill_uniform_a(s)
+    for _ in range(10):
+        _step(s, 1000, lambda job: 0.5)
+
+    assert s.done()
+    assert s.anchorless_groups() == [(TASK_A, ())]
+
+
+def test_anchorless_not_flagged_before_final_rung(tmp_path: Path) -> None:
+    s = _new(tmp_path, SMALL_A)
+    _kill_uniform_a(s)
+
+    s.promotions()
+
+    assert s.anchorless_groups() == []
+
+
+def test_no_anchorless_groups_when_anchors_succeed(tmp_path: Path) -> None:
+    s = _new(tmp_path, SMALL_A)
+    for _ in range(10):
+        _step(s, 1000, lambda job: 0.5)
+
+    assert s.done()
+    assert s.anchorless_groups() == []
+
+
+def test_batch_counts_in_flight_jobs_as_observations(tmp_path: Path) -> None:
+    s = _finish_rung0_small(tmp_path)
+    n_rung1 = sum(1 for st in s.states() if st.rung == 1)
+    rung1 = {UNIFORM_A.label(): 0.50, POINT_A.label(): 0.48, V00_A.label(): 0.10}
+    _step(s, n_rung1, _by_label(rung1))  # one seed each (dense arms score 0.0)
+    # Task A spread = sample std of [0.50, 0.48, 0.10] = 0.22554; bonus 2 * 0.22554 / sqrt(n).
+    # Pick 1: uniform 0.951 > point 0.931 > V00_A 0.551 (dense arms 0.0).
+    # Pick 2: uniform now has 1 in flight, n = 2: 0.5 + 0.319 = 0.819 < point 0.931.
+    # Pick 3: point n = 2: 0.48 + 0.319 = 0.799 < uniform 0.819 > V00_A 0.551.
+
+    jobs = s.next_jobs(3)
+
+    assert [(j.arm, j.seed) for j in jobs] == [
+        (UNIFORM_A, 1),
+        (POINT_A, 1),
+        (UNIFORM_A, 2),
+    ]
 
 
 # --- reporting ---------------------------------------------------------------------------------

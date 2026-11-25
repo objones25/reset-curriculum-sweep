@@ -200,6 +200,37 @@ def test_rung1_expand_task_variants(rung0: list[Arm]) -> None:
     }
 
 
+def test_rung1_expand_adds_anchors_for_each_task_variant(rung0: list[Arm]) -> None:
+    maze = _survivor(rung0, task="maze", method="walk", score="rnd")
+    trap = _survivor(rung0, task="maze_trap", method="walk", score="rnd")
+    expanded = arm_space("rung1_expand", survivors=[maze, trap])
+    anchors = {
+        (a.task, a.task_kw, a.method)
+        for a in expanded
+        if a.task_kw and a.method in {"uniform", "point"}
+    }
+    assert anchors == {
+        (task, kw, method)
+        for task, kw in (
+            ("maze", (("lanes", 5),)),
+            ("maze_trap", (("trap_scale", 0.5),)),
+            ("maze_trap", (("trap_scale", 2.0),)),
+        )
+        for method in ("uniform", "point")
+    }
+
+
+def test_variant_anchors_match_the_plain_anchors(rung0: list[Arm]) -> None:
+    maze = _survivor(rung0, task="maze", method="walk", score="rnd")
+    plain = {a.method: a for a in rung0 if a.task == "maze" and a.method in {"uniform", "point"}}
+    expanded = arm_space("rung1_expand", survivors=[maze])
+    variant = [a for a in expanded if a.task_kw and a.method in {"uniform", "point"}]
+    assert variant == [
+        Arm(**{**plain[a.method].__dict__, "task_kw": (("lanes", 5),)}) for a in variant
+    ]
+    assert len(variant) == 2
+
+
 def test_rung1_expand_rejects_non_rung0_survivor(rung0: list[Arm]) -> None:
     survivor = _survivor(rung0, task="maze", method="walk", score="rnd")
     dense = Arm(**{**survivor.__dict__, "task": "pendulum_dense"})

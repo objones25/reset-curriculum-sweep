@@ -14,7 +14,8 @@ until it has a plan.
 - Task variants exist for `maze` (lanes=5) and `maze_trap` (trap_scale 0.5, 2.0) only.
 - It returns only arms that rung 0 did not run, deduplicated in `arm_space`: `visited` gets
   no p_task variants (rung 0 ran the whole sweep), and `uniform`/`point` are added on the
-  dense tasks only.
+  dense tasks and on every task variant it creates (each variant is its own ranking group
+  and needs its own normalisation anchor), never on the plain sparse tasks.
 - `critic_value` arms are never put on the dense tasks: the `arm_dense` and `claw` rewards are
   mostly negative, so `V * (vmax - V)` (scores/critic.py) is meaningless there.
 - The smoke test (tests/test_smoke.py) covers 32 envs on CPU only, not the sweep's sizes.
@@ -221,9 +222,9 @@ def _unique(arms: Sequence[Arm]) -> list[Arm]:
 
 def arm_space(stage: Stage, *, survivors: Sequence[Arm] = ()) -> list[Arm]:
     """Arms for `stage`. `rung0`: every compatible method x score on the sparse tasks.
-    `rung1_expand`: `uniform` and `point` on every task, plus what each rung-0 survivor adds
-    (p_task, order, inverted score, task variants, dense tasks); survivors themselves are
-    not repeated."""
+    `rung1_expand`: `uniform` and `point` on every dense task and every new task variant,
+    plus what each rung-0 survivor adds (p_task, order, inverted score, task variants, dense
+    tasks); survivors themselves are not repeated."""
     if stage == "rung0":
         return _unique([a for t in SPARSE_TASKS for a in _rung0_arms_for(t)])
     if stage != "rung1_expand":
@@ -237,5 +238,13 @@ def arm_space(stage: Stage, *, survivors: Sequence[Arm] = ()) -> list[Arm]:
         if a.method in _NO_P_TASK
     ]
     added = [a for s in survivors for a in _expand(s)]
+    variant_controls = [
+        replace(c, task_kw=a.task_kw)
+        for a in _unique(added)
+        if a.task_kw
+        for c in _rung0_arms_for(a.task)
+        if c.method in _NO_P_TASK
+    ]
     already_run = set(arm_space("rung0")) | set(survivors)
-    return [a for a in _unique(dense_controls + added) if a not in already_run]
+    candidates = _unique(dense_controls + variant_controls + added)
+    return [a for a in candidates if a not in already_run]

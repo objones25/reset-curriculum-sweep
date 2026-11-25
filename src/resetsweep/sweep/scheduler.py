@@ -5,49 +5,61 @@ The scheduler is a state machine over arms. Each arm has a current rung and a st
     active    live; entered its rung without a promotion (rung-0 arms, rung-1 expansions)
     promoted  live; promoted into its current rung (below the final rung)
     final     live; on the final rung
-    pruned    stopped: UCB fell below the task leader's LCB, or not promoted out of its rung
-    failed    stopped: one seed failed twice (seed, then seed + RETRY_SEED_OFFSET)
+    pruned    stopped: UCB fell below the group leader's LCB, or not promoted out of its rung
+    failed    stopped: one seed failed on every allowed attempt
 
 Decisions (all binding rulings unless marked "ours"):
 
+- Groups. Ranking, promotion, pruning and normalisation happen per group
+  ``(arm.task, arm.task_kw)``: a task variant such as ``maze[lanes=5]`` is its own group, with
+  its own `uniform` and `point` anchors (added by `arm_space("rung1_expand")`).
 - Arm ids. `RunResult.arm_id` is `RunSpec.arm_id()`, which hashes `step_budget`, so one arm
   has a different id on every rung. The scheduler takes `arm_id_of(arm, step_budget) -> str`
   and keeps the map arm_id -> (arm, rung). Task 23 passes
   ``lambda arm, b: spec_for(arm, seed=0, step_budget=b, defaults=d).arm_id()`` (seed is not
   hashed). The ids are stored in `scheduler.json`; `load` recomputes them and refuses to
   resume if any differ (a changed RunSpec default would orphan every result).
-- Seeds. Rung r runs seeds ``0 .. seeds_per_rung[r] - 1``. A failed seed is retried once as
-  ``seed + RETRY_SEED_OFFSET``; a second failure marks the arm `failed`, excluded from ranking,
+- Seeds. Rung r runs seeds ``0 .. seeds_per_rung[r] - 1``. Attempt j of seed s uses seed
+  ``s + j * RETRY_SEED_OFFSET``. Ordinary arms get 1 retry, protected arms 3, each with a fresh
+  seed. When the last allowed attempt fails the arm is `failed`: excluded from ranking,
   promotion and job selection. Results at a rung count only toward that rung.
 - Order. Pending rung-0 jobs are always issued first, in arm order, so rung 0 runs every arm
-  once before any UCB choice. After that, live arms on rung >= 1 are sorted by
-  (rung ascending, UCB descending, arm order) and given one job per pass, round-robin
-  (ours: lower rungs first, because they gate promotions; UCB is not comparable across rungs).
+  once before any UCB choice. After that, jobs on rung >= 1 are picked one at a time by
+  (rung ascending, batch UCB descending, jobs in flight ascending, arm order); lower rungs
+  first is ours (they gate promotions; UCB is not comparable across step budgets). The batch
+  UCB counts the arm's jobs in flight, including those picked earlier in the same call, as
+  virtual observations in n but not in the mean, so one arm's uncertainty bonus is not spent
+  several times in one batch. Pruning uses the plain bounds (ok results only).
 - UCB at rung >= 1: mean = IQM of ok AUCs at the arm's current rung; sd = sample std
-  (ddof 1) for n >= 2, else the task's spread at the rung (sample std of the per-arm means of
-  that task's non-failed arms at that rung; 1.0, the AUC range, if fewer than 2 have results).
+  (ddof 1) for n >= 2, else the group's spread at the rung (sample std of the per-arm means of
+  the group's non-failed arms at that rung; 1.0, the AUC range, if fewer than 2 have results).
   An arm with no result yet (n = 0, e.g. a rung-1 expansion) has UCB +inf and LCB -inf: it is
   explored first and can be neither pruned nor the leader until it has a result.
-- Rung 0: the "mean" is the `rung0_key` order rank-transformed to [0, 1] within the task (ties
+- Rung 0: the "mean" is the `rung0_key` order rank-transformed to [0, 1] within the group (ties
   share the average rank). Every arm has one seed there, so the spread term is the same for
   all arms and UCB order equals rank order; rung 0 only uses it to rank promotions, and
   pruning starts at rung 1.
-- Promotion out of rung r for a task happens once the rung is finished for that task (no job
+- Promotion out of rung r for a group happens once the rung is finished for that group (no job
   running at that rung, no live arm with a pending seed). Out of rung >= 1 it also waits until
-  every task with rung-0 arms has promoted out of rung 0, because rung-1 expansions keep adding
-  dense-task arms until then. The top ``ceil(n / eta)`` non-protected arms are promoted, where
-  n counts the task's non-protected, non-failed arms on the rung (pruned ones included); rank
-  at rung 0, UCB above. The rest are pruned.
+  every group with rung-0 arms has promoted out of rung 0, because rung-1 expansions keep
+  adding dense-task and variant arms until then. Trade-off (accepted): a fast group idles at
+  the end of rung 1 until the slowest group finishes rung 0. The top ``ceil(n / eta)``
+  non-protected arms are promoted, where n counts the group's non-protected, non-failed arms
+  on the rung (pruned ones included); rank at rung 0, UCB above. The rest are pruned.
 - Protected arms (`uniform`, `point`) are never pruned and are promoted to every rung outside
   the quota, so the normalisation anchor reaches the final rung with the same seed count.
-  They can still fail.
+- Anchorless groups: a group that has been promoted to its final rung but has no live
+  (non-failed) `uniform` arm there, the arm `normalise` maps to 0, is listed by
+  `anchorless_groups()`. The report ranks it by raw AUC within the task and leaves it out
+  of the overall normalised IQM.
 - rung1_expand: promotion out of rung 0 calls ``arm_space("rung1_expand", survivors=winners)``
   (the quota winners; protected arms are not survivors) and adds every arm the scheduler does
   not already have at rung 1 with status `active`.
-- Tasks are grouped by `arm.task` (the name): task variants (`task_kw`) compete in their base
-  task's group (ours).
-- Done: nothing running, and either every task has a final-rung arm whose LCB beats the UCB of
-  every other live final-rung arm, or no job and no promotion remains.
+- Done: nothing running, no promotion ready and no job left. Equal compute (spec section 6)
+  outranks the early stop of section 7.6: leader separation may only be checked once every
+  live arm at a group's final rung has all its final-rung seeds. At that point the group has
+  no job left, so the separation stop can never end the sweep earlier than exhaustion does,
+  and it is not coded separately.
 - State: `results.jsonl` is append-only, one RunResult per line (NaN written as null), and is
   the only copy of the results. `scheduler.json` holds everything else (config, arms, rungs,
   statuses, arm ids, jobs in flight, promotions done, and how many results.jsonl lines it
@@ -64,6 +76,7 @@ import itertools
 import json
 import math
 import os
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -72,20 +85,26 @@ from typing import Any, Final, Literal
 import numpy as np
 
 from resetsweep.ppo.update import PPOConfig
-from resetsweep.sweep.arms import DENSE_TASKS, SPARSE_TASKS, Arm, Kw, arm_space
+from resetsweep.sweep.arms import SPARSE_TASKS, Arm, Kw, arm_space
 from resetsweep.sweep.stats import iqm, rung0_key
 from resetsweep.train import RunResult, RunSpec
 
 Status = Literal["active", "promoted", "pruned", "final", "failed"]
 ArmIdOf = Callable[[Arm, int], str]
+GroupKey = tuple[str, Kw]  # (task, task_kw)
 
 LIVE_STATUSES: Final = frozenset({"active", "promoted", "final"})
 PROTECTED_METHODS: Final = frozenset({"uniform", "point"})
+ANCHOR_METHOD: Final = "uniform"  # `normalise` maps it to 0
 RETRY_SEED_OFFSET: Final = 1000
+RETRIES: Final = 1
+PROTECTED_RETRIES: Final = 3
 STATE_FILE: Final = "scheduler.json"
 RESULTS_FILE: Final = "results.jsonl"
-_STATE_VERSION: Final = 1
+_STATE_VERSION: Final = 2
 _NO_RESULTS_SD: Final = 1.0  # the AUC range
+# Each pass closes at least one (group, rung); there are a few dozen groups and 3 rungs.
+_MAX_PROMOTION_PASSES: Final = 1000
 _FLOAT_RESULT_FIELDS: Final = ("auc", "final_success", "ever_succeeded_share", "wall_s")
 
 
@@ -141,23 +160,35 @@ def spec_for(
     )
 
 
+def group_of(arm: Arm) -> GroupKey:
+    return (arm.task, arm.task_kw)
+
+
 def ucb_bounds(
-    values: Sequence[float], *, spread_sd: float, beta: float
+    values: Sequence[float], *, spread_sd: float, beta: float, n_virtual: int = 0
 ) -> tuple[float, float]:
-    """(LCB, UCB) = IQM -/+ beta * sd / sqrt(n); sd is the sample std for n >= 2, else
-    `spread_sd`. No values gives (-inf, inf)."""
+    """(LCB, UCB) = IQM -/+ beta * sd / sqrt(n + n_virtual); sd is the sample std of `values`
+    for n >= 2, else `spread_sd`. `n_virtual` (jobs in flight) narrows the interval without
+    moving the mean. No values gives (-inf, inf)."""
     if not (math.isfinite(spread_sd) and spread_sd >= 0.0):
         raise ValueError(f"spread_sd must be finite and >= 0, got {spread_sd}")
     if not (math.isfinite(beta) and beta >= 0.0):
         raise ValueError(f"beta must be finite and >= 0, got {beta}")
-    n = len(values)
-    if n == 0:
+    if n_virtual < 0:
+        raise ValueError(f"n_virtual must be >= 0, got {n_virtual}")
+    if not values:
         return -math.inf, math.inf
-    arr = np.asarray(values, dtype=float)
-    mean = iqm(arr)  # raises on non-finite values
-    sd = float(np.std(arr, ddof=1)) if n >= 2 else spread_sd
-    half = beta * sd / math.sqrt(n)
+    mean, sd = _mean_sd(values, spread_sd=spread_sd)
+    half = beta * sd / math.sqrt(len(values) + n_virtual)
     return mean - half, mean + half
+
+
+def _mean_sd(values: Sequence[float], *, spread_sd: float) -> tuple[float, float]:
+    """IQM and the sd `ucb_bounds` uses; `values` must be non-empty."""
+    arr = np.asarray(values, dtype=float)
+    mean = iqm(arr)  # raises on empty or non-finite values
+    sd = float(np.std(arr, ddof=1)) if arr.size >= 2 else spread_sd
+    return mean, sd
 
 
 def _check_config(
@@ -185,6 +216,10 @@ def _check_config(
         raise ValueError(f"eta must be >= 2, got {eta}")
     if not (math.isfinite(beta) and beta >= 0.0):
         raise ValueError(f"beta must be finite and >= 0, got {beta}")
+
+
+def _max_retries(arm: Arm) -> int:
+    return PROTECTED_RETRIES if arm.method in PROTECTED_METHODS else RETRIES
 
 
 class Scheduler:
@@ -218,7 +253,7 @@ class Scheduler:
                     f"{state_dir / name} exists; resume with Scheduler.load({state_dir!s})"
                 )
         state_dir.mkdir(parents=True, exist_ok=True)
-        self._rung0_tasks = tuple(dict.fromkeys(a.task for a in arms))
+        self._rung0_groups = tuple(dict.fromkeys(group_of(a) for a in arms))
         for arm in arms:
             self._add_arm(arm, rung=0, status="active")
         self.save()
@@ -240,21 +275,21 @@ class Scheduler:
         self._dir = state_dir
         self._arm_id_of = arm_id_of
         self._last_rung = len(self._budgets) - 1
-        self._rung0_tasks: tuple[str, ...] = ()
+        self._rung0_groups: tuple[GroupKey, ...] = ()
         self._states: list[ArmState] = []
         self._index: dict[Arm, int] = {}
         self._ids: dict[str, tuple[int, int]] = {}  # arm_id -> (arm index, rung)
         self._id_at: dict[tuple[int, int], str] = {}
         self._running: dict[tuple[str, int], Job] = {}  # (arm_id, seed) -> job
         self._resubmit: list[Job] = []
-        self._promoted_out: set[tuple[str, int]] = set()
+        self._promoted_out: set[tuple[GroupKey, int]] = set()
         self._n_results = 0  # lines of results.jsonl reflected in this state
 
     # --- public interface ----------------------------------------------------------------------
 
     def next_jobs(self, k: int) -> list[Job]:
         """Up to `k` new jobs: resubmitted in-flight jobs first, then rung 0 in arm order, then
-        UCB round-robin. Never a job already running or done, past the final rung's seed count,
+        batch-UCB picks. Never a job already running or done, past the final rung's seed count,
         or for an arm that is not live. Runs `promotions()` first."""
         if k < 0:
             raise ValueError(f"k must be >= 0, got {k}")
@@ -270,12 +305,11 @@ class Scheduler:
                 jobs.append(self._issue(i, job.seed))
             else:
                 self._resubmit.append(job)  # keeps its priority for the next call
-        rung0 = [i for i in self._live() if self._states[i].rung == 0]
-        for i in rung0:
+        for i in [i for i in self._live() if self._states[i].rung == 0]:
             for seed in self._pending_seeds(i)[: k - len(jobs)]:
                 jobs.append(self._issue(i, seed))
         if len(jobs) < k:
-            jobs += self._ucb_round_robin(k - len(jobs))
+            jobs += self._ucb_batch(k - len(jobs))
         if jobs:
             self.save()
         assert len(jobs) <= k, (len(jobs), k)
@@ -295,29 +329,46 @@ class Scheduler:
         self.save()
 
     def promotions(self) -> None:
-        """Promote every task whose current rung has finished; idempotent."""
-        max_passes = (len(SPARSE_TASKS) + len(DENSE_TASKS)) * len(self._budgets) + 1
+        """Promote every group whose current rung has finished; idempotent."""
         changed = False
-        for _ in range(max_passes):
+        for _ in range(_MAX_PROMOTION_PASSES):
             ready = self._ready_promotions()
             if not ready:
                 break
-            for task, rung in ready:
-                self._promote(task, rung)
+            for group, rung in ready:
+                self._promote(group, rung)
             changed = True
         else:
-            raise RuntimeError(f"promotions did not settle in {max_passes} passes")
+            raise RuntimeError(
+                f"promotions did not settle in {_MAX_PROMOTION_PASSES} passes"
+            )
         if changed:
             self.save()
 
     def done(self) -> bool:
+        """Nothing running, no promotion ready, no job left (see the module docstring)."""
         if self._running:
             return False
-        if self._all_separated():
-            return True
         return not self._ready_promotions() and not any(
             self._pending_seeds(i) for i in self._live()
         )
+
+    def anchorless_groups(self) -> list[GroupKey]:
+        """Groups promoted to their final rung without a live `uniform` arm there."""
+        out: list[GroupKey] = []
+        for group in self._groups():
+            if (group, self._last_rung - 1) not in self._promoted_out:
+                continue
+            anchors = [
+                i
+                for i in self._live()
+                if group_of(self._states[i].arm) == group
+                and self._states[i].arm.method == ANCHOR_METHOD
+                and self._states[i].rung == self._last_rung
+            ]
+            if not anchors:
+                out.append(group)
+        return out
 
     def state(self, arm: Arm) -> ArmState:
         st = self._states[self._index[arm]]
@@ -351,6 +402,10 @@ class Scheduler:
     def _live(self) -> list[int]:
         return [i for i in range(len(self._states)) if self._is_live(i)]
 
+    def _in(self, i: int, group: GroupKey, rung: int) -> bool:
+        st = self._states[i]
+        return group_of(st.arm) == group and st.rung == rung
+
     def _rung_results(self, i: int, rung: int) -> list[RunResult]:
         arm_id = self._id_at.get((i, rung))
         return [r for r in self._states[i].results if r.arm_id == arm_id]
@@ -365,16 +420,17 @@ class Scheduler:
         arm_id = self._id_at[(i, st.rung)]
         got = {r.seed: r.status for r in self._rung_results(i, st.rung)}
         running = {seed for (aid, seed) in self._running if aid == arm_id}
+        attempts = range(_max_retries(st.arm) + 1)
         out: list[int] = []
         for seed in range(self._seeds[st.rung]):
-            retry = seed + RETRY_SEED_OFFSET
-            if seed in running or retry in running:
+            tries = [seed + j * RETRY_SEED_OFFSET for j in attempts]
+            if any(t in running for t in tries) or any(
+                got.get(t) == "ok" for t in tries
+            ):
                 continue
-            first, second = got.get(seed), got.get(retry)
-            if first is None:
-                out.append(seed)
-            elif first == "failed" and second is None:
-                out.append(retry)
+            untried = [t for t in tries if t not in got]  # every earlier attempt failed
+            if untried:
+                out.append(untried[0])
         return out
 
     def _issue(self, i: int, seed: int) -> Job:
@@ -390,47 +446,70 @@ class Scheduler:
 
     # --- UCB -----------------------------------------------------------------------------------
 
-    def _spread(self, task: str, rung: int) -> float:
+    def _spread(self, group: GroupKey, rung: int) -> float:
         means = [
             iqm(np.asarray(aucs))
-            for i, st in enumerate(self._states)
-            if st.arm.task == task and st.rung == rung and st.status != "failed"
+            for i in range(len(self._states))
+            if self._in(i, group, rung) and self._states[i].status != "failed"
             if (aucs := self._ok_aucs(i))
         ]
         return float(np.std(means, ddof=1)) if len(means) >= 2 else _NO_RESULTS_SD
 
-    def _bounds(self, indices: Iterable[int]) -> dict[int, tuple[float, float]]:
-        spreads: dict[tuple[str, int], float] = {}
-        out: dict[int, tuple[float, float]] = {}
+    def _spreads(self, indices: Iterable[int]) -> dict[int, float]:
+        cache: dict[tuple[GroupKey, int], float] = {}
+        out: dict[int, float] = {}
         for i in indices:
             st = self._states[i]
             assert st.rung >= 1, "UCB is not used at rung 0"
-            key = (st.arm.task, st.rung)
-            if key not in spreads:
-                spreads[key] = self._spread(*key)
-            out[i] = ucb_bounds(
-                self._ok_aucs(i), spread_sd=spreads[key], beta=self._beta
-            )
+            key = (group_of(st.arm), st.rung)
+            if key not in cache:
+                cache[key] = self._spread(*key)
+            out[i] = cache[key]
         return out
 
-    def _ucb_round_robin(self, k: int) -> list[Job]:
+    def _bounds(self, indices: Iterable[int]) -> dict[int, tuple[float, float]]:
+        spreads = self._spreads(indices)
+        return {
+            i: ucb_bounds(self._ok_aucs(i), spread_sd=sd, beta=self._beta)
+            for i, sd in spreads.items()
+        }
+
+    def _ucb_batch(self, k: int) -> list[Job]:
         pending = {
-            i: s
+            i: seeds
             for i in self._live()
             if self._states[i].rung >= 1
-            if (s := self._pending_seeds(i))
+            if (seeds := self._pending_seeds(i))
         }
-        bounds = self._bounds(pending)
-        order = sorted(pending, key=lambda i: (self._states[i].rung, -bounds[i][1], i))
+        spreads = self._spreads(pending)
+        n_ok = {i: len(self._ok_aucs(i)) for i in pending}
+        mean_sd = {
+            i: _mean_sd(self._ok_aucs(i), spread_sd=spreads[i])
+            for i in pending
+            if n_ok[i]
+        }
+        in_flight: Counter[int] = Counter()
+        for aid, _ in self._running:
+            i, rung = self._ids[aid]
+            if i in pending and rung == self._states[i].rung:
+                in_flight[i] += 1
+
+        def priority(i: int) -> tuple[int, float, int, int]:
+            # Same UCB as ucb_bounds(..., n_virtual=in_flight[i]), with the IQM computed once.
+            ucb = math.inf
+            if n_ok[i]:
+                mean, sd = mean_sd[i]
+                ucb = mean + self._beta * sd / math.sqrt(n_ok[i] + in_flight[i])
+            return (self._states[i].rung, -ucb, in_flight[i], i)
+
         jobs: list[Job] = []
-        for _ in range(2 * max(self._seeds)):  # each pass issues one seed per arm
-            issued = False
-            for i in order:
-                if len(jobs) < k and pending[i]:
-                    jobs.append(self._issue(i, pending[i].pop(0)))
-                    issued = True
-            if not issued or len(jobs) >= k:
+        for _ in range(k):
+            available = [i for i, seeds in pending.items() if seeds]
+            if not available:
                 break
+            i = min(available, key=priority)
+            jobs.append(self._issue(i, pending[i].pop(0)))
+            in_flight[i] += 1
         return jobs
 
     def _rung0_ranks(self, members: Sequence[int]) -> dict[int, float]:
@@ -450,64 +529,51 @@ class Scheduler:
         i = self._index[job.arm]
         st = self._states[i]
         st.results.append(result)
-        if (
-            result.status == "failed"
-            and job.seed >= RETRY_SEED_OFFSET
-            and self._is_live(i)
-        ):
+        last_attempt = job.seed // RETRY_SEED_OFFSET >= _max_retries(st.arm)
+        if result.status == "failed" and last_attempt and self._is_live(i):
             st.status = "failed"
         if job.rung >= 1 and st.rung == job.rung:
-            self._prune(st.arm.task, job.rung)
+            self._prune(group_of(st.arm), job.rung)
 
-    def _prune(self, task: str, rung: int) -> None:
-        live = [
-            i
-            for i in self._live()
-            if self._states[i].arm.task == task and self._states[i].rung == rung
-        ]
+    def _prune(self, group: GroupKey, rung: int) -> None:
+        live = [i for i in self._live() if self._in(i, group, rung)]
         bounds = self._bounds(live)
         leader_lcb = max((lcb for lcb, _ in bounds.values()), default=-math.inf)
         if not math.isfinite(leader_lcb):
             return
         for i in live:
-            if (
-                self._states[i].arm.method not in PROTECTED_METHODS
-                and bounds[i][1] < leader_lcb
-            ):
+            protected = self._states[i].arm.method in PROTECTED_METHODS
+            if not protected and bounds[i][1] < leader_lcb:
                 self._states[i].status = "pruned"
 
-    def _tasks(self) -> list[str]:
-        return list(dict.fromkeys(st.arm.task for st in self._states))
+    def _groups(self) -> list[GroupKey]:
+        return list(dict.fromkeys(group_of(st.arm) for st in self._states))
 
-    def _rung_finished(self, task: str, rung: int) -> bool:
-        if any(j.arm.task == task and j.rung == rung for j in self._running.values()):
+    def _rung_finished(self, group: GroupKey, rung: int) -> bool:
+        if any(
+            group_of(j.arm) == group and j.rung == rung for j in self._running.values()
+        ):
             return False
         return not any(
-            self._pending_seeds(i)
-            for i in self._live()
-            if self._states[i].arm.task == task and self._states[i].rung == rung
+            self._pending_seeds(i) for i in self._live() if self._in(i, group, rung)
         )
 
-    def _ready_promotions(self) -> list[tuple[str, int]]:
-        rung0_done = all((t, 0) in self._promoted_out for t in self._rung0_tasks)
-        ready: list[tuple[str, int]] = []
-        for task in self._tasks():
+    def _ready_promotions(self) -> list[tuple[GroupKey, int]]:
+        rung0_done = all((g, 0) in self._promoted_out for g in self._rung0_groups)
+        ready: list[tuple[GroupKey, int]] = []
+        for group in self._groups():
             for rung in range(self._last_rung):
-                if (task, rung) in self._promoted_out:
+                if (group, rung) in self._promoted_out:
                     continue
-                if rung == 0 and task not in self._rung0_tasks:
+                if rung == 0 and group not in self._rung0_groups:
                     continue
-                if (rung == 0 or rung0_done) and self._rung_finished(task, rung):
-                    ready.append((task, rung))
+                if (rung == 0 or rung0_done) and self._rung_finished(group, rung):
+                    ready.append((group, rung))
                 break
         return ready
 
-    def _promote(self, task: str, rung: int) -> None:
-        members = [
-            i
-            for i, st in enumerate(self._states)
-            if st.arm.task == task and st.rung == rung
-        ]
+    def _promote(self, group: GroupKey, rung: int) -> None:
+        members = [i for i in range(len(self._states)) if self._in(i, group, rung)]
         protected = [
             i
             for i in members
@@ -535,33 +601,13 @@ class Scheduler:
             st.rung = new_rung
             st.status = "final" if new_rung == self._last_rung else "promoted"
             self._register_id(i, new_rung)
-        self._promoted_out.add((task, rung))
+        self._promoted_out.add((group, rung))
         if rung == 0:
             survivors = [self._states[i].arm for i in winners]
             entry: Status = "final" if self._last_rung == 1 else "active"
             for arm in arm_space("rung1_expand", survivors=survivors):
                 if arm not in self._index:
                     self._add_arm(arm, rung=1, status=entry)
-
-    def _all_separated(self) -> bool:
-        tasks = self._tasks()
-        for task in tasks:
-            finals = [
-                i
-                for i in self._live()
-                if self._states[i].arm.task == task
-                and self._states[i].status == "final"
-            ]
-            if not finals:
-                return False
-            bounds = self._bounds(finals)
-            leader = max(finals, key=lambda i: (bounds[i][0], -i))
-            leader_lcb = bounds[leader][0]
-            if not math.isfinite(leader_lcb):
-                return False
-            if any(bounds[i][1] >= leader_lcb for i in finals if i != leader):
-                return False
-        return bool(tasks)
 
     # --- persistence ---------------------------------------------------------------------------
 
@@ -586,18 +632,17 @@ class Scheduler:
                 "eta": self._eta,
                 "beta": self._beta,
             },
-            "rung0_tasks": list(self._rung0_tasks),
+            "rung0_groups": [_group_to_json(g) for g in self._rung0_groups],
             "arms": [
-                {
-                    "arm": _arm_to_json(st.arm),
-                    "rung": st.rung,
-                    "status": st.status,
-                }
+                {"arm": _arm_to_json(st.arm), "rung": st.rung, "status": st.status}
                 for st in self._states
             ],
             "arm_ids": [[i, rung, arm_id] for (i, rung), arm_id in self._id_at.items()],
             "running": [self._job_json(j) for j in in_flight],
-            "promoted_out": sorted([t, r] for t, r in self._promoted_out),
+            "promoted_out": [
+                [*_group_to_json(g), r]
+                for g, r in sorted(self._promoted_out, key=lambda x: (repr(x[0]), x[1]))
+            ],
             "n_results": self._n_results,
         }
         tmp = self._dir / f"{STATE_FILE}.tmp"
@@ -626,7 +671,9 @@ class Scheduler:
             state_dir,
             arm_id_of,
         )
-        self._rung0_tasks = tuple(state["rung0_tasks"])
+        self._rung0_groups = tuple(
+            _group_from_json(t, kw) for t, kw in state["rung0_groups"]
+        )
         for i, row in enumerate(state["arms"]):
             arm = _arm_from_json(row["arm"])
             self._index[arm] = i
@@ -638,7 +685,9 @@ class Scheduler:
                     f"arm_id of {self._states[i].arm.label()}@rung{rung} changed from {saved_id} "
                     f"to {self._id_at[(i, rung)]}; the RunSpec defaults differ from the saved sweep"
                 )
-        self._promoted_out = {(t, r) for t, r in state["promoted_out"]}
+        self._promoted_out = {
+            (_group_from_json(t, kw), r) for t, kw, r in state["promoted_out"]
+        }
         for row in state["running"]:
             i, rung = row["arm"], row["rung"]
             arm = self._states[i].arm
@@ -686,6 +735,14 @@ def _kw_to_json(kw: Kw) -> list[list[Any]]:
 
 def _kw_from_json(rows: list[list[Any]]) -> Kw:
     return tuple((k, _kw_from_json(v) if isinstance(v, list) else v) for k, v in rows)  # pyright: ignore[reportUnknownArgumentType] # nested kw pairs
+
+
+def _group_to_json(group: GroupKey) -> list[Any]:
+    return [group[0], _kw_to_json(group[1])]
+
+
+def _group_from_json(task: str, kw: list[list[Any]]) -> GroupKey:
+    return (task, _kw_from_json(kw))
 
 
 def _arm_to_json(arm: Arm) -> dict[str, Any]:
