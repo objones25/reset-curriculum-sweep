@@ -397,15 +397,17 @@ class _Maze:
 
     def _with_noise(self, centres: Tensor, gen: torch.Generator) -> StartStates:
         """Start states at `centres` (n, 2), with small position and velocity noise."""
-        n = centres.shape[0]
+        n, d = centres.shape[0], gen.device
         pos_noise = (
-            (torch.rand(n, 2, generator=gen) * 2 - 1)
+            (torch.rand(n, 2, generator=gen, device=d) * 2 - 1)
             * _START_NOISE_CELLS
             * self.grid.cell_m
         )
-        vel_noise = (torch.rand(n, 2, generator=gen) * 2 - 1) * _START_SPEED_NOISE_M_S
+        vel_noise = (
+            torch.rand(n, 2, generator=gen, device=d) * 2 - 1
+        ) * _START_SPEED_NOISE_M_S
         return StartStates(
-            centres + pos_noise, vel_noise, torch.zeros(n, self.extra_dim)
+            centres.to(d) + pos_noise, vel_noise, torch.zeros(n, self.extra_dim, device=d)
         )
 
     def canonical_start(self) -> StartStates:

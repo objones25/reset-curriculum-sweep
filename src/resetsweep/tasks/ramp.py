@@ -97,11 +97,11 @@ class _Ramp:
         )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
-        u = torch.rand(n, 2, generator=gen) * 2 - 1
+        u = torch.rand(n, 2, generator=gen, device=gen.device) * 2 - 1
         return StartStates(
             u[:, :1] * _START_HALF_WIDTH_M,
             u[:, 1:] * _START_SPEED_M_S,
-            torch.zeros(n, 0),
+            torch.zeros(n, 0, device=gen.device),
         )
 
     def canonical_start(self) -> StartStates:

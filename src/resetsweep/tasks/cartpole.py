@@ -94,8 +94,10 @@ class _Cartpole:
         )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
-        noise = (torch.rand(n, 4, generator=gen) * 2 - 1) * _START_NOISE
-        return StartStates(noise[:, :2], noise[:, 2:], torch.zeros(n, 0))
+        noise = (torch.rand(n, 4, generator=gen, device=gen.device) * 2 - 1) * _START_NOISE
+        return StartStates(
+            noise[:, :2], noise[:, 2:], torch.zeros(n, 0, device=gen.device)
+        )
 
     def canonical_start(self) -> StartStates:
         return StartStates(torch.zeros(1, 2), torch.zeros(1, 2), torch.zeros(1, 0))

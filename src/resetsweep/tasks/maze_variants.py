@@ -189,9 +189,14 @@ class MazeInfeasible(Maze):
         )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
-        u = torch.rand(n, generator=gen)
-        easy_pick = torch.randint(self._easy_centres.shape[0], (n,), generator=gen)
-        pocket_pick = torch.randint(self._pocket_centres.shape[0], (n,), generator=gen)
+        # Draw on the generator's device; the centre tables stay on the CPU, so pick there.
+        u = torch.rand(n, generator=gen, device=gen.device).cpu()
+        easy_pick = torch.randint(
+            self._easy_centres.shape[0], (n,), generator=gen, device=gen.device
+        ).cpu()
+        pocket_pick = torch.randint(
+            self._pocket_centres.shape[0], (n,), generator=gen, device=gen.device
+        ).cpu()
         centres = torch.where(
             (u < _P_EASY).unsqueeze(1),
             self._easy_centres[easy_pick],

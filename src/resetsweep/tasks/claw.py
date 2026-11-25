@@ -133,15 +133,16 @@ class Claw:
         )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
-        x = _START_X_M[0] + torch.rand(n, 1, generator=gen) * (
+        d = gen.device
+        x = _START_X_M[0] + torch.rand(n, 1, generator=gen, device=d) * (
             _START_X_M[1] - _START_X_M[0]
         )
-        y = _START_Y_M[0] + torch.rand(n, 1, generator=gen) * (
+        y = _START_Y_M[0] + torch.rand(n, 1, generator=gen, device=d) * (
             _START_Y_M[1] - _START_Y_M[0]
         )
-        angle = (torch.rand(n, 1, generator=gen) * 2 - 1) * _START_DISC_NOISE_RAD
-        qpos = torch.cat([x, y, torch.zeros(n, 2), angle], dim=1)
-        return StartStates(qpos, torch.zeros(n, 5), torch.zeros(n, 0))
+        angle = (torch.rand(n, 1, generator=gen, device=d) * 2 - 1) * _START_DISC_NOISE_RAD
+        qpos = torch.cat([x, y, torch.zeros(n, 2, device=d), angle], dim=1)
+        return StartStates(qpos, torch.zeros(n, 5, device=d), torch.zeros(n, 0, device=d))
 
     def canonical_start(self) -> StartStates:
         x, y = sum(_START_X_M) / 2, sum(_START_Y_M) / 2
