@@ -277,3 +277,56 @@ class SamplingPlanner:
             self._sim.step(flat[:, t])
             total += self._task.reward(self._sim, e, flat[:, t])
         return total.reshape(self._n, self._k)
+
+
+class MazePathFollower:
+    """Follows the BFS grid path to the goal, steering toward the next cell centre with a PD force.
+
+    Works for any maze-family task that exposes `grid` (a `MazeGrid`). Observations are
+    (x, y, vx, vy); actions are two forces in [-1, 1]. The desired speed is capped at
+    `cruise_m_s` and shrinks near the waypoint, so the point can turn corners in narrow passages.
+    """
+
+    def __init__(
+        self, task: Task, *, cruise_m_s: float = 1.5, gain: float = 10.0
+    ) -> None:
+        grid = task.grid  # pyright: ignore[reportAttributeAccessIssue] # maze tasks expose their grid
+        self._grid = grid
+        self._cruise, self._gain = cruise_m_s, gain
+        goal = grid.flat(grid.goal_cell)
+        to_goal = grid.dist_cells[:, goal]  # steps to the goal; -1 for walls
+        waypoint = torch.zeros(grid.rows * grid.cols, 2)
+        for row in range(grid.rows):
+            for col in range(grid.cols):
+                here = row * grid.cols + col
+                if bool(grid.occupied[row, col]):
+                    continue
+                best = (row, col)
+                for n_row, n_col in (
+                    (row + 1, col),
+                    (row - 1, col),
+                    (row, col + 1),
+                    (row, col - 1),
+                ):
+                    if not (0 <= n_row < grid.rows and 0 <= n_col < grid.cols):
+                        continue
+                    if bool(grid.occupied[n_row, n_col]):
+                        continue
+                    if (
+                        to_goal[n_row * grid.cols + n_col]
+                        < to_goal[best[0] * grid.cols + best[1]]
+                    ):
+                        best = (n_row, n_col)
+                waypoint[here] = grid.centre(best)
+        self._waypoint = waypoint
+        self._goal_centre = grid.centre(grid.goal_cell)
+
+    def __call__(self, obs: Tensor) -> Tensor:
+        pos, vel = obs[:, :2], obs[:, 2:4]
+        target = self._waypoint[self._grid.cell_index(pos)]
+        error = target - pos
+        dist = error.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        speed = torch.minimum(torch.full_like(dist, self._cruise), self._gain * dist)
+        desired = error / dist * speed
+        # Force that would close the velocity error over ~0.25 s, as a fraction of FORCE_LIMIT_N.
+        return ((desired - vel) * 2.0).clamp(-1.0, 1.0)
