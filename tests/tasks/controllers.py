@@ -12,6 +12,7 @@ from torch import Tensor
 from resetsweep.sim.batch import BatchSim
 from resetsweep.sim.env import VecEnv
 from resetsweep.tasks.base import Task
+from resetsweep.tasks.maze import MazeGrid
 from resetsweep.types import Outcomes, StartStates, StepCounter
 
 _GRAVITY_M_S2 = 9.81
@@ -282,15 +283,22 @@ class SamplingPlanner:
 class MazePathFollower:
     """Follows the BFS grid path to the goal, steering toward the next cell centre with a PD force.
 
-    Works for any maze-family task that exposes `grid` (a `MazeGrid`). Observations are
+    Works for any maze-family task that exposes `grid` (a `MazeGrid`), or plans on the `grid`
+    given. Observations are
     (x, y, vx, vy); actions are two forces in [-1, 1]. The desired speed is capped at
     `cruise_m_s` and shrinks near the waypoint, so the point can turn corners in narrow passages.
     """
 
     def __init__(
-        self, task: Task, *, cruise_m_s: float = 1.5, gain: float = 10.0
+        self,
+        task: Task,
+        *,
+        cruise_m_s: float = 1.5,
+        gain: float = 10.0,
+        grid: MazeGrid | None = None,
     ) -> None:
-        grid = task.grid  # pyright: ignore[reportAttributeAccessIssue] # maze tasks expose their grid
+        # `grid` overrides the task's own for planning, e.g. a grid with a pit's cells blocked.
+        grid = grid or task.grid  # pyright: ignore[reportAttributeAccessIssue] # maze tasks expose their grid
         self._grid = grid
         self._cruise, self._gain = cruise_m_s, gain
         goal = grid.flat(grid.goal_cell)

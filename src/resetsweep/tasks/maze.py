@@ -8,7 +8,7 @@ Row index grows with y, column index with x. `qpos = (x, y)`, in metres.
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import torch
@@ -152,24 +152,41 @@ class MazeGrid:
         row, col = self.cell_of(xy)
         return row * self.cols + col
 
+    def blocked(self, mask: Tensor) -> "MazeGrid":
+        """Copy of this grid with the cells in `mask` (bool, same shape as `occupied`) treated as
+        walls, distances recomputed. For planners that must route around a region the physics
+        still lets the ball enter (a pit). Start and goal must stay free."""
+        if mask.shape != self.occupied.shape:
+            raise ValueError(
+                f"mask shape {tuple(mask.shape)}, expected {tuple(self.occupied.shape)}"
+            )
+        occupied = self.occupied | mask
+        if bool(occupied[self.start_cell]) or bool(occupied[self.goal_cell]):
+            raise ValueError("blocked cells must not cover the start or goal cell")
+        return replace(self, occupied=occupied, dist_cells=_distances(occupied))
+
 
 def _horizontal_occupancy(
-    lanes: int,
+    lanes: int, lane_rows: int
 ) -> tuple[list[list[bool]], tuple[int, int], tuple[int, int]]:
-    """Serpentine with horizontal lanes: lane i is row 2i+1, joined by a gap in the wall between."""
-    rows, cols = 2 * lanes + 1, _LANE_CELLS + 2
+    """Serpentine with horizontal lanes `lane_rows` cells thick, one wall row between them, joined
+    by a one-cell gap in that wall. Lane i starts at row `i * (lane_rows + 1) + 1`."""
+    pitch = lane_rows + 1
+    rows, cols = lanes * pitch + 1, _LANE_CELLS + 2
     occupied = [[True] * cols for _ in range(rows)]
     for lane in range(lanes):
-        for col in range(1, _LANE_CELLS + 1):
-            occupied[2 * lane + 1][col] = False
-    for gap_row in range(2, 2 * lanes, 2):
-        gap_col = _LANE_CELLS if (gap_row // 2) % 2 == 1 else 1
-        occupied[gap_row][gap_col] = False
+        for row in range(lane * pitch + 1, lane * pitch + 1 + lane_rows):
+            for col in range(1, _LANE_CELLS + 1):
+                occupied[row][col] = False
+    for lane in range(1, lanes):
+        gap_col = _LANE_CELLS if lane % 2 == 1 else 1
+        occupied[lane * pitch][gap_col] = False
     goal_col = _LANE_CELLS if (lanes - 1) % 2 == 0 else 1
-    return occupied, (1, 1), (2 * lanes - 1, goal_col)
+    return occupied, (1, 1), ((lanes - 1) * pitch + 1, goal_col)
 
 
 def _distances(occupied: Tensor) -> Tensor:
+    """All-pairs 4-connected BFS distances in cells; -1 for walls and unreachable pairs."""
     rows, cols = occupied.shape
     free = [(r, c) for r in range(rows) for c in range(cols) if not occupied[r, c]]
     dist = torch.full((rows * cols, rows * cols), -1, dtype=torch.long)
@@ -191,8 +208,6 @@ def _distances(occupied: Tensor) -> Tensor:
                         steps[(r, c)] + 1
                     )
                     queue.append((n_r, n_c))
-        if len(steps) != len(free):
-            raise ValueError("maze has disconnected free cells")
     return dist
 
 
@@ -225,29 +240,77 @@ def _wall_boxes(occupied: Tensor) -> list[tuple[int, int, int, int]]:
 
 
 def build_maze(
-    *, lanes: int, passage_width: float, layout: Layout
+    *,
+    lanes: int,
+    passage_width: float,
+    layout: Layout,
+    lane_rows: int = 1,
+    pad_cells: int = 0,
+    pockets: tuple[tuple[int, int], ...] = (),
+    ctrl_limit: float = 1.0,
 ) -> tuple[str, MazeGrid]:
     """MJCF and occupancy grid of a serpentine maze with `lanes` lanes.
 
     `layout="horizontal"` runs lanes along x; `"vertical"` is the transpose (up, down, up: an N
     for three lanes). The start is the first lane's near end, the goal the last lane's far end.
+    `lane_rows` is the lane thickness in cells, `pad_cells` extra wall cells all around, and
+    `pockets` are `(row, col)` wall cells of the final grid turned into free cells. Each must
+    be sealed off from the maze: the grid then has islands with no path to the goal.
+    `ctrl_limit` is the motors' control range (1 unless a task adds force through `control`).
     """
-    if lanes <= 0 or passage_width <= 0:
+    if lanes <= 0 or passage_width <= 0 or lane_rows <= 0 or pad_cells < 0:
         raise ValueError(
-            f"lanes and passage_width must be positive, got {lanes}, {passage_width}"
+            "lanes, passage_width and lane_rows must be positive and pad_cells non-negative, "
+            f"got {lanes}, {passage_width}, {lane_rows}, {pad_cells}"
         )
-    cells, start, goal = _horizontal_occupancy(lanes)
+    cells, start, goal = _horizontal_occupancy(lanes, lane_rows)
     occupied = torch.tensor(cells, dtype=torch.bool)
     if layout == "vertical":
         occupied = occupied.T.contiguous()
         start, goal = (start[1], start[0]), (goal[1], goal[0])
     elif layout != "horizontal":
         raise ValueError(f"layout must be 'horizontal' or 'vertical', got {layout!r}")
-    grid = MazeGrid(occupied, passage_width, start, goal, _distances(occupied))
-    return _mjcf(grid), grid
+    if pad_cells:
+        padded = torch.ones(
+            occupied.shape[0] + 2 * pad_cells,
+            occupied.shape[1] + 2 * pad_cells,
+            dtype=torch.bool,
+        )
+        padded[pad_cells:-pad_cells, pad_cells:-pad_cells] = occupied
+        occupied = padded
+        start = (start[0] + pad_cells, start[1] + pad_cells)
+        goal = (goal[0] + pad_cells, goal[1] + pad_cells)
+    for row, col in pockets:
+        if not (0 <= row < occupied.shape[0] and 0 <= col < occupied.shape[1]):
+            raise ValueError(f"pocket {(row, col)} is outside the grid")
+        if not bool(occupied[row, col]):
+            raise ValueError(f"pocket {(row, col)} is not a wall cell")
+        occupied[row, col] = False
+    dist = _distances(occupied)
+    _check_connectivity(occupied, dist, start, pockets)
+    grid = MazeGrid(occupied, passage_width, start, goal, dist)
+    return _mjcf(grid, ctrl_limit), grid
 
 
-def _mjcf(grid: MazeGrid) -> str:
+def _check_connectivity(
+    occupied: Tensor,
+    dist: Tensor,
+    start: tuple[int, int],
+    pockets: tuple[tuple[int, int], ...],
+) -> None:
+    """Every free cell is reachable from the start, except the pockets, which none may be."""
+    rows, cols = occupied.shape
+    reachable = dist[start[0] * cols + start[1]] >= 0
+    pocket_flat = torch.zeros(rows * cols, dtype=torch.bool)
+    for row, col in pockets:
+        pocket_flat[row * cols + col] = True
+    if bool((reachable & pocket_flat).any()):
+        raise ValueError("a pocket is not sealed off from the maze")
+    if bool(((~occupied).flatten() & ~reachable & ~pocket_flat).any()):
+        raise ValueError("maze has disconnected free cells")
+
+
+def _mjcf(grid: MazeGrid, ctrl_limit: float) -> str:
     cell = grid.cell_m
     half_height = cell
     walls = []
@@ -270,8 +333,8 @@ def _mjcf(grid: MazeGrid) -> str:
     </body>
   </worldbody>
   <actuator>
-    <motor joint="x" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-1 1"/>
-    <motor joint="y" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor joint="x" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-{ctrl_limit} {ctrl_limit}"/>
+    <motor joint="y" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-{ctrl_limit} {ctrl_limit}"/>
   </actuator>
 </mujoco>
 """
@@ -306,10 +369,14 @@ class _Maze:
     name: str
 
     def __init__(
-        self, lanes: int = 3, passage_width: float = 0.4, layout: Layout = "horizontal"
+        self,
+        lanes: int = 3,
+        passage_width: float = 0.4,
+        layout: Layout = "horizontal",
+        **build: Any,
     ) -> None:
         self.mjcf, self.grid = build_maze(
-            lanes=lanes, passage_width=passage_width, layout=layout
+            lanes=lanes, passage_width=passage_width, layout=layout, **build
         )
         path_m = self.grid.shortest_path_cells * passage_width
         self.max_steps = math.ceil(
@@ -319,21 +386,30 @@ class _Maze:
             torch.tensor([self.grid.cols, self.grid.rows], dtype=torch.float32)
             * passage_width
         )
-        speed = torch.full((2,), MAX_SPEED_M_S * 1.25)
+        # Margin over the fastest reachable speed: terminal speed at the largest control.
+        speed = torch.full((2,), MAX_SPEED_M_S * build.get("ctrl_limit", 1.0) * 1.25)
         self.start_box = Box(
             torch.cat([torch.zeros(2), -speed]), torch.cat([extent, speed])
         )
         self._goal_cell = self.grid.flat(self.grid.goal_cell)
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
+        return self._with_noise(
+            self.grid.centre(self.grid.start_cell).expand(n, 2), gen
+        )
+
+    def _with_noise(self, centres: Tensor, gen: torch.Generator) -> StartStates:
+        """Start states at `centres` (n, 2), with small position and velocity noise."""
+        n = centres.shape[0]
         pos_noise = (
             (torch.rand(n, 2, generator=gen) * 2 - 1)
             * _START_NOISE_CELLS
             * self.grid.cell_m
         )
         vel_noise = (torch.rand(n, 2, generator=gen) * 2 - 1) * _START_SPEED_NOISE_M_S
-        qpos = self.grid.centre(self.grid.start_cell) + pos_noise
-        return StartStates(qpos, vel_noise, torch.zeros(n, 0))
+        return StartStates(
+            centres + pos_noise, vel_noise, torch.zeros(n, self.extra_dim)
+        )
 
     def canonical_start(self) -> StartStates:
         return StartStates(
@@ -366,15 +442,11 @@ class _Maze:
         return self.sample_start(n, torch.Generator().manual_seed(seed))
 
     def _in_goal(self, xy: Tensor) -> Tensor:
-        cell = self.grid.cell_index(xy.cpu()).to(xy.device)
-        inside = (
-            (xy >= 0)
-            & (
-                xy
-                < torch.tensor([self.grid.cols, self.grid.rows], device=xy.device)
-                * self.grid.cell_m
-            )
-        ).all(dim=1)
+        cell = self.grid.cell_index(xy)  # works on any device; clamped into the grid
+        extent = torch.tensor(
+            [self.grid.cols, self.grid.rows], dtype=xy.dtype, device=xy.device
+        )
+        inside = ((xy >= 0) & (xy < extent * self.grid.cell_m)).all(dim=1)
         return inside & (cell == self._goal_cell)
 
     @staticmethod

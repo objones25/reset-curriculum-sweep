@@ -376,3 +376,57 @@ def test_rejects_generator_on_wrong_device(make_task: Callable[..., Task]) -> No
             counter=StepCounter(budget=100),
             gen=torch.Generator(device="cpu"),
         )
+
+
+def test_task_control_hook_sets_the_ctrl_the_sim_receives(
+    make_task: Callable[..., Task],
+) -> None:
+    task = make_task()
+    task.control = lambda sim, extra, action: action + 0.25  # pyright: ignore[reportAttributeAccessIssue] # optional hook, set on the instance
+    env, _, _ = _env(task)
+    env.reset_all()
+
+    env.step(_zeros())
+
+    assert env.sim.ctrl.tolist() == [[0.25]] * NUM_ENVS
+
+
+def test_task_init_extra_hook_overrides_extra_the_method_supplied(
+    make_task: Callable[..., Task],
+) -> None:
+    task = make_task(extra_dim=1)
+    seen: list[tuple[int, torch.Generator]] = []
+
+    def init_extra(states: StartStates, gen: torch.Generator) -> Tensor:
+        seen.append((states.n, gen))
+        return torch.full((states.n, 1), 7.0)
+
+    task.init_extra = init_extra  # pyright: ignore[reportAttributeAccessIssue] # optional hook, set on the instance
+
+    def start(env_ids: Tensor) -> StartStates:
+        q = torch.full((len(env_ids), 1), pi)
+        return StartStates(q, torch.zeros_like(q), torch.zeros(len(env_ids), 1))
+
+    env, _, _ = _env(task, StubMethod(start))
+
+    env.reset_all()
+
+    assert env.extra.tolist() == [[7.0]] * NUM_ENVS
+    assert seen[0][0] == NUM_ENVS
+    assert seen[0][1] is env._gen  # pyright: ignore[reportPrivateUsage] # the env's own generator, so draws are reproducible
+
+
+def test_init_extra_hook_with_wrong_shape_is_rejected(
+    make_task: Callable[..., Task],
+) -> None:
+    task = make_task(extra_dim=1)
+    task.init_extra = lambda states, gen: torch.zeros(states.n, 3)  # pyright: ignore[reportAttributeAccessIssue] # optional hook
+
+    def start(env_ids: Tensor) -> StartStates:
+        q = torch.full((len(env_ids), 1), pi)
+        return StartStates(q, torch.zeros_like(q), torch.zeros(len(env_ids), 1))
+
+    env, _, _ = _env(task, StubMethod(start))
+
+    with pytest.raises(ValueError, match="init_extra"):
+        env.reset_all()
