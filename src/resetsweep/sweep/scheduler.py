@@ -23,6 +23,12 @@ Decisions (all binding rulings unless marked "ours"):
   ``s + j * RETRY_SEED_OFFSET``. Ordinary arms get 1 retry, protected arms 3, each with a fresh
   seed. When the last allowed attempt fails the arm is `failed`: excluded from ranking,
   promotion and job selection. Results at a rung count only toward that rung.
+- sd floor (ruling on review minor 6). Every sd the UCB uses is ``max(sd, sd_floor)``, with
+  ``sd_floor = 0.05`` AUC units by default. Seeds with identical AUCs (common at 0 on sparse
+  tasks) would otherwise give a zero-width interval, so an arm would prune or be pruned with
+  full confidence from two runs. 0.05 is 1/20 of the AUC range: small next to the gaps worth
+  acting on, and about half the seed-to-seed noise we expect (ours, not measured yet; revisit
+  from the rung-0 results). `sd_floor=0` restores the plain rule.
 - Order. Pending rung-0 jobs are always issued first, in arm order, so rung 0 runs every arm
   once before any UCB choice. After that, jobs on rung >= 1 are picked one at a time by
   (rung ascending, batch UCB descending, jobs in flight ascending, arm order); lower rungs
@@ -60,13 +66,25 @@ Decisions (all binding rulings unless marked "ours"):
   live arm at a group's final rung has all its final-rung seeds. At that point the group has
   no job left, so the separation stop can never end the sweep earlier than exhaustion does,
   and it is not coded separately.
+- Liveness. `is_live(job)` is False once the job's arm is pruned, failed or has moved rung,
+  so Task 23 can stop paying for it. A result that still arrives is recorded.
+- Duplicates. A result whose (arm_id, seed) is already recorded is ignored (debug log) if it
+  is identical (NaN-aware) and raises `ConflictingResultError` otherwise; a late result from
+  a worker that outlived a restart is harmless.
 - State: `results.jsonl` is append-only, one RunResult per line (NaN written as null), and is
   the only copy of the results. `scheduler.json` holds everything else (config, arms, rungs,
   statuses, arm ids, jobs in flight, promotions done, and how many results.jsonl lines it
   reflects); it is rewritten atomically (temp file, fsync, `os.replace`) after every change,
   so its size does not grow with the results. A result is appended before the state is
   saved; `load` applies any logged result the snapshot missed (a crash between the two
-  writes), then hands the in-flight jobs back first from `next_jobs`.
+  writes), then hands the in-flight jobs back first from `next_jobs`. A last line that does
+  not parse and is beyond what the state applied is a torn append: it is truncated with a
+  warning and its job is resubmitted; any other bad line raises. After each `os.replace`
+  the directory is fsynced so the rename itself survives a power loss.
+- Bounds. `promotions` runs at most `_MAX_PROMOTION_PASSES` (1000) passes and raises
+  `RuntimeError` beyond that; each pass closes at least one (group, rung) and a sweep has a
+  few dozen groups times 2 promotable rungs. A batch picks at most `k` jobs. Every other loop
+  runs over a finite collection.
 """
 
 from __future__ import annotations
@@ -74,6 +92,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+import logging
 import math
 import os
 from collections import Counter
@@ -88,6 +107,8 @@ from resetsweep.ppo.update import PPOConfig
 from resetsweep.sweep.arms import SPARSE_TASKS, Arm, Kw, arm_space
 from resetsweep.sweep.stats import iqm, rung0_key
 from resetsweep.train import RunResult, RunSpec
+
+_log = logging.getLogger(__name__)
 
 Status = Literal["active", "promoted", "pruned", "final", "failed"]
 ArmIdOf = Callable[[Arm, int], str]
@@ -106,6 +127,10 @@ _NO_RESULTS_SD: Final = 1.0  # the AUC range
 # Each pass closes at least one (group, rung); there are a few dozen groups and 3 rungs.
 _MAX_PROMOTION_PASSES: Final = 1000
 _FLOAT_RESULT_FIELDS: Final = ("auc", "final_success", "ever_succeeded_share", "wall_s")
+
+
+class ConflictingResultError(ValueError):
+    """A second, different result for an (arm_id, seed) that already has one."""
 
 
 @dataclass(frozen=True)
@@ -165,10 +190,15 @@ def group_of(arm: Arm) -> GroupKey:
 
 
 def ucb_bounds(
-    values: Sequence[float], *, spread_sd: float, beta: float, n_virtual: int = 0
+    values: Sequence[float],
+    *,
+    spread_sd: float,
+    beta: float,
+    n_virtual: int = 0,
+    sd_floor: float = 0.0,
 ) -> tuple[float, float]:
     """(LCB, UCB) = IQM -/+ beta * sd / sqrt(n + n_virtual); sd is the sample std of `values`
-    for n >= 2, else `spread_sd`. `n_virtual` (jobs in flight) narrows the interval without
+    for n >= 2, else `spread_sd`, and never below `sd_floor`. `n_virtual` (jobs in flight) narrows the interval without
     moving the mean. No values gives (-inf, inf)."""
     if not (math.isfinite(spread_sd) and spread_sd >= 0.0):
         raise ValueError(f"spread_sd must be finite and >= 0, got {spread_sd}")
@@ -176,19 +206,27 @@ def ucb_bounds(
         raise ValueError(f"beta must be finite and >= 0, got {beta}")
     if n_virtual < 0:
         raise ValueError(f"n_virtual must be >= 0, got {n_virtual}")
+    _check_sd_floor(sd_floor)
     if not values:
         return -math.inf, math.inf
-    mean, sd = _mean_sd(values, spread_sd=spread_sd)
+    mean, sd = _mean_sd(values, spread_sd=spread_sd, sd_floor=sd_floor)
     half = beta * sd / math.sqrt(len(values) + n_virtual)
     return mean - half, mean + half
 
 
-def _mean_sd(values: Sequence[float], *, spread_sd: float) -> tuple[float, float]:
+def _mean_sd(
+    values: Sequence[float], *, spread_sd: float, sd_floor: float
+) -> tuple[float, float]:
     """IQM and the sd `ucb_bounds` uses; `values` must be non-empty."""
     arr = np.asarray(values, dtype=float)
     mean = iqm(arr)  # raises on empty or non-finite values
     sd = float(np.std(arr, ddof=1)) if arr.size >= 2 else spread_sd
-    return mean, sd
+    return mean, max(sd, sd_floor)
+
+
+def _check_sd_floor(sd_floor: float) -> None:
+    if not (math.isfinite(sd_floor) and sd_floor >= 0.0):
+        raise ValueError(f"sd_floor must be finite and >= 0, got {sd_floor}")
 
 
 def _check_config(
@@ -234,10 +272,13 @@ class Scheduler:
         seeds_per_rung: tuple[int, int, int] = (1, 3, 5),
         eta: int = 3,
         beta: float = 2.0,
+        sd_floor: float = 0.05,
         state_dir: Path,
         arm_id_of: ArmIdOf,
     ) -> None:
-        self._configure(rung_budgets, seeds_per_rung, eta, beta, state_dir, arm_id_of)
+        self._configure(
+            rung_budgets, seeds_per_rung, eta, beta, sd_floor, state_dir, arm_id_of
+        )
         if not arms:
             raise ValueError("arms is empty")
         if len(set(arms)) != len(arms):
@@ -264,10 +305,13 @@ class Scheduler:
         seeds_per_rung: Sequence[int],
         eta: int,
         beta: float,
+        sd_floor: float,
         state_dir: Path,
         arm_id_of: ArmIdOf,
     ) -> None:
         _check_config(rung_budgets, seeds_per_rung, eta, beta)
+        _check_sd_floor(sd_floor)
+        self._sd_floor = sd_floor
         self._budgets = tuple(rung_budgets)
         self._seeds = tuple(seeds_per_rung)
         self._eta = eta
@@ -320,13 +364,32 @@ class Scheduler:
         key = (result.arm_id, result.seed)
         job = self._running.pop(key, None)
         if job is None:
-            raise ValueError(f"result {key} matches no running job")
+            self._check_duplicate(result)
+            _log.debug("ignoring duplicate result %s", key)
+            return
         if result.status == "ok" and not math.isfinite(result.auc):
             self._running[key] = job
             raise ValueError(f"ok result {key} has non-finite auc {result.auc}")
         self._append_result(result)
         self._apply(job, result)
         self.save()
+
+    def _check_duplicate(self, result: RunResult) -> None:
+        """Return if `result` is identical to the recorded one; raise otherwise."""
+        key = (result.arm_id, result.seed)
+        where = self._ids.get(result.arm_id)
+        recorded = [
+            r
+            for r in (self._states[where[0]].results if where else [])
+            if (r.arm_id, r.seed) == key
+        ]
+        if not recorded:
+            raise ValueError(f"result {key} matches no running job")
+        assert len(recorded) == 1, key
+        if _result_to_json(recorded[0]) != _result_to_json(result):
+            raise ConflictingResultError(
+                f"result {key} differs from the recorded one: {recorded[0]} vs {result}"
+            )
 
     def promotions(self) -> None:
         """Promote every group whose current rung has finished; idempotent."""
@@ -369,6 +432,13 @@ class Scheduler:
             if not anchors:
                 out.append(group)
         return out
+
+    def is_live(self, job: Job) -> bool:
+        """False once `job`'s arm is pruned, failed or on another rung: the job can be killed."""
+        i = self._index.get(job.arm)
+        if i is None:
+            raise ValueError(f"unknown arm {job.arm.label()}")
+        return self._is_live(i) and self._states[i].rung == job.rung
 
     def state(self, arm: Arm) -> ArmState:
         st = self._states[self._index[arm]]
@@ -470,7 +540,9 @@ class Scheduler:
     def _bounds(self, indices: Iterable[int]) -> dict[int, tuple[float, float]]:
         spreads = self._spreads(indices)
         return {
-            i: ucb_bounds(self._ok_aucs(i), spread_sd=sd, beta=self._beta)
+            i: ucb_bounds(
+                self._ok_aucs(i), spread_sd=sd, beta=self._beta, sd_floor=self._sd_floor
+            )
             for i, sd in spreads.items()
         }
 
@@ -484,7 +556,7 @@ class Scheduler:
         spreads = self._spreads(pending)
         n_ok = {i: len(self._ok_aucs(i)) for i in pending}
         mean_sd = {
-            i: _mean_sd(self._ok_aucs(i), spread_sd=spreads[i])
+            i: _mean_sd(self._ok_aucs(i), spread_sd=spreads[i], sd_floor=self._sd_floor)
             for i in pending
             if n_ok[i]
         }
@@ -631,6 +703,7 @@ class Scheduler:
                 "seeds_per_rung": list(self._seeds),
                 "eta": self._eta,
                 "beta": self._beta,
+                "sd_floor": self._sd_floor,
             },
             "rung0_groups": [_group_to_json(g) for g in self._rung0_groups],
             "arms": [
@@ -651,6 +724,11 @@ class Scheduler:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self._dir / STATE_FILE)
+        dir_fd = os.open(self._dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)  # make the rename itself durable
+        finally:
+            os.close(dir_fd)
 
     @classmethod
     def load(cls, state_dir: Path, *, arm_id_of: ArmIdOf) -> Scheduler:
@@ -668,6 +746,7 @@ class Scheduler:
             tuple(cfg["seeds_per_rung"]),
             cfg["eta"],
             cfg["beta"],
+            cfg["sd_floor"],
             state_dir,
             arm_id_of,
         )
@@ -705,13 +784,20 @@ class Scheduler:
         """Attach the first `n_applied` logged results (already reflected in the saved
         statuses); apply later ones, which a crash kept out of the snapshot, as reports."""
         path = self._dir / RESULTS_FILE
-        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        raw = path.read_bytes() if path.exists() else b""
+        lines = raw.decode("utf-8").splitlines(keepends=True)
         if len(lines) < n_applied:
             raise ValueError(
                 f"{path} has {len(lines)} results, the state expects {n_applied}"
             )
         for n, line in enumerate(lines, start=1):
-            result = _result_from_json(json.loads(line))
+            try:
+                result = _result_from_json(json.loads(line))
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                if n == len(lines) and n > n_applied:
+                    self._truncate_torn_tail(path, keep=lines[:-1], error=e)
+                    break
+                raise ValueError(f"{path} line {n}: unreadable result ({e})") from e
             key = (result.arm_id, result.seed)
             if n <= n_applied:
                 i, _ = self._ids[result.arm_id]
@@ -723,7 +809,23 @@ class Scheduler:
                     f"{path} line {n}: result {key} matches no running job"
                 )
             self._apply(job, result)
-        self._n_results = len(lines)
+            self._n_results = n
+        self._n_results = max(self._n_results, n_applied)
+
+    def _truncate_torn_tail(
+        self, path: Path, *, keep: list[str], error: Exception
+    ) -> None:
+        size = len("".join(keep).encode("utf-8"))
+        _log.warning(
+            "%s: last line is a torn append (%s); truncating to %d bytes, its job is resubmitted",
+            path,
+            error,
+            size,
+        )
+        with path.open("r+b") as f:
+            f.truncate(size)
+            f.flush()
+            os.fsync(f.fileno())
 
 
 # --- JSON codecs -------------------------------------------------------------------------------
