@@ -5,9 +5,11 @@ from resetsweep.methods import (
     own_success,
     phased,
     point,
+    proposal,
     uniform,
     visited,
     visited_count,
+    walk,
 )
 from resetsweep.methods.base import (
     METHODS,
@@ -31,7 +33,9 @@ __all__ = [
     "own_success",
     "phased",
     "point",
+    "proposal",
     "uniform",
     "visited",
     "visited_count",
+    "walk",
 ]

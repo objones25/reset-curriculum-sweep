@@ -2,12 +2,13 @@ from collections.abc import Callable
 
 import pytest
 import torch
+from torch import Tensor
 
 from resetsweep.methods.base import P_TASK_DEFAULT, MethodContext
-from resetsweep.scores.base import Score
+from resetsweep.scores.base import BaseScore, Score, median_fill
 from resetsweep.sim.rollouts import Rollouts
 from resetsweep.tasks.base import TASKS, Task
-from resetsweep.types import StepCounter
+from resetsweep.types import Outcomes, RolloutStats, StepCounter
 
 TASKS.load("resetsweep.tasks")
 
@@ -44,3 +45,33 @@ def make_ctx(pendulum: Task) -> Callable[..., MethodContext]:
         )
 
     return factory
+
+
+class FixedScore(BaseScore):
+    """Score fake with settable `lp` / `trusted`; it logs every call it gets."""
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self.lp = torch.zeros(capacity)
+        self.trusted = torch.ones(capacity, dtype=torch.bool)
+        self.recorded: list[Outcomes] = []
+        self.observed: list[RolloutStats] = []
+        self.forgotten: list[list[int]] = []
+
+    def record(self, outcomes: Outcomes) -> None:
+        self.recorded.append(outcomes)
+
+    def observe_rollout(self, stats: RolloutStats) -> None:
+        self.observed.append(stats)
+
+    def values(self, ic_ids: Tensor) -> tuple[Tensor, Tensor]:
+        trusted = self.trusted[ic_ids]
+        return median_fill(self.lp[ic_ids], trusted), trusted
+
+    def forget(self, ic_ids: Tensor) -> None:
+        self.forgotten.append(sorted(ic_ids.tolist()))
+
+
+@pytest.fixture
+def fixed_score() -> Callable[[int], FixedScore]:
+    return FixedScore

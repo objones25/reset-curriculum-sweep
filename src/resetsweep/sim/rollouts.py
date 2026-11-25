@@ -74,13 +74,20 @@ class Rollouts:
             out.append(self._read(sim, chunk.n))
         return StartStates.cat(out)
 
-    def hold_screen(self, starts: StartStates, seconds: float) -> Tensor:
+    def hold_screen(
+        self, starts: StartStates, seconds: float, *, speed_max: float | None = None
+    ) -> Tensor:
         """True for starts that stay put under zero action for `seconds`: the task never
-        terminates and `max |qvel|` never exceeds `speed_max`. Charges every start for the
-        full duration (kind "screen"), also those that fail early.
+        terminates and `max |qvel|` never exceeds `speed_max` (the constructor's bound when
+        None). Charges every start for the full duration (kind "screen"), also those that
+        fail early.
         """
         if seconds <= 0:
             raise ValueError(f"seconds must be positive, got {seconds}")
+        if speed_max is None:
+            speed_max = self._speed_max
+        if speed_max <= 0:
+            raise ValueError(f"speed_max must be positive, got {speed_max}")
         steps = max(1, round(seconds / self._control_dt_s))
         self._counter.add_extra(starts.n * steps, "screen")
         keep: list[Tensor] = []
@@ -91,7 +98,7 @@ class Rollouts:
             for _ in range(steps):
                 step_task(self._task, sim, self._extra, zero)
                 ok &= ~self._task.terminated(sim, self._extra)
-                ok &= sim.qvel.abs().amax(dim=1) <= self._speed_max
+                ok &= sim.qvel.abs().amax(dim=1) <= speed_max
             keep.append(ok[: chunk.n])
         return torch.cat(keep)
 

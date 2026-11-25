@@ -111,3 +111,24 @@ def test_hold_screen_rejects_state_that_terminates() -> None:
     keep = rollouts.hold_screen(starts, seconds=0.5)
 
     assert keep.tolist() == [True, False]
+
+
+def test_hold_screen_speed_max_argument_overrides_constructor_bound() -> None:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    rollouts, _ = _rollouts(task)  # constructor bound: the 5.0 default
+    # Swinging through the bottom at 6 rad/s; it never goes over the top, so speed stays <= 6.
+    starts = StartStates(torch.zeros(1, 1), torch.full((1, 1), 6.0), torch.zeros(1, 0))
+
+    default = rollouts.hold_screen(starts, seconds=0.5)
+    wider = rollouts.hold_screen(starts, seconds=0.5, speed_max=8.0)
+
+    assert default.tolist() == [False]
+    assert wider.tolist() == [True]
+
+
+def test_hold_screen_rejects_non_positive_speed_max() -> None:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    rollouts, _ = _rollouts(task)
+
+    with pytest.raises(ValueError, match="speed_max must be positive"):
+        rollouts.hold_screen(task.canonical_start(), seconds=0.5, speed_max=0.0)
