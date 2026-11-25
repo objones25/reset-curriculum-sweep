@@ -23,6 +23,7 @@ accumulated in device tensors and read with `.item()`/`float()` once per iterati
 
 import dataclasses
 import hashlib
+import inspect
 import itertools
 import json
 import math
@@ -111,7 +112,7 @@ class RunSpec:
             if f.name not in ("seed", "device")
         }
         fields["ppo"] = dataclasses.asdict(self.ppo)
-        blob = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        blob = json.dumps(_plain(fields, "spec"), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def config(self) -> dict[str, Any]:
@@ -121,8 +122,28 @@ class RunSpec:
         return out
 
 
+def _plain(value: object, path: str) -> object:
+    """`value` as JSON-ready plain data: any Mapping becomes a dict, tuples become lists.
+    Raises TypeError naming the field path for anything else, so arm ids never depend on
+    a repr."""
+    if isinstance(value, Mapping):
+        return {str(k): _plain(v, f"{path}.{k}") for k, v in value.items()}  # pyright: ignore[reportUnknownVariableType] # kw values are arbitrary
+    if isinstance(value, list | tuple):
+        return [_plain(v, f"{path}[{i}]") for i, v in enumerate(value)]  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType] # kw values are arbitrary
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    raise TypeError(
+        f"{path.removeprefix('spec.')} has a {type(value).__module__}.{type(value).__qualname__} "
+        "value; RunSpec fields must be plain data (str, int, float, bool, None, lists, mappings)"
+    )
+
+
 @dataclass(frozen=True)
 class RunResult:
+    """Outcome of one run. `ever_succeeded_share` is `1 - never_succeeded_share` from the
+    method's last diagnostics, and NaN for methods without per-IC outcomes (uniform, point,
+    visited): ranking code must treat NaN as "not applicable", not as 0."""
+
     arm_id: str
     seed: int
     status: Literal["ok", "failed"]
@@ -469,6 +490,34 @@ class _Parts:
     evaluator: Evaluator
 
 
+def _seeded_score_kw(name: str, kw: Mapping[str, Any], seed: int) -> dict[str, Any]:
+    """`kw` plus `seed=seed` when score `name` takes a `seed` keyword and `kw` sets none,
+    applied recursively to an `inner` score's `inner_kw` (`inverted` wrapping `random`).
+    The seed is injected here, not stored in `score_kw`, so the arm id stays seed-free."""
+    params = inspect.signature(SCORES.get(name)).parameters
+    out = dict(kw)
+    if "seed" in params and "seed" not in out:
+        out["seed"] = seed
+    if "inner" in params and "inner" in out:
+        out["inner_kw"] = _seeded_score_kw(
+            str(out["inner"]), out.get("inner_kw") or {}, seed
+        )
+    return out
+
+
+def build_score(spec: RunSpec, task: Task) -> Score | None:
+    """The arm's score with the method's IC capacity, seeded from `spec.seed` when it
+    draws random values; None for scoreless arms."""
+    if spec.score is None:
+        return None
+    method_kw = {k: v for k, v in spec.method_kw.items() if k != "p_task"}
+    capacity = score_capacity(
+        spec.method, task=task, num_envs=spec.num_envs, method_kw=method_kw
+    )
+    kw = _seeded_score_kw(spec.score, spec.score_kw, spec.seed)
+    return SCORES.construct(spec.score, capacity=capacity, device=spec.device, **kw)  # pyright: ignore[reportReturnType] # registry returns object
+
+
 def _build(spec: RunSpec) -> _Parts:
     d = spec.device
     task: Task = TASKS.construct(spec.task, **spec.task_kw)  # pyright: ignore[reportAssignmentType] # registry returns object
@@ -481,14 +530,7 @@ def _build(spec: RunSpec) -> _Parts:
         )
     method_kw = dict(spec.method_kw)
     p_task = float(method_kw.pop("p_task", P_TASK_DEFAULT))
-    score: Score | None = None
-    if spec.score is not None:
-        capacity = score_capacity(
-            spec.method, task=task, num_envs=spec.num_envs, method_kw=method_kw
-        )
-        score = SCORES.construct(  # pyright: ignore[reportAssignmentType] # registry returns object
-            spec.score, capacity=capacity, device=d, **spec.score_kw
-        )
+    score = build_score(spec, task)
     gen = torch.Generator(device=d).manual_seed(spec.seed)
     counter = StepCounter(budget=_hard_budget(spec))
     ctx = MethodContext(
@@ -590,8 +632,11 @@ def _iteration_metrics(
     diag = parts.method.diagnostics()
     data["ic/never_succeeded_share"] = diag.pop("never_succeeded_share")
     data["ic/sampling_entropy"] = diag.pop("sampling_entropy")
-    for k, v in {**diag, **update_stats}.items():
+    # Namespaced apart so a key both report can never overwrite the other.
+    for k, v in diag.items():
         data[k if k.startswith("side/") else f"method/{k}"] = float(v)
+    for k, v in update_stats.items():
+        data[k if k.startswith("side/") else f"method_update/{k}"] = float(v)
     score = _active_score(parts)
     extra_metrics = getattr(score, "extra_metrics", None)
     if callable(extra_metrics):

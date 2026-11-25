@@ -1,5 +1,6 @@
 import dataclasses
 import math
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ from resetsweep.train import (
     Evaluator,
     RunSpec,
     auc,
+    build_score,
     collect_rollout,
     run,
     score_capacity,
@@ -136,6 +138,23 @@ def test_arm_id_does_not_depend_on_kw_order() -> None:
     assert a.arm_id() == b.arm_id()
 
 
+def test_arm_id_accepts_read_only_mappings() -> None:
+    kw = {"R": 2, "nested": {"a": [1, 2]}}
+    proxied = MappingProxyType({"R": 2, "nested": MappingProxyType({"a": (1, 2)})})
+
+    a = _spec(method="walk", method_kw=kw, score="random")
+    b = _spec(method="walk", method_kw=proxied, score="random")
+
+    assert a.arm_id() == b.arm_id()
+
+
+def test_arm_id_rejects_values_that_are_not_plain_data() -> None:
+    spec = _spec(method_kw={"device": torch.device("cpu")})
+
+    with pytest.raises(TypeError, match=r"method_kw\.device.*torch\.device"):
+        spec.arm_id()
+
+
 def test_run_spec_rejects_minibatch_larger_than_rollout() -> None:
     with pytest.raises(ValueError, match="minibatch_size 128 exceeds"):
         _spec(ppo=dataclasses.replace(PPO, minibatch_size=128))
@@ -177,6 +196,63 @@ def test_score_capacity_rejects_a_method_without_scores() -> None:
 
     with pytest.raises(ValueError, match="'uniform' takes no score"):
         score_capacity("uniform", task=task, num_envs=16, method_kw={})
+
+
+def _random_draws(**overrides: Any) -> Tensor:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    spec = _spec(method="walk", method_kw={"R": 2}, score="random", **overrides)
+    score = build_score(spec, task)
+    assert score is not None
+    lp, _ = score.values(torch.arange(score.capacity))
+    return lp
+
+
+def test_random_score_draws_differ_across_run_seeds() -> None:
+    assert not torch.equal(_random_draws(seed=0), _random_draws(seed=1))
+
+
+def test_random_score_draws_repeat_for_the_same_run_seed() -> None:
+    torch.testing.assert_close(
+        _random_draws(seed=3), _random_draws(seed=3), rtol=0, atol=0
+    )
+
+
+def test_random_score_keeps_an_explicit_seed() -> None:
+    a = _random_draws(seed=0, score_kw={"seed": 9})
+    b = _random_draws(seed=1, score_kw={"seed": 9})
+
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_inverted_random_score_is_seeded_from_the_run_seed() -> None:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+
+    def draws(seed: int) -> Tensor:
+        spec = _spec(
+            method="walk",
+            method_kw={"R": 2},
+            score="inverted",
+            score_kw={"inner": "random"},
+            seed=seed,
+        )
+        score = build_score(spec, task)
+        assert score is not None
+        return score.values(torch.arange(score.capacity))[0]
+
+    assert not torch.equal(draws(0), draws(1))
+    torch.testing.assert_close(draws(2), draws(2), rtol=0, atol=0)
+
+
+def test_seeding_does_not_change_arm_id() -> None:
+    assert (
+        _spec(score="random", seed=0).arm_id() == _spec(score="random", seed=1).arm_id()
+    )
+
+
+def test_build_score_is_none_for_scoreless_specs() -> None:
+    task: Task = TASKS.construct("pendulum_sparse")  # pyright: ignore[reportAssignmentType] # registry is untyped
+
+    assert build_score(_spec(), task) is None
 
 
 def test_run_rejects_score_the_method_does_not_accept() -> None:
@@ -321,14 +397,23 @@ def test_run_stops_at_step_budget_including_extra_steps() -> None:
         step_budget=budget,
     )
 
-    result = run(spec, _Recorder())
+    sink = _Recorder()
+    result = run(spec, sink)
 
     extra = sum(result.env_steps_extra.values())
+    total = result.env_steps_train + extra
     assert result.env_steps_extra["walk"] > 0
-    assert result.env_steps_train + extra >= budget
+    assert total >= budget
     # Train steps alone stay below the budget: the walks were charged against it.
     assert result.env_steps_train < budget
     assert result.env_steps_train % (NUM_ENVS * ROLLOUT_LEN) == 0
+    # Upper bound: the iteration before the last one ended below the budget, so the run
+    # overshoots by at most one iteration (N*T train steps plus that iteration's extras).
+    iteration_totals = [d["env_steps/total"] for s, d in sink.logs if s > 0]
+    assert iteration_totals[-1] == total
+    assert iteration_totals[-2] < budget
+    last_extra = sink.logs[-1][1]["env_steps/walk"] - sink.logs[-2][1]["env_steps/walk"]
+    assert total - budget < NUM_ENVS * ROLLOUT_LEN + last_extra
 
 
 def test_run_result_auc_is_zero_when_never_successful() -> None:
@@ -409,6 +494,19 @@ def test_run_records_first_reward_step_on_dense_task() -> None:
     # Counted in vector steps of NUM_ENVS; dense height reward appears within the run.
     assert first % NUM_ENVS == 0
     assert 0 < first <= result.env_steps_train
+
+
+def test_run_namespaces_method_update_stats_apart_from_diagnostics() -> None:
+    torch.manual_seed(0)
+    sink = _Recorder()
+
+    run(_spec(method="walk", method_kw={"R": 2}, score="random"), sink)
+
+    keys = sink.logged_keys()
+    assert "method/buffer_size" in keys  # diagnostics keep the method/ prefix
+    assert not any(
+        k.startswith("method_update/") for k in keys
+    )  # walk.update returns {}
 
 
 def test_run_propagates_exceptions() -> None:
