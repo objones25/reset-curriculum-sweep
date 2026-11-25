@@ -78,14 +78,25 @@ def save(path: Path, launches: list[Launch]) -> None:
 def settle(client: RunPodClient, launches: list[Launch]) -> list[Launch]:
     """Each launch with `spent_usd` set to its pod + volume spend from the billing API.
 
-    Never lowered: billing runs every few minutes, so a fresh read can lag an earlier one."""
+    A volume reused by later launches (`--volume-id`) is billed once, to the earliest launch
+    that used it, from that launch's creation hour. Never lowered: billing runs every few
+    minutes, so a fresh read can lag an earlier one."""
+    first_use: dict[str, int] = {}
+    for i, launch in enumerate(launches):
+        j = first_use.get(launch.volume_id)
+        if j is None or launch.created() < launches[j].created():
+            first_use[launch.volume_id] = i
     settled = []
-    for launch in launches:
+    for i, launch in enumerate(launches):
         since = _billing_start(launch.created())
-        spent = client.volume_spend_usd(launch.volume_id, since=since)
+        spent = 0.0
+        if first_use[launch.volume_id] == i:
+            spent += client.volume_spend_usd(launch.volume_id, since=since)
         if launch.pod_id is not None:
             spent += client.pod_spend_usd(launch.pod_id, since=since)
         settled.append(replace(launch, spent_usd=max(spent, launch.spent_usd)))
+    if len(settled) != len(launches):
+        raise AssertionError("settle must keep every launch")
     return settled
 
 

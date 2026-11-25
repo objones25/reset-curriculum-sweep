@@ -71,6 +71,7 @@ class FakeRunPod:
     volume_spend_usd: dict[str, float] = field(default_factory=dict)
     pod_create_statuses: list[int] = field(default_factory=list)
     volume_create_status: int = 201
+    volumes: dict[str, dict[str, object]] = field(default_factory=dict)
     requests: list[httpx.Request] = field(default_factory=list)
     _pods_created: int = 0
 
@@ -96,6 +97,13 @@ class FakeRunPod:
             ("POST", "/v2/network-volumes"): self._create_volume,
             ("POST", "/v2/pods"): self._create_pod,
         }
+        if request.method == "GET" and request.url.path.startswith(
+            "/v2/network-volumes/"
+        ):
+            volume = self.volumes.get(request.url.path.rsplit("/", 1)[1])
+            if volume is None:
+                return httpx.Response(404, json={"detail": "volume not found"})
+            return httpx.Response(200, json=volume)
         if route not in routes:
             return httpx.Response(404, json={"detail": f"no fake route {route}"})
         return routes[route](request)

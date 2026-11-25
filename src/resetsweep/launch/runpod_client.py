@@ -7,6 +7,7 @@ Endpoints, from docs.runpod.io/api-reference-v2 (read 2026-11-25 via the RunPod 
 - `GET  /catalog/datacenters?include=GPU_AVAILABILITY`: `dataCenters[]` with `id`,
   `networkVolumeTypes` (STANDARD|HIGH_PERFORMANCE) and `gpuAvailability[]`.
 - `POST /network-volumes` {name, size, dataCenter} -> 201 with `id`.
+- `GET  /network-volumes/{id}` -> `id`, `size` (GB), `dataCenter`, `type`.
 - `POST /pods` -> 201 with `id` and `cost` (USD/h). 400 = no capacity or a rule violation,
   422 = validation failed.
 - `DELETE /pods/{id}` -> 204.
@@ -72,6 +73,14 @@ class DataCenter:
     available_gpus: tuple[str, ...]  # GPU type ids with stock (availability != NONE)
 
 
+@dataclass(frozen=True)
+class NetworkVolume:
+    id: str
+    datacenter: str
+    size_gb: int
+    type: str
+
+
 class RunPodClient:
     def __init__(
         self,
@@ -128,6 +137,23 @@ class RunPodClient:
     def create_volume(self, name: str, size_gb: int, datacenter: str) -> str:
         body = {"name": name, "size": size_gb, "dataCenter": datacenter}
         return _str(self._json("POST", "/network-volumes", body=body), "id")
+
+    def get_volume(self, volume_id: str) -> NetworkVolume:
+        data = self._json("GET", f"/network-volumes/{volume_id}")
+        size = data.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise RunPodError(
+                200, "malformed response: volume `size` is not a positive integer"
+            )
+        volume = NetworkVolume(
+            id=_str(data, "id"),
+            datacenter=_str(data, "dataCenter"),
+            size_gb=size,
+            type=_str(data, "type"),
+        )
+        if volume.id != volume_id:
+            raise RunPodError(200, f"asked for volume {volume_id}, got {volume.id}")
+        return volume
 
     def create_pod(self, body: dict[str, object]) -> dict[str, object]:
         pod = self._json("POST", "/pods", body=body)

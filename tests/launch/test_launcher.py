@@ -132,7 +132,10 @@ def test_create_pod_body_has_network_mount_secure_cloud_min_cuda_and_env(
     assert pod["cmd"] == ["bash", "-c", CLONE_ONE_LINER]
     env = pod["env"]
     assert isinstance(env, dict)
-    assert env["RUNPOD_API_KEY"] == FAKE_RUNPOD_KEY
+    assert env["SWEEP_RUNPOD_API_KEY"] == FAKE_RUNPOD_KEY
+    assert (
+        "RUNPOD_API_KEY" not in env
+    )  # RunPod may inject its own pod-scoped key under that name
     assert env["WANDB_API_KEY"] == FAKE_WANDB_KEY
     assert env["REPO_URL"] == REPO
     assert env["REPO_REF"] == "feat/sweep"
@@ -146,12 +149,22 @@ def test_create_pod_body_has_network_mount_secure_cloud_min_cuda_and_env(
     assert all(isinstance(v, str) for v in env.values())
 
 
-def test_clone_one_liner_is_the_specified_command() -> None:
-    assert CLONE_ONE_LINER == (
-        "set -euo pipefail; cd /workspace; if [ -d repo ]; then git -C repo fetch --depth 1 origin "
-        '"$REPO_REF" && git -C repo checkout FETCH_HEAD; else git clone --depth 1 --branch '
-        '"$REPO_REF" "$REPO_URL" repo; fi; exec bash repo/scripts/pod_bootstrap.sh'
+def test_clone_one_liner_installs_self_delete_trap_before_the_specified_clone() -> None:
+    trap = (
+        'set -euo pipefail; self_delete() { if [ -n "${RUNPOD_POD_ID:-}" ] && '
+        "[ -n \"${SWEEP_RUNPOD_API_KEY:-}\" ]; then printf 'Authorization: Bearer %s\\n' "
+        '"$SWEEP_RUNPOD_API_KEY" | curl -fsS -X DELETE --max-time 30 --retry 5 '
+        '--retry-all-errors -H @- "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" || true; fi; }; '
+        "trap self_delete EXIT; "
     )
+    clone = (
+        "cd /workspace; if [ -d repo ]; then git -C repo fetch --depth 1 origin "
+        '"$REPO_REF"; git -C repo checkout FETCH_HEAD; else git clone --depth 1 --branch '
+        '"$REPO_REF" "$REPO_URL" repo; fi; test -f repo/scripts/pod_bootstrap.sh; '
+        "exec bash repo/scripts/pod_bootstrap.sh"
+    )
+
+    assert CLONE_ONE_LINER == trap + clone
 
 
 def test_smoke_flag_sets_env(
@@ -208,7 +221,8 @@ def test_dry_run_redacts_secrets_and_makes_no_post(
     assert {r.method for r in fake_runpod.requests} == {"GET"}
     assert FAKE_RUNPOD_KEY not in out.out + out.err
     assert FAKE_WANDB_KEY not in out.out + out.err
-    assert '"RUNPOD_API_KEY": "***"' in out.out
+    assert '"SWEEP_RUNPOD_API_KEY": "***"' in out.out
+    assert '"RUNPOD_API_KEY"' not in out.out
     assert '"WANDB_API_KEY": "***"' in out.out
     assert '"minCudaVersion": "13.2"' in out.out
     assert '"size": 20' in out.out
@@ -384,7 +398,9 @@ def test_falls_back_to_next_gpu_on_400_and_reports_orphan_volume_when_all_fail(
     err = capsys.readouterr().err
     gpu_ids = [b["gpu"]["id"] for b in fake_runpod.bodies("POST", "/v2/pods")]  # type: ignore[index]
     assert code == 2
-    assert gpu_ids == list(PRICES)
+    assert gpu_ids == sorted(
+        PRICES, key=lambda g: (g != "NVIDIA GeForce RTX 4090", PRICES[g])
+    )
     assert len(fake_runpod.sent("POST", "/v2/network-volumes")) == 1
     assert "vol-1" in err
     assert "curl -fsS -X DELETE" in err
@@ -463,3 +479,186 @@ def test_settled_spend_is_never_lowered_by_a_lagging_billing_read(
     env = pod["env"]
     assert isinstance(env, dict)
     assert env["SWEEP_CAP_USD"] == "60.00"
+
+
+def test_fallbacks_are_tried_in_ascending_live_price_and_unavailable_ones_skipped(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    prices = {
+        "NVIDIA GeForce RTX 4090": 0.89,
+        "NVIDIA RTX A5000": 0.27,
+        "NVIDIA A40": 0.59,
+        "NVIDIA L4": 0.69,
+        "NVIDIA RTX A6000": 0.69,
+        "NVIDIA L40S": 1.09,
+        "NVIDIA RTX 6000 Ada Generation": 1.09,
+        "NVIDIA A100-SXM4-80GB": 2.19,
+    }
+    out_of_stock = {"NVIDIA A40", "NVIDIA L40S"}
+    fake_runpod.gpus = [
+        {
+            "id": g,
+            "price": {"secure": p, "community": p},
+            "dataCenters": [
+                {"id": DC, "availability": "NONE" if g in out_of_stock else "LOW"}
+            ],
+        }
+        for g, p in reversed(prices.items())
+    ]
+    fake_runpod.pod_create_statuses = [400] * 8
+
+    code = _run(fake_runpod, env_file, tmp_path)
+
+    gpu_ids = [b["gpu"]["id"] for b in fake_runpod.bodies("POST", "/v2/pods")]  # type: ignore[index]
+    assert code == 2
+    assert gpu_ids == [
+        "NVIDIA GeForce RTX 4090",
+        "NVIDIA RTX A5000",
+        "NVIDIA L4",
+        "NVIDIA RTX A6000",
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA A100-SXM4-80GB",
+    ]
+
+
+def test_fallback_list_holds_the_ruled_catalog_ids() -> None:
+    from resetsweep.launch.launcher import GPU_FALLBACKS
+
+    assert set(GPU_FALLBACKS) == {
+        "NVIDIA A40",
+        "NVIDIA L40S",
+        "NVIDIA RTX A6000",
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA L4",
+        "NVIDIA RTX A5000",
+        "NVIDIA A100-SXM4-80GB",
+    }
+
+
+OTHER_DC = "US-TX-3"
+
+
+def _existing_volume(
+    fake: FakeRunPod, *, dc: str = OTHER_DC, kind: str = "STANDARD"
+) -> None:
+    fake.volumes["vol-old"] = {
+        "id": "vol-old",
+        "name": "old",
+        "size": 20,
+        "dataCenter": dc,
+        "type": kind,
+    }
+    fake.gpus = [
+        g
+        | {
+            "dataCenters": [
+                {"id": DC, "availability": "HIGH"},
+                {"id": dc, "availability": "LOW"},
+            ]
+        }
+        for g in fake.gpus
+    ]
+
+
+def test_volume_id_reuses_the_volume_and_pins_its_datacenter(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    _existing_volume(fake_runpod)
+    ledger = tmp_path / "ledger.json"
+
+    code = _run(
+        fake_runpod, env_file, tmp_path, "--volume-id", "vol-old", ledger=ledger
+    )
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    assert code == 0
+    assert fake_runpod.sent("POST", "/v2/network-volumes") == []
+    assert pod["mounts"] == {"network": [{"volumeId": "vol-old", "path": "/workspace"}]}
+    assert pod["dataCenterIds"] == [OTHER_DC]
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert saved["launches"][0]["volume_id"] == "vol-old"
+
+
+def test_volume_id_failure_does_not_call_the_users_volume_orphaned(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _existing_volume(fake_runpod)
+    fake_runpod.pod_create_statuses = [400] * 4
+
+    code = _run(fake_runpod, env_file, tmp_path, "--volume-id", "vol-old")
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "orphaned" not in err
+    assert "vol-old" in err
+
+
+def test_volume_id_not_found_exits_1_before_any_post(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    code = _run(fake_runpod, env_file, tmp_path, "--volume-id", "vol-missing")
+
+    assert code == 1
+    assert [r.method for r in fake_runpod.requests if r.method != "GET"] == []
+
+
+def test_volume_id_of_a_non_standard_volume_is_refused(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _existing_volume(fake_runpod, kind="HIGH_PERFORMANCE")
+
+    code = _run(fake_runpod, env_file, tmp_path, "--volume-id", "vol-old")
+
+    assert code == 1
+    assert fake_runpod.sent("POST", "/v2/pods") == []
+    assert "HIGH_PERFORMANCE" in capsys.readouterr().err
+
+
+def test_volume_id_in_a_datacenter_without_stock_exits_2(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    fake_runpod.volumes["vol-old"] = {
+        "id": "vol-old",
+        "size": 20,
+        "dataCenter": "XX-NONE-1",
+        "type": "STANDARD",
+    }
+
+    code = _run(fake_runpod, env_file, tmp_path, "--volume-id", "vol-old")
+
+    assert code == 2
+    assert fake_runpod.sent("POST", "/v2/pods") == []
+
+
+def test_shared_volume_spend_is_counted_once(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    later = _old_launch(pod_id="pod-2") | {"created_at": "2026-11-24T20:00:00+00:00"}
+    _write_ledger(ledger, [_old_launch(), later])
+    fake_runpod.pod_spend_usd.update({"pod-old": 10.0, "pod-2": 20.0})
+    fake_runpod.volume_spend_usd["vol-old"] = 5.0
+
+    _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    env = pod["env"]
+    assert isinstance(env, dict)
+    assert env["SWEEP_CAP_USD"] == "65.00"
+
+
+def test_prints_how_to_resume_on_the_same_volume(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run(fake_runpod, env_file, tmp_path, "--smoke")
+
+    assert "sweep-launch --volume-id vol-1 --smoke" in capsys.readouterr().out

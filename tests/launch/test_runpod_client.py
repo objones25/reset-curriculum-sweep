@@ -11,7 +11,12 @@ import httpx
 import pytest
 from runpod_fakes import DC, FAKE_RUNPOD_KEY, PRICES, FakeRunPod
 
-from resetsweep.launch.runpod_client import DataCenter, RunPodClient, RunPodError
+from resetsweep.launch.runpod_client import (
+    DataCenter,
+    NetworkVolume,
+    RunPodClient,
+    RunPodError,
+)
 
 
 class RecordingSleep:
@@ -310,3 +315,21 @@ def test_volume_spend_reads_billing_totals_for_one_volume(
     assert spend == pytest.approx(0.5)
     assert fake_runpod.requests[0].url.path == "/v2/billing/network-volumes"
     assert fake_runpod.requests[0].url.params["networkVolumeId"] == "vol-old"
+
+
+def test_get_volume_reads_datacenter_size_and_type(fake_runpod: FakeRunPod) -> None:
+    fake_runpod.volumes["vol-7"] = {
+        "id": "vol-7",
+        "name": "v",
+        "size": 20,
+        "dataCenter": DC,
+        "type": "STANDARD",
+    }
+    client = RunPodClient(FAKE_RUNPOD_KEY, transport=fake_runpod.transport())
+
+    volume = client.get_volume("vol-7")
+
+    assert volume == NetworkVolume(
+        id="vol-7", datacenter=DC, size_gb=20, type="STANDARD"
+    )
+    assert fake_runpod.requests[0].url.path == "/v2/network-volumes/vol-7"
