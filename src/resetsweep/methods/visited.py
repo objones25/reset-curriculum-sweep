@@ -18,6 +18,7 @@ from resetsweep.methods.base import (
     mix_task_start,
     to_device,
 )
+from resetsweep.tasks.base import prepare_candidates
 from resetsweep.types import Outcomes, StartStates
 
 CAPACITY_DEFAULT = 65536
@@ -80,13 +81,10 @@ class Visited(MethodBase):
         self._write(qpos, qvel, extra)
 
     def _write(self, qpos: Tensor, qvel: Tensor, extra: Tensor) -> Tensor:
-        """Store the valid rows; return each row's slot (`capacity` = rejected, the spare row)."""
-        states = StartStates(qpos, qvel, extra)
-        valid = (
-            self.ctx.task.is_valid(states)
-            & torch.isfinite(qpos).all(dim=1)
-            & torch.isfinite(qvel).all(dim=1)
-            & torch.isfinite(extra).all(dim=1)
+        """Store the valid rows, canonicalized (`prepare_candidates`); return each row's slot
+        (`capacity` = rejected, the spare row)."""
+        states, valid = prepare_candidates(
+            self.ctx.task, StartStates(qpos, qvel, extra)
         )
         rank = valid.long().cumsum(0) - 1
         slot = torch.where(
@@ -94,9 +92,9 @@ class Visited(MethodBase):
             (self._ptr + rank) % self._capacity,
             torch.full_like(rank, self._capacity),
         )
-        self._qpos[slot] = qpos
-        self._qvel[slot] = qvel
-        self._extra[slot] = extra
+        self._qpos[slot] = states.qpos
+        self._qvel[slot] = states.qvel
+        self._extra[slot] = states.extra
         added = valid.sum()
         self._ptr = (self._ptr + added) % self._capacity
         self._size = (self._size + added).clamp(max=self._capacity)

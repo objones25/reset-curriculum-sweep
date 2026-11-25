@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
-from resetsweep.tasks.base import TASKS
+from resetsweep.tasks.base import TASKS, wrap_columns
 from resetsweep.types import Box, StartStates
 
 # Two 1 kg capsules of 0.5 m, so the tip reaches 1.0 m from the pivot. Gravity on the second link
@@ -55,6 +55,9 @@ def _tip_height_m(qpos: Tensor) -> Tensor:
     return -LINK_LENGTH_M * (q1.cos() + (q1 + q2).cos())
 
 
+_HINGE_COLUMNS = (0, 1)  # unlimited hinges: shoulder and elbow (neither `limited` in the MJCF)
+
+
 class _Acrobot:
     mjcf = _MJCF
     obs_dim = 6  # cos/sin of both joints, then both velocities
@@ -91,6 +94,9 @@ class _Acrobot:
 
     def state_features(self, qpos: Tensor, qvel: Tensor, extra: Tensor) -> Tensor:
         return torch.cat([qpos.cos(), qpos.sin(), qvel], dim=1)
+
+    def canonicalize(self, states: StartStates) -> StartStates:
+        return wrap_columns(states, _HINGE_COLUMNS)
 
     def is_valid(self, states: StartStates) -> Tensor:
         x = torch.cat([states.qpos, states.qvel], dim=1)

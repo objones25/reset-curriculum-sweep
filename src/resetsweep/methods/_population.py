@@ -40,6 +40,7 @@ from torch import Tensor
 from resetsweep.methods._slots import ICVersions
 from resetsweep.methods.base import MethodBase, MethodContext, mix_task_start, to_device
 from resetsweep.scores.base import Score
+from resetsweep.tasks.base import canonicalize
 from resetsweep.types import InvalidStartState, Outcomes, RolloutStats, StartStates
 
 R_DEFAULT = 4
@@ -304,6 +305,13 @@ class PopulationMixin(MethodBase):
         )
         return states, torch.zeros(k, dtype=torch.long, device=d)
 
+    def _admit(self, states: StartStates) -> tuple[StartStates, Tensor]:
+        """Children canonicalized (`tasks.base.canonicalize`), then checked by `_valid`:
+        `(states, ok)`. Only the children path canonicalizes; `_valid` checks states that
+        are stored as given (`replace`)."""
+        states = canonicalize(self.ctx.task, states)
+        return states, self._valid(states)
+
     def _valid(self, states: StartStates) -> Tensor:
         x = torch.cat([states.qpos, states.qvel], dim=1)
         in_box = ((x >= self._low) & (x <= self._high)).all(dim=1)
@@ -319,8 +327,7 @@ class PopulationMixin(MethodBase):
         extra = torch.zeros(m, self._extra.shape[1], device=d)
         pending = torch.arange(m, device=d)
         for _ in range(self._tries):
-            cand = to_device(propose(pending), d)
-            ok = self._valid(cand)
+            cand, ok = self._admit(to_device(propose(pending), d))
             if self._screen_seconds > 0 and bool(ok.any()):
                 idx = ok.nonzero(as_tuple=True)[0]
                 ok[idx] = self.ctx.rollouts.hold_screen(

@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
-from resetsweep.tasks.base import TASKS
+from resetsweep.tasks.base import TASKS, wrap_columns
 from resetsweep.types import Box, StartStates
 
 # Cart 1 kg, pole 0.2 kg with its centre of mass 0.25 m from the hinge. Full force 4 N on the
@@ -56,6 +56,9 @@ _MAX_POLE_SPEED_RAD_S = 10.0
 def _angle_from_upright(theta: Tensor) -> Tensor:
     """Absolute angular distance to upright, in [0, pi], for any unwrapped angle."""
     return (torch.remainder(theta, 2 * math.pi) - math.pi).abs()
+
+
+_HINGE_COLUMNS = (1,)  # unlimited hinges: the pole hinge; the cart slider is limited and never wrapped
 
 
 class _Cartpole:
@@ -113,6 +116,9 @@ class _Cartpole:
     def state_features(self, qpos: Tensor, qvel: Tensor, extra: Tensor) -> Tensor:
         theta = qpos[:, 1:2]
         return torch.cat([qpos[:, :1], theta.cos(), theta.sin(), qvel], dim=1)
+
+    def canonicalize(self, states: StartStates) -> StartStates:
+        return wrap_columns(states, _HINGE_COLUMNS)
 
     def is_valid(self, states: StartStates) -> Tensor:
         x = torch.cat([states.qpos, states.qvel], dim=1)

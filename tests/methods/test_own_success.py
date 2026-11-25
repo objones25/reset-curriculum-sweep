@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable, Sequence
 
 import pytest
@@ -31,12 +32,14 @@ def _build(
     )
 
 
-def _offer(method: OwnSuccess, env_id: int, qpos: float, ep_step: int) -> None:
+def _offer(
+    method: OwnSuccess, env_id: int, qpos: float, ep_step: int, *, qvel: float = 0.0
+) -> None:
     """Offer one state for `env_id` only (the other envs are not offered)."""
     method.offer_visited(
         torch.tensor([env_id]),
         torch.tensor([[qpos]]),
-        torch.zeros(1, 1),
+        torch.tensor([[qvel]]),
         torch.zeros(1, 0),
         torch.tensor([ep_step]),
     )
@@ -290,3 +293,36 @@ def test_episode_versions_mark_stored_starts_zero_and_task_starts_minus_one(
     method.reset(torch.tensor([0]), None)
 
     assert method.episode_versions().tolist() == [0, -1]
+
+
+def test_own_success_skips_invalid_states_and_keeps_tags(make_ctx: MakeCtx) -> None:
+    torch.manual_seed(0)
+    score = StepsToReward(capacity=2 * STATES_PER_TRAJ, device="cpu")
+    method = _build(make_ctx, score=score, order="frontier")
+    _offer(method, 0, 0.1, 8)
+    _offer(method, 0, 0.2 + 2 * math.pi, 16)  # past +pi: wrapped to 0.2, kept
+    _offer(method, 0, 0.3, 24, qvel=1e3)  # faster than the start box allows: dropped
+    _offer(method, 0, 0.4, 32)
+
+    method.reset(torch.tensor([0]), _outcomes([0], first_reward_step=[32]))
+
+    lp, trusted = score.values(torch.arange(4))
+    _, ids = method.reset(torch.tensor([0, 1]), None)
+    assert method.ic_states().qpos[:4, 0].tolist() == pytest.approx(
+        [0.1, 0.2, 0.4, 0.0], abs=1e-5
+    )
+    assert lp[:3].tolist() == [-24.0, -16.0, 0.0]  # tags of the kept states, in order
+    assert trusted.tolist() == [True, True, True, False]
+    assert ids.tolist() == [2, 2]  # the frontier indexes the stored states
+
+
+def test_own_success_does_not_store_trajectory_without_valid_states(
+    make_ctx: MakeCtx,
+) -> None:
+    torch.manual_seed(0)
+    method = _build(make_ctx)
+    _offer(method, 0, 0.1, 8, qvel=1e3)
+
+    method.reset(torch.tensor([0]), _outcomes([0], first_reward_step=[8]))
+
+    assert method.diagnostics()["trajectories"] == 0.0

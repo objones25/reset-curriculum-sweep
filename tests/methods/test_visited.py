@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 
 import pytest
@@ -55,8 +56,15 @@ def test_visited_stores_clones_not_views(make_ctx: MakeCtx) -> None:
 def test_visited_skips_states_the_task_would_reject(make_ctx: MakeCtx) -> None:
     method = Visited(make_ctx(num_envs=3), capacity=8)
 
-    # pendulum start_box allows |qpos| <= pi; 50.0 is outside, nan is non-finite
-    _offer(method, [0.5, 50.0, float("nan")])
+    # pendulum start_box caps |qvel|: 1e3 rad/s is outside it, nan is non-finite. (An angle
+    # past +-pi is not invalid: it wraps, see test_visited_keeps_wrapped_swingup_states.)
+    method.offer_visited(
+        torch.arange(3),
+        torch.tensor([[0.5], [0.6], [float("nan")]]),
+        torch.tensor([[0.0], [1e3], [0.0]]),
+        torch.zeros(3, 0),
+        torch.zeros(3, dtype=torch.long),
+    )
 
     assert method.buffer().qpos[:, 0].tolist() == pytest.approx([0.5])
 
@@ -144,3 +152,13 @@ def test_visited_rejects_bad_sizes(
 ) -> None:
     with pytest.raises(ValueError, match="capacity|min_fill"):
         Visited(make_ctx(num_envs=num_envs), capacity=capacity, min_fill=min_fill)
+
+
+def test_visited_keeps_wrapped_swingup_states(make_ctx: MakeCtx) -> None:
+    # A swinging pendulum's angle runs past +-pi; the state is physically in the box.
+    method = Visited(make_ctx(num_envs=2), capacity=4)
+
+    _offer(method, [math.pi + 0.2, -3 * math.pi - 0.3])
+
+    stored = sorted(method.buffer().qpos[:, 0].tolist())
+    assert stored == pytest.approx([-math.pi + 0.2, math.pi - 0.3], abs=1e-5)

@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
-from resetsweep.tasks.base import TASKS
+from resetsweep.tasks.base import TASKS, wrap_columns
 from resetsweep.types import Box, StartStates
 
 # Capsule of mass 1 kg, 0.5 m long, so its centre of mass is l = 0.25 m below the hinge and
@@ -49,6 +49,9 @@ def _angle_from_upright(theta: Tensor) -> Tensor:
     return (torch.remainder(theta, 2 * math.pi) - math.pi).abs()
 
 
+_HINGE_COLUMNS = (0,)  # unlimited hinges: the hinge (no `limited` in the MJCF)
+
+
 class _Pendulum:
     mjcf = _MJCF
     obs_dim = 3  # cos(theta), sin(theta), omega
@@ -85,6 +88,9 @@ class _Pendulum:
 
     def state_features(self, qpos: Tensor, qvel: Tensor, extra: Tensor) -> Tensor:
         return torch.cat([qpos.cos(), qpos.sin(), qvel], dim=1)
+
+    def canonicalize(self, states: StartStates) -> StartStates:
+        return wrap_columns(states, _HINGE_COLUMNS)
 
     def is_valid(self, states: StartStates) -> Tensor:
         x = torch.cat([states.qpos, states.qvel], dim=1)

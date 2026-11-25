@@ -6,7 +6,9 @@ offered during its current episode with their `ep_step`. When an episode ends wi
 `reached_reward`, its states up to and including `Outcomes.first_reward_step` (the episode
 clock on the step the reward was first > 0) are stored as one trajectory, each tagged with
 steps-to-reward `first_reward_step - ep_step`; states after the first reward are never
-stored. A trajectory has room for every offer of a whole episode: `M =
+stored. Stored states go through `prepare_candidates` (unlimited hinges wrapped into
+[-pi, pi), then `task.is_valid`): invalid rows are dropped, the rest keep their order and
+tags, and a trajectory with no valid state is not stored. A trajectory has room for every offer of a whole episode: `M =
 states_per_trajectory(task) = ceil(task.max_steps / visit_every)` (66 for the 528-step
 maze_trap), so nothing before the reward is cut. Episodes that started from a stored state
 are not captured (ours): their trajectory is a tail of one already stored, and storing
@@ -55,7 +57,7 @@ from resetsweep.methods.base import (
 from resetsweep.scores.base import ICTable, Score, median_fill
 from resetsweep.scores.steps_to_reward import StepsToReward
 from resetsweep.sim.env import VISIT_EVERY_DEFAULT
-from resetsweep.tasks.base import Task
+from resetsweep.tasks.base import Task, prepare_candidates
 from resetsweep.types import Outcomes, RolloutStats, StartStates
 
 Order = Literal["uniform", "frontier"]
@@ -263,14 +265,20 @@ class OwnSuccess(MethodBase):
         steps = self._ep_step[env]
         keep = ((steps >= 0) & (steps <= first)).nonzero(as_tuple=True)[0]
         rows = keep[torch.argsort(steps[keep], stable=True)][-self._m :]
+        raw = StartStates(
+            self._ep_qpos[env, rows], self._ep_qvel[env, rows], self._ep_extra[env, rows]
+        )
+        states, valid = prepare_candidates(self.ctx.task, raw)
+        # Invalid rows are dropped; the rest keep their time order and steps-to-reward.
+        rows, states = rows[valid], states.index(valid)
         n = rows.numel()
-        if n == 0:  # reward came before the first offer: nothing to restart from
+        if n == 0:  # no valid state before the reward: nothing to restart from
             return
         t = self._n_traj
         ids = torch.arange(t * self._m, t * self._m + n, device=self.ctx.device)
-        self._qpos[ids] = self._ep_qpos[env, rows]
-        self._qvel[ids] = self._ep_qvel[env, rows]
-        self._extra[ids] = self._ep_extra[env, rows]
+        self._qpos[ids] = states.qpos
+        self._qvel[ids] = states.qvel
+        self._extra[ids] = states.extra
         self._steps[ids] = first - steps[rows]
         self._traj_len[t] = n
         self._frontier[t] = n - 1
