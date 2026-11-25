@@ -135,10 +135,9 @@ def test_rung0_has_no_dense_tasks_or_variants(rung0: list[Arm]) -> None:
 def test_uniform_and_point_on_every_task(rung0: list[Arm]) -> None:
     for name in ("uniform", "point"):
         assert {a.task for a in rung0 if a.method == name} == set(SPARSE_TASKS)
-    r1 = arm_space("rung1_expand", survivors=[])
-    for name in ("uniform", "point"):
-        # Sparse copies already ran at rung 0; rung 1 adds only the dense tasks.
-        assert {a.task for a in r1 if a.method == name} == set(DENSE_TASKS)
+    # Spec 5.4: dense tasks run only finalists, so rung 1 adds no dense anchors.
+    assert arm_space("rung1_expand", survivors=[]) == []
+    assert arm_space("final_expand", survivors=[]) == []
 
 
 def _survivor(rung0: list[Arm], *, task: str, method: str, score: str | None) -> Arm:
@@ -147,26 +146,34 @@ def _survivor(rung0: list[Arm], *, task: str, method: str, score: str | None) ->
     )
 
 
-def test_rung1_expand_adds_inverted_and_dense_for_survivors_only(
-    rung0: list[Arm],
-) -> None:
+def test_rung1_expand_adds_only_p_task_and_task_variants(rung0: list[Arm]) -> None:
+    """Spec 5.4 / final-review ruling C2a: rung 1 adds the p_task variants {0.2, 0.8} and the
+    task variants (each with its own uniform/point anchors), nothing else."""
     survivor = _survivor(rung0, task="maze", method="walk", score="rnd")
-    expanded = arm_space("rung1_expand", survivors=[survivor])
-    inverted = [a for a in expanded if a.score == "inverted"]
-    assert [(a.task, a.method) for a in inverted] == [("maze", "walk")]
-    assert inverted[0].score_kwargs() == {"inner": "rnd", "inner_kw": {}}
-    dense = [a for a in expanded if a.task in DENSE_TASKS and a.method == "walk"]
-    assert {a.task for a in dense} == set(DENSE_TASKS)
-    assert {a.score for a in dense} == {"rnd"}
-    # No other method gets an inverted or dense arm beyond uniform/point.
-    extras = [a for a in expanded if a.method not in {"walk", "uniform", "point"}]
-    assert extras == []
+    expanded = {a.label() for a in arm_space("rung1_expand", survivors=[survivor])}
+    assert expanded == {
+        "maze/walk[p_task=0.2]/rnd",
+        "maze/walk[p_task=0.8]/rnd",
+        "maze[lanes=5]/walk[p_task=0.5]/rnd",
+        "maze[lanes=5]/uniform/-",
+        "maze[lanes=5]/point/-",
+    }
 
 
-def test_rung1_expand_p_task_variants_and_own_success_order(rung0: list[Arm]) -> None:
+def test_rung1_expand_has_no_inverted_dense_or_order_variants(rung0: list[Arm]) -> None:
+    survivors = [a for a in rung0 if a.task in {"maze", "pendulum_sparse"}]
+    expanded = arm_space("rung1_expand", survivors=survivors)
+    assert [a for a in expanded if a.score == "inverted"] == []
+    assert [a for a in expanded if a.task in DENSE_TASKS] == []
+    own_orders = {
+        _kw(a.method_kw)["order"] for a in expanded if a.method == "own_success"
+    }
+    assert own_orders == {"uniform"}
+
+
+def test_rung1_expand_p_task_variants(rung0: list[Arm]) -> None:
     walk = _survivor(rung0, task="maze", method="walk", score="rnd")
-    own = _survivor(rung0, task="maze", method="own_success", score=None)
-    expanded = arm_space("rung1_expand", survivors=[walk, own])
+    expanded = arm_space("rung1_expand", survivors=[walk])
     walk_p = {
         _kw(a.method_kw)["p_task"]
         for a in expanded
@@ -175,15 +182,57 @@ def test_rung1_expand_p_task_variants_and_own_success_order(rung0: list[Arm]) ->
         and a.score == "rnd"
     }
     assert walk_p == {0.2, 0.8}
-    own_orders = {
-        _kw(a.method_kw)["order"]
-        for a in expanded
-        if a.method == "own_success" and a.task == "maze"
+
+
+def test_final_expand_adds_inverted_and_dense_copies(rung0: list[Arm]) -> None:
+    survivor = _survivor(rung0, task="maze", method="walk", score="rnd")
+    expanded = arm_space("final_expand", survivors=[survivor])
+    inverted = [a for a in expanded if a.score == "inverted"]
+    assert [(a.task, a.method) for a in inverted] == [("maze", "walk")]
+    assert inverted[0].score_kwargs() == {"inner": "rnd", "inner_kw": {}}
+    dense = [a for a in expanded if a.task in DENSE_TASKS and a.method == "walk"]
+    assert {a.task for a in dense} == set(DENSE_TASKS)
+    assert {a.score for a in dense} == {"rnd"}
+    anchors = {(a.task, a.method) for a in expanded if a.method in {"uniform", "point"}}
+    assert anchors == {(t, m) for t in DENSE_TASKS for m in ("uniform", "point")}
+    assert len(expanded) == 1 + 3 + 6
+
+
+def test_final_expand_takes_rung1_arms_and_clears_task_kw_on_dense(
+    rung0: list[Arm],
+) -> None:
+    base = _survivor(rung0, task="maze", method="walk", score="rnd")
+    variant = Arm(**{**base.__dict__, "task_kw": (("lanes", 5),)})
+    p_variant = Arm(**{**base.__dict__, "method_kw": (("p_task", 0.2),)})
+    expanded = arm_space("final_expand", survivors=[variant, p_variant])
+    dense = {a.label() for a in expanded if a.task in DENSE_TASKS and a.method == "walk"}
+    assert dense == {
+        f"{t}/walk[p_task={p}]/rnd" for t in DENSE_TASKS for p in (0.5, 0.2)
     }
-    assert "frontier" in own_orders
-    assert not [
-        a for a in expanded if a.method == "own_success" and a.score == "inverted"
-    ]
+    inverted = {(a.task, a.task_kw) for a in expanded if a.score == "inverted"}
+    assert inverted == {("maze", (("lanes", 5),)), ("maze", ())}
+
+
+def test_final_expand_dedupes_dense_copies_across_tasks(rung0: list[Arm]) -> None:
+    a = _survivor(rung0, task="maze", method="walk", score="rnd")
+    b = _survivor(rung0, task="pendulum_sparse", method="walk", score="rnd")
+    expanded = arm_space("final_expand", survivors=[a, b])
+    assert len(expanded) == len(set(expanded))
+    dense_walk = [x for x in expanded if x.task in DENSE_TASKS and x.method == "walk"]
+    assert len(dense_walk) == len(DENSE_TASKS)
+    assert set(expanded) & {a, b} == set()
+
+
+def test_final_expand_rejects_dense_survivor(rung0: list[Arm]) -> None:
+    survivor = _survivor(rung0, task="maze", method="walk", score="rnd")
+    dense = Arm(**{**survivor.__dict__, "task": "pendulum_dense"})
+    with pytest.raises(ValueError, match="sparse task"):
+        arm_space("final_expand", survivors=[dense])
+
+
+def test_final_expand_adds_nothing_for_scoreless_controls(rung0: list[Arm]) -> None:
+    uniform = _survivor(rung0, task="maze", method="uniform", score=None)
+    assert arm_space("final_expand", survivors=[uniform]) == []
 
 
 def test_rung1_expand_task_variants(rung0: list[Arm]) -> None:
@@ -271,7 +320,7 @@ def test_inverted_wraps_the_survivors_score_kw(rung0: list[Arm]) -> None:
     survivor = _survivor(rung0, task="maze", method="walk", score="critic_value")
     inverted = [
         a
-        for a in arm_space("rung1_expand", survivors=[survivor])
+        for a in arm_space("final_expand", survivors=[survivor])
         if a.score == "inverted"
     ]
     assert [a.score_kwargs() for a in inverted] == [
@@ -296,9 +345,9 @@ def test_visited_survivor_adds_no_p_task_variants(rung0: list[Arm]) -> None:
         if a.method == "visited" and (a.task, a.task_kw) == ("maze", ())
     ]
     assert p_variants == []
-    # Beyond the maze variant (task_kw set), visited appears only on the dense tasks.
+    # Beyond the maze variant (task_kw set), rung 1 adds no visited arm.
     plain = {a.task for a in expanded if a.method == "visited" and not a.task_kw}
-    assert plain == set(DENSE_TASKS)
+    assert plain == set()
 
 
 def _survivor_where(rung0: list[Arm], method: str, *, p_task: float) -> Arm:
@@ -315,7 +364,9 @@ def test_critic_value_never_runs_on_dense_tasks(rung0: list[Arm]) -> None:
     # arm_dense and claw rewards are mostly negative, so V * (vmax - V) is meaningless there.
     survivors = [a for a in rung0 if a.task == "maze" and a.score == "critic_value"]
     assert survivors
-    expanded = arm_space("rung1_expand", survivors=survivors)
+    expanded = arm_space("final_expand", survivors=survivors)
     on_dense = [a for a in expanded if a.task in DENSE_TASKS]
     assert [a for a in on_dense if a.score in {"critic_value", "inverted"}] == []
     assert [a for a in on_dense if a.method == "walk"] == []
+    # inverted(critic_value) still runs on the sparse task itself.
+    assert {a.score for a in expanded if a.task == "maze"} == {"inverted"}

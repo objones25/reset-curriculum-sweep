@@ -4,6 +4,12 @@ Rules:
 - Ranked arms are the live arms that reached the ranking rung (the final rung by default; smoke
   mode ranks rung 0) and have ok results there. Only results at that rung count, so ranked arms
   in a group have equal step budgets.
+- Provisional fallback (final-review ruling C2c): with no explicit `rank_rung`, if no group at
+  the final rung has an equal-seed ranking (>= 2 common ok seeds) when the sweep stops, the
+  report ranks at the highest rung where some group has one, else at rung 0. It then says
+  "provisional: ranked at rung k, final rung not reached" in report.md, report.json
+  (`provisional`) and the W&B summary. At rung 0 (one seed per arm) arms are ordered by
+  `stats.rung0_key`, the scheduler's own rung-0 order; elsewhere by IQM AUC.
 - Equal seeds (spec section 6; controller ruling, fix round 1): a sweep stopped by the budget
   mid-rung leaves arms with different seed counts. Each group is ranked on its common seed
   count k = the fewest ok seeds among its ranked arms, using each arm's first k ok seeds in
@@ -50,7 +56,7 @@ from resetsweep.sweep.scheduler import (
     GroupKey,
     group_of,
 )
-from resetsweep.sweep.stats import bootstrap_ci, iqm, normalise
+from resetsweep.sweep.stats import bootstrap_ci, iqm, normalise, rung0_key
 from resetsweep.train import RunResult
 
 _log = logging.getLogger(__name__)
@@ -318,6 +324,28 @@ def _normalise_group(rows: list[dict[str, Any]], anchored: bool) -> bool:
     return True
 
 
+def _has_equal_seed_ranking(source: ReportSource, states: Sequence[ArmState], rung: int) -> bool:
+    """True if some group has >= MIN_COMMON_SEEDS common ok seeds among its ranked arms at `rung`."""
+    counts: dict[GroupKey, list[int]] = {}
+    for st in states:
+        if st.status in LIVE_STATUSES and st.rung >= rung:
+            n = len(_ok_aucs(source.rung_results(st.arm, rung)))
+            if n:
+                counts.setdefault(group_of(st.arm), []).append(n)
+    return any(min(ns) >= MIN_COMMON_SEEDS for ns in counts.values())
+
+
+def _fallback_rung(source: ReportSource, states: Sequence[ArmState], last: int) -> int:
+    for rung in range(last, 0, -1):
+        if _has_equal_seed_ranking(source, states, rung):
+            return rung
+    return 0
+
+
+def provisional_note(rung: int) -> str:
+    return f"provisional: ranked at rung {rung}, final rung not reached"
+
+
 def build_report(
     source: ReportSource,
     *,
@@ -327,10 +355,11 @@ def build_report(
     """The report as plain JSON-ready data (see the module docstring). `tick` is called once
     per arm and per group, so a caller can keep its budget heartbeat going."""
     last = len(source.rung_budgets) - 1
-    rung = last if rank_rung is None else rank_rung
+    states = source.states()
+    rung = _fallback_rung(source, states, last) if rank_rung is None else rank_rung
     if not 0 <= rung <= last:
         raise ValueError(f"rank_rung {rank_rung} out of range 0..{last}")
-    states = source.states()
+    provisional = provisional_note(rung) if rank_rung is None and rung < last else None
     ranked_results: dict[GroupKey, list[tuple[ArmState, list[RunResult]]]] = {}
     unranked: list[dict[str, Any]] = []
     not_started = 0
@@ -360,7 +389,12 @@ def build_report(
         tick()
         k = min(len(_ok_aucs(results)) for _, results in members)
         common[group] = k
-        by_group[group] = [_arm_row(st, results, rung, k) for st, results in members]
+        rows = [_arm_row(st, results, rung, k) for st, results in members]
+        if rung == 0:
+            keys = {st.arm.label(): rung0_key(_first_ok(results, k)) for st, results in members}
+            for r in rows:
+                r["rung0_order"] = keys[r["label"]]
+        by_group[group] = rows
 
     flagged = set(source.anchorless_groups())
     groups: list[dict[str, Any]] = []
@@ -371,7 +405,11 @@ def build_report(
         if not anchored:
             anchorless.append(group)
         scaled = _normalise_group(rows, anchored)
-        rows.sort(key=lambda r: (-r["iqm_auc"], r["label"]))
+        if rung == 0:
+            rows.sort(key=lambda r: r["label"])
+            rows.sort(key=lambda r: r.pop("rung0_order"), reverse=True)  # stable: label breaks ties
+        else:
+            rows.sort(key=lambda r: (-r["iqm_auc"], r["label"]))
         if scaled:
             for r in rows:
                 scores.setdefault(r["config"], []).append(r["normalised"])
@@ -400,6 +438,7 @@ def build_report(
         arms.append(_arm_table_row(source, st))
     return {
         "rank_rung": rung,
+        "provisional": provisional,
         "step_budget": source.rung_budgets[rung],
         "groups": groups,
         "overall": overall,
@@ -427,6 +466,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "",
         f"Ranked at rung {report['rank_rung']} ({report['step_budget']} env steps per run).",
     ]
+    if report.get("provisional"):
+        lines += ["", f"**{report['provisional']}**"]
     for key, value in report.get("extra", {}).items():
         lines.append(f"- {key}: {_fmt(value)}")
     lines += ["", "## Overall (IQM of per-task normalised AUC)", ""]
@@ -530,11 +571,13 @@ def write_report(
     _write_atomic(path_md, render_markdown(report))
     for name, (columns, rows) in _tables(report).items():
         sink.log_table(name, columns, rows)
-    sink.summary(
-        {
-            **report["extra"],
-            "ranked_groups": float(len(report["groups"])),
-            "unranked_arms": float(len(report["unranked"])),
-        }
-    )
+    summary: dict[str, float | str] = {
+        **report["extra"],
+        "ranked_groups": float(len(report["groups"])),
+        "unranked_arms": float(len(report["unranked"])),
+        "rank_rung": float(report["rank_rung"]),
+    }
+    if report["provisional"]:
+        summary["provisional"] = report["provisional"]
+    sink.summary(summary)
     return report

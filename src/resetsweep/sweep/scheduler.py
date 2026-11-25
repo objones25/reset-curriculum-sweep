@@ -61,6 +61,11 @@ Decisions (all binding rulings unless marked "ours"):
 - rung1_expand: promotion out of rung 0 calls ``arm_space("rung1_expand", survivors=winners)``
   (the quota winners; protected arms are not survivors) and adds every arm the scheduler does
   not already have at rung 1 with status `active`.
+- final_expand (spec 5.4, final-review ruling C2a): promotion into the final rung calls
+  ``arm_space("final_expand", survivors=winners)`` and adds every arm the scheduler does not
+  already have (inverted controls, dense-task copies and their anchors) directly at the final
+  rung with status `final`. A dense group therefore has no arm below the final rung; its
+  (group, final - 1) promotion closes empty once rung 0 is done, so `anchorless_groups` sees it.
 - Done: nothing running, no promotion ready and no job left. Equal compute (spec section 6)
   outranks the early stop of section 7.6: leader separation may only be checked once every
   live arm at a group's final rung has all its final-rung seeds. At that point the group has
@@ -692,12 +697,16 @@ class Scheduler:
             st.status = "final" if new_rung == self._last_rung else "promoted"
             self._register_id(i, new_rung)
         self._promoted_out.add((group, rung))
+        survivors = [self._states[i].arm for i in winners]
         if rung == 0:
-            survivors = [self._states[i].arm for i in winners]
             entry: Status = "final" if self._last_rung == 1 else "active"
             for arm in arm_space("rung1_expand", survivors=survivors):
                 if arm not in self._index:
                     self._add_arm(arm, rung=1, status=entry)
+        if new_rung == self._last_rung:
+            for arm in arm_space("final_expand", survivors=survivors):
+                if arm not in self._index:
+                    self._add_arm(arm, rung=new_rung, status="final")
 
     # --- persistence ---------------------------------------------------------------------------
 

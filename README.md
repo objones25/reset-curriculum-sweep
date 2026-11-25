@@ -11,7 +11,11 @@ A sweep of reset-curriculum methods for GPU MuJoCo PPO, run on one RunPod pod un
 - **Scheduling.** A UCB successive-rung scheduler (`src/resetsweep/sweep/scheduler.py`). Rung 0
   runs every arm once on a short step budget. Promising arms are promoted to rungs with 3x and 9x
   the steps, and arms that cannot win are pruned. Rung sizes are set from calibration
-  measurements and the remaining budget, not hard-coded.
+  measurements and the remaining budget, not hard-coded: the whole expected ladder (rung 0, the
+  promoted arms and their expansions, with 1, 3 and 5 seeds) is sized to cost 90% of what
+  calibration leaves. Task variants and other `p_task` values join at rung 1; `inverted(x)`
+  controls and the dense tasks run only for finalists. If the rung-0 budget would fall below
+  `SWEEP_MIN_R0_STEPS` (default 2,000,000 env steps) the sweep refuses to start.
 - **Budget.** Account-wide cap of $100 (`--cap` accepts at most 100), with a $5 margin.
 - **Output.** A final per-task and overall ranking (IQM with bootstrap intervals).
 
@@ -192,9 +196,10 @@ launcher as orphaned, with the same command.
 | 2 | No pod could be created, no data center fits, an earlier pod still exists, or a usage error |
 | 3 | Refused by the budget check |
 
-`sweep-run` (on the pod): 0 finished; 2 bad settings; 3 budget already spent, too small to size
-rung 0, or calibration produced no usable measurement; 4 state dir made by another mode or arm
-set, or scheduler state without its calibration. `scripts/pod_bootstrap.sh` exits 1 if it refuses
+`sweep-run` (on the pod): 0 finished; 2 bad settings; 3 budget already spent, or calibration
+produced no usable measurement; 4 state dir made by another mode or arm set, or scheduler state
+without its calibration; 5 the rung-0 budget would be below `SWEEP_MIN_R0_STEPS` (the log names
+the numbers and the knobs: fewer tasks, fewer arms, fewer seeds). `scripts/pod_bootstrap.sh` exits 1 if it refuses
 to start, 124 if a step hit the deadline, 137 if a step ignored TERM and was killed, otherwise
 the failing step's exit code.
 

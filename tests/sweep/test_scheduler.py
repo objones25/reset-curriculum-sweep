@@ -61,6 +61,8 @@ V00_A = _arm(TASK_A, "visited[p_task=0.0]/-")
 V02_A = _arm(TASK_A, "visited[p_task=0.2]/-")
 V05_A = _arm(TASK_A, "visited[p_task=0.5]/-")
 SMALL_A = [UNIFORM_A, POINT_A, V00_A, V02_A, V05_A]
+WALK_MAZE = _arm("maze", "walk[p_task=0.5]/rnd")
+MAZE_TRIO = [_arm("maze", "uniform/-"), _arm("maze", "point/-"), WALK_MAZE]
 
 
 def _arm_id(arm: Arm, step_budget: int) -> str:
@@ -188,19 +190,33 @@ def test_promotion_sets_statuses(tmp_path: Path) -> None:
     }
 
 
-def test_rung0_promotion_adds_rung1_expansion_arms(tmp_path: Path) -> None:
-    s = _finish_rung0_small(tmp_path)
-    expected = arm_space("rung1_expand", survivors=[V00_A])
+def _finish_rung0_two_groups(tmp_path: Path) -> Scheduler:
+    """SMALL_A plus uniform/point/walk on maze through rung 0. Rung 1 holds task A (uniform,
+    point, V00_A), maze (uniform, point, walk at p_task 0.5/0.2/0.8) and the maze[lanes=5]
+    variant group (uniform, point, walk), all with no results yet."""
+    s = _new(tmp_path, SMALL_A + MAZE_TRIO)
+    _step(s, 100, _by_label({V00_A.label(): 0.9, V02_A.label(): 0.2}))
+    s.promotions()
+    return s
 
-    added = [st for st in s.states() if st.arm not in SMALL_A]
+
+def test_rung0_promotion_adds_rung1_expansion_arms(tmp_path: Path) -> None:
+    s = _new(tmp_path, MAZE_TRIO)
+    _step(s, 100, _by_label({}))
+    s.promotions()
+    expected = arm_space("rung1_expand", survivors=[WALK_MAZE])
+
+    added = [st for st in s.states() if st.arm not in MAZE_TRIO]
 
     assert [st.arm for st in added] == expected
     assert {(st.rung, st.status, len(st.results)) for st in added} == {(1, "active", 0)}
 
 
 def test_expansion_arms_get_rung1_seeds(tmp_path: Path) -> None:
-    s = _finish_rung0_small(tmp_path)
-    expanded = set(arm_space("rung1_expand", survivors=[V00_A]))
+    s = _new(tmp_path, MAZE_TRIO)
+    _step(s, 100, _by_label({}))
+    expanded = set(arm_space("rung1_expand", survivors=[WALK_MAZE]))
+    assert expanded
 
     jobs = s.next_jobs(1000)
 
@@ -247,11 +263,13 @@ def test_ucb_prefers_uncertain_arm_with_close_mean(tmp_path: Path) -> None:
 
 
 def test_lone_result_uses_unit_spread(tmp_path: Path) -> None:
-    s = _finish_rung0_small(tmp_path)
+    s = _finish_rung0_two_groups(tmp_path)
+    # `dense` (named for its role before ruling C2a moved dense arms to the final rung): the
+    # only arm of its group with a result.
     (dense,) = [
         a
-        for a in arm_space("rung1_expand", survivors=[V00_A])
-        if a.label() == "pendulum_dense/visited[p_task=0.0]/-"
+        for a in arm_space("rung1_expand", survivors=[WALK_MAZE])
+        if a.label() == "maze[lanes=5]/walk[p_task=0.5]/rnd"
     ]
     jobs = {(j.arm, j.seed): j for j in s.next_jobs(1000)}
     # Failures leave one pending retry each for point and `dense`.
@@ -261,7 +279,7 @@ def test_lone_result_uses_unit_spread(tmp_path: Path) -> None:
     s.report(_result(jobs[(dense, 0)], 0.0, status="failed"))
     s.report(_result(jobs[(dense, 1)], 0.2))
     # point: task A means [0.3, 0.3] -> spread 0 -> UCB 0.3.
-    # dense: the only arm with a result on pendulum_dense -> sd 1.0 -> UCB 0.2 + 2.0 = 2.2.
+    # dense: the only arm with a result on maze[lanes=5] -> sd 1.0 -> UCB 0.2 + 2.0 = 2.2.
 
     assert s.next_jobs(1) == [Job(arm=dense, seed=1000, rung=1, step_budget=30)]
 
@@ -818,12 +836,12 @@ def test_save_load_round_trip_resubmits_running_jobs(tmp_path: Path) -> None:
 
 
 def test_load_resubmits_in_flight_jobs_before_new_ones(tmp_path: Path) -> None:
-    s = _finish_rung0_small(tmp_path)
+    s = _finish_rung0_two_groups(tmp_path)
     rung1 = s.next_jobs(1000)
     dense = [j for j in rung1 if j.arm.task != TASK_A]
     for job in [j for j in rung1 if j != dense[0]]:
         s.report(_result(job, 0.5))
-    s.promotions()  # task A moves to rung 2; the dense tasks wait for dense[0]
+    s.promotions()  # task A moves to rung 2; the maze groups wait for dense[0]
     (in_flight,) = s.next_jobs(1)
     s.report(_result(dense[0], 0.0, status="failed"))  # a rung-1 retry is now pending
 
@@ -834,12 +852,12 @@ def test_load_resubmits_in_flight_jobs_before_new_ones(tmp_path: Path) -> None:
 
 
 def test_resubmits_beyond_k_keep_priority(tmp_path: Path) -> None:
-    s = _finish_rung0_small(tmp_path)
+    s = _finish_rung0_two_groups(tmp_path)
     rung1 = s.next_jobs(1000)
     dense = [j for j in rung1 if j.arm.task != TASK_A]
     for job in [j for j in rung1 if j != dense[0]]:
         s.report(_result(job, 0.5))
-    s.promotions()  # task A moves to rung 2; the dense tasks wait for dense[0]
+    s.promotions()  # task A moves to rung 2; the maze groups wait for dense[0]
     in_flight = s.next_jobs(2)
     s.report(_result(dense[0], 0.0, status="failed"))  # a rung-1 retry is now pending
     loaded = Scheduler.load(tmp_path, arm_id_of=_arm_id)
@@ -943,7 +961,7 @@ def test_constructor_rejects_duplicate_arms(tmp_path: Path) -> None:
 
 
 def test_constructor_rejects_non_rung0_arm(tmp_path: Path) -> None:
-    dense = arm_space("rung1_expand", survivors=[V00_A])[0]
+    dense = arm_space("final_expand", survivors=[V00_A])[0]
 
     with pytest.raises(ValueError, match="rung-0 arm"):
         _new(tmp_path, [dense])
@@ -1158,3 +1176,56 @@ def test_bounds_are_none_at_rung0(tmp_path: Path) -> None:
     s = _new(tmp_path, SMALL_A)
 
     assert s.bounds(UNIFORM_A) is None
+
+
+# --- final-rung expansion (spec 5.4; final-review ruling C2a) ------------------------------------
+
+
+WALK_A = _arm(TASK_A, "walk[p_task=0.5]/rnd")
+
+
+def test_promotion_out_of_rung0_adds_no_dense_or_inverted_arms(tmp_path: Path) -> None:
+    s = _new(tmp_path, [UNIFORM_A, POINT_A, WALK_A])
+    _step(s, 100, _by_label({}))
+    s.promotions()
+
+    rung1 = {st.arm.label() for st in s.states() if st.rung == 1}
+    assert rung1 == {
+        f"{TASK_A}/uniform/-",
+        f"{TASK_A}/point/-",
+        f"{TASK_A}/walk[p_task=0.5]/rnd",
+        f"{TASK_A}/walk[p_task=0.2]/rnd",
+        f"{TASK_A}/walk[p_task=0.8]/rnd",
+    }
+
+
+def test_promotion_into_final_rung_adds_inverted_and_dense_copies(tmp_path: Path) -> None:
+    s = _new(tmp_path, [UNIFORM_A, POINT_A, WALK_A])
+    _step(s, 100, _by_label({}))
+    # Rung 1: 3 seeds each; walk p_task=0.5 is best, so it is the quota winner
+    # (ceil(3 non-protected / 3) = 1).
+    _step(s, 100, _by_label({WALK_A.label(): 0.9}))
+    s.promotions()
+
+    final = {st.arm for st in s.states() if st.rung == 2 and st.status == "final"}
+    expected_new = set(arm_space("final_expand", survivors=[WALK_A]))
+    assert len(expected_new) == 1 + 3 + 6  # inverted, 3 dense copies, 6 dense anchors
+    assert final == {UNIFORM_A, POINT_A, WALK_A} | expected_new
+    jobs = s.next_jobs(1000)
+    assert {j.step_budget for j in jobs} == {90}
+    assert Counter(j.arm for j in jobs) == {a: 5 for a in final}
+    _ = [s.report(_result(j, 0.5)) for j in jobs]
+    assert s.anchorless_groups() == []
+    assert s.done()
+
+
+def test_final_expansion_survives_save_and_load(tmp_path: Path) -> None:
+    s = _new(tmp_path, [UNIFORM_A, POINT_A, WALK_A])
+    _step(s, 100, _by_label({}))
+    _step(s, 100, _by_label({WALK_A.label(): 0.9}))
+    s.promotions()
+    before = {(st.arm, st.rung, st.status) for st in s.states()}
+
+    loaded = Scheduler.load(tmp_path, arm_id_of=_arm_id)
+
+    assert {(st.arm, st.rung, st.status) for st in loaded.states()} == before

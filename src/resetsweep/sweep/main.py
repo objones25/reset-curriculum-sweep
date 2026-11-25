@@ -8,14 +8,21 @@ Steps:
 2. Calibrate (`calibration.calibrate`), or reuse `state_dir/calibration.json`. Once a scheduler
    exists in the state dir, calibration is never re-run: the plan, and so every arm id, must
    stay what the saved sweep used.
-3. Size the rungs (`size_rungs`): rung 0 runs every rung-0 arm once on about 35% of the
-   remaining budget; r1 = 3 r0, r2 = 9 r0. On resume the saved budgets are used.
+3. Size the rungs (`size_rungs`, final-review ruling C2b): `ladder.project_ladder` gives the
+   expected arm count per family at each rung from the real arm space (quota ceil(n / eta) per
+   group plus the expected rung-1 and final-rung expansions); a rung-k arm costs
+   seeds_k x budget_k = 1, 9, 45 rung-0 runs. r0 is chosen so the whole expected ladder costs
+   `LADDER_SHARE` (90%) of what calibration left, at the calibrated steps/s and worker count;
+   r1 = 3 r0, r2 = 9 r0. The projected USD per rung and r0 are logged. If r0 would fall below
+   `SWEEP_MIN_R0_STEPS` (default 2,000,000) the sweep refuses to start (exit 5) and logs the
+   numbers and the knobs: a paid run must not produce noise. Smoke mode projects rung 0 only.
+   On resume the saved budgets are used.
 4. Loop (`SweepLoop`): poll results -> report -> kill jobs whose arm is no longer live ->
    heartbeat -> stop checks -> `next_jobs(1)` -> `can_start` -> submit, until the scheduler is
    done or the guard refuses a job; then wait for the jobs in flight.
 5. Write the report (`report.write_report`) and log it to a sweep-level W&B run.
-6. Return 0. Bad settings return 2; a new sweep whose budget is already spent, a budget too
-   small to size rung 0, or calibration with no usable measurement returns 3; a state dir made
+6. Return 0. Bad settings return 2; a new sweep whose budget is already spent, or calibration
+   with no usable measurement, returns 3; r0 below `SWEEP_MIN_R0_STEPS` returns 5; a state dir made
    by another mode or arm set (`sweep_meta.json`), or a scheduler state without its
    calibration.json, returns 4.
 
@@ -48,12 +55,14 @@ Budget handling (spec section 8):
 
 Tunable sizes for tests and CPU smoke runs (not needed on the pod): `SWEEP_NUM_ENVS_GRID`,
 `SWEEP_WORKERS_GRID`, `SWEEP_ROLLOUT_LEN`, `SWEEP_CALIB_STEPS`, `SWEEP_THROUGHPUT_ITERS`,
-`SWEEP_EVAL_N`, and `SWEEP_R0_STEPS` (overrides the rung-0 sizing).
+`SWEEP_EVAL_N`, `SWEEP_R0_STEPS` (overrides the rung sizing; the projected cost is still
+logged) and `SWEEP_MIN_R0_STEPS` (the refusal floor above).
 """
 
 import argparse
 import dataclasses
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -61,7 +70,7 @@ import os
 import statistics
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -93,6 +102,7 @@ from resetsweep.sweep.calibration import (
     family_of,
     sparse_families,
 )
+from resetsweep.sweep.ladder import project_ladder
 from resetsweep.sweep.pool import (
     Pool,
     PoolFactory,
@@ -125,7 +135,9 @@ _log = logging.getLogger(__name__)
 
 STATE_DIR_DEFAULT: Final = "/workspace/sweep"
 PROJECT_DEFAULT: Final = "reset-curriculum-sweep"
-RUNG0_SHARE: Final = 0.35
+LADDER_SHARE: Final = 0.9  # the expected ladder may use 90% of what calibration left
+MIN_R0_STEPS_DEFAULT: Final = 2_000_000
+SEEDS_PER_RUNG: Final = (1, 3, 5)
 ETA: Final = 3
 EVALS_PER_RUN: Final = 20  # eval points per run: the AUC's resolution
 POLL_S: Final = 5.0
@@ -145,7 +157,7 @@ class SettingsError(ValueError):
 
 
 class BudgetTooSmallError(RuntimeError):
-    """The remaining budget cannot pay for rung 0."""
+    """The remaining budget cannot pay for the ladder at the minimum r0."""
 
 
 # --- settings ----------------------------------------------------------------------------------
@@ -166,6 +178,7 @@ class Settings:
     throughput_iters: int
     eval_n: int
     r0_steps: int | None
+    min_r0_steps: int
 
 
 def _positive_float(env: Mapping[str, str], name: str) -> float:
@@ -232,41 +245,118 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         throughput_iters=required_int("SWEEP_THROUGHPUT_ITERS", THROUGHPUT_ITERS),
         eval_n=required_int("SWEEP_EVAL_N", 512),
         r0_steps=_positive_int(environ, "SWEEP_R0_STEPS", None),
+        min_r0_steps=required_int("SWEEP_MIN_R0_STEPS", MIN_R0_STEPS_DEFAULT),
     )
 
 
 # --- rung sizing -------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RungSizing:
+    """The rung step budgets and the projected USD each rung costs (expected arm counts)."""
+
+    rungs: tuple[int, int, int]
+    cost_usd: tuple[float, ...]
+
+
+_Line = tuple[float, float]  # pod-seconds = slope * r0 + intercept
+
+
+def _rung_lines(
+    counts: Mapping[str, float], plan: Plan, seeds: int, mult: int
+) -> tuple[_Line, _Line]:
+    """Two lower bounds on one rung's pod time, as lines in r0. Full pool: a job holds
+    1/n_workers of the pod, so its pod time is ``mult * r0 / steps_per_s_f + overhead_f /
+    n_workers`` (steps_per_s_f is the aggregate over n_workers). Not-full pool (fewer jobs than
+    workers, e.g. smoke): the pod bills at least one whole job wall,
+    ``mult * r0 / (steps_per_s_f / n_workers) + overhead_f``, for the slowest family."""
+    fams = {f: plan.for_family(f) for f, n in counts.items() if n > 0}
+    share = (
+        sum(counts[f] * seeds * mult / fp.steps_per_s for f, fp in fams.items()),
+        sum(counts[f] * seeds * fp.overhead_s for f, fp in fams.items()) / plan.n_workers,
+    )
+    wall = max(
+        ((mult * plan.n_workers / fp.steps_per_s, fp.overhead_s) for fp in fams.values()),
+        default=(0.0, 0.0),
+    )
+    return share, wall
+
+
+def _ladder_lines(
+    arms_per_rung: Sequence[Mapping[str, float]], plan: Plan, seeds: Sequence[int]
+) -> list[tuple[_Line, _Line]]:
+    return [
+        _rung_lines(counts, plan, seeds[k], ETA**k) for k, counts in enumerate(arms_per_rung)
+    ]
+
+
+def _rung_cost_usd(lines: list[tuple[_Line, _Line]], r0: int, usd_per_s: float) -> tuple[float, ...]:
+    return tuple(max(a * r0 + b for a, b in pair) * usd_per_s for pair in lines)
+
+
+def _max_r0(lines: list[tuple[_Line, _Line]], budget_s: float) -> int:
+    """Largest r0 with sum over rungs of max(line_1, line_2) <= budget_s. The sum of maxima is
+    the maximum over every choice of one line per rung, so it is <= budget_s exactly when each
+    choice is: r0 = min over choices of (budget_s - sum intercepts) / sum slopes."""
+    best = math.inf
+    for choice in itertools.product(*lines):
+        slope = sum(a for a, _ in choice)
+        free = budget_s - sum(b for _, b in choice)
+        if free <= 0:
+            return 0
+        best = min(best, free / slope)
+    return math.floor(best)
+
+
 def size_rungs(
     *,
-    arms_per_family: Mapping[str, int],
+    arms_per_rung: Sequence[Mapping[str, float]],
     plan: Plan,
     remaining_usd: float,
     usd_per_s: float,
-    share: float = RUNG0_SHARE,
-) -> tuple[int, int, int]:
-    """(r0, 3 r0, 9 r0) with rung 0 (every arm once) costing `share` of `remaining_usd`.
+    min_r0_steps: int,
+    seeds_per_rung: Sequence[int] = SEEDS_PER_RUNG,
+    share: float = LADDER_SHARE,
+) -> RungSizing:
+    """(r0, 3 r0, 9 r0) with the whole expected ladder costing `share` of `remaining_usd`.
 
-    Pod time of rung 0 = sum over arms of ``r0 / steps_per_s_f + overhead_f / n_workers``
-    (steps_per_s_f is the aggregate over n_workers, so each job holds 1/n of the pod).
+    `arms_per_rung[k]` maps family -> expected arms at rung k (`ladder.project_ladder`); a
+    rung-k arm costs ``seeds_per_rung[k] * ETA**k`` r0-runs (1, 9, 45). A rung's pod time is
+    the larger of its full-pool share and one whole job wall (`_rung_lines`). Raises
+    `BudgetTooSmallError` when r0 would be below `min_r0_steps` or one rollout: a paid run must
+    not produce noise.
     """
     if not (0 < share <= 1) or not (math.isfinite(usd_per_s) and usd_per_s > 0):
         raise ValueError(f"bad share {share} or usd_per_s {usd_per_s}")
-    if not arms_per_family or any(n < 1 for n in arms_per_family.values()):
-        raise ValueError(f"arms_per_family must be non-empty and positive: {arms_per_family}")
+    if not arms_per_rung or len(arms_per_rung) > len(seeds_per_rung):
+        raise ValueError(f"need 1..{len(seeds_per_rung)} rungs of arm counts, got {len(arms_per_rung)}")
+    if not arms_per_rung[0] or any(n < 0 for c in arms_per_rung for n in c.values()):
+        raise ValueError(f"arm counts must be non-negative with a non-empty rung 0: {arms_per_rung}")
     budget_s = share * remaining_usd / usd_per_s
-    fams = {f: plan.for_family(f) for f in arms_per_family}
-    overhead_s = sum(n * fams[f].overhead_s for f, n in arms_per_family.items()) / plan.n_workers
-    s_per_step = sum(n / fams[f].steps_per_s for f, n in arms_per_family.items())
-    r0 = math.floor((budget_s - overhead_s) / s_per_step) if budget_s > overhead_s else 0
-    min_r0 = max(fp.num_envs * fp.rollout_len for fp in fams.values())
-    if r0 < min_r0:
+    lines = _ladder_lines(arms_per_rung, plan, seeds_per_rung)
+    r0 = _max_r0(lines, budget_s)
+    rollout = max(plan.for_family(f).num_envs * plan.for_family(f).rollout_len for f in arms_per_rung[0])
+    floor_steps = max(min_r0_steps, rollout)
+    if r0 < floor_steps:
+        totals = ", ".join(f"{sum(c.values()):.0f}" for c in arms_per_rung)
+        overhead_s = sum(max(b for _, b in pair) for pair in lines)
         raise BudgetTooSmallError(
-            f"rung 0 would get {r0} steps per run, below one rollout ({min_r0}); "
-            f"{remaining_usd:.2f} USD remain, rung 0 may use {share:.0%} of it"
+            f"r0 would be {r0} env steps per rung-0 run, below the minimum {floor_steps} "
+            f"(SWEEP_MIN_R0_STEPS={min_r0_steps}, one rollout={rollout}): {remaining_usd:.2f} USD "
+            f"remain, the ladder may use {share:.0%} of it = {budget_s:.0f} pod-s, of which "
+            f"{overhead_s:.0f} s is job overhead; expected arms per rung {totals} at seeds "
+            f"{tuple(seeds_per_rung[: len(arms_per_rung)])}. Knobs: fewer tasks, fewer arms, fewer "
+            "seeds, a higher cap, or a lower SWEEP_MIN_R0_STEPS"
         )
-    return r0, ETA * r0, ETA * ETA * r0
+    return RungSizing(rungs=(r0, ETA * r0, ETA * ETA * r0), cost_usd=_rung_cost_usd(lines, r0, usd_per_s))
+
+
+def ladder_cost_usd(
+    arms_per_rung: Sequence[Mapping[str, float]], plan: Plan, r0: int, usd_per_s: float
+) -> tuple[float, ...]:
+    """Projected USD per rung for a given r0 (used to log an `SWEEP_R0_STEPS` override)."""
+    return _rung_cost_usd(_ladder_lines(arms_per_rung, plan, SEEDS_PER_RUNG), r0, usd_per_s)
 
 
 # --- the loop ----------------------------------------------------------------------------------
@@ -607,6 +697,56 @@ def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
     return None
 
 
+def _family_counts(arms: list[Arm], *, smoke: bool) -> list[dict[str, float]]:
+    """Expected arms per family at each rung the sweep will run (smoke runs rung 0 only)."""
+    ladder = project_ladder(arms, eta=ETA, n_rungs=1 if smoke else len(SEEDS_PER_RUNG))
+    out: list[dict[str, float]] = []
+    for counts in ladder.per_rung:
+        fams: dict[str, float] = {}
+        for task, n in counts.items():
+            fams[family_of(task)] = fams.get(family_of(task), 0.0) + n
+        out.append(fams)
+    return out
+
+
+def _plan_rungs(
+    settings: Settings, arms: list[Arm], plan: Plan, guard: BudgetGuard
+) -> tuple[int, int, int] | None:
+    """Rung budgets for a new sweep, logged with the projected cost per rung; None (after
+    logging the numbers and the knobs) when r0 would fall below the minimum."""
+    counts = _family_counts(arms, smoke=settings.smoke)
+    remaining = guard.remaining()
+    if settings.r0_steps is not None:
+        r0 = settings.r0_steps
+        rungs = (r0, ETA * r0, ETA * ETA * r0)
+        cost = ladder_cost_usd(counts, plan, r0, guard.usd_per_s)
+        source = "SWEEP_R0_STEPS"
+    else:
+        try:
+            sizing = size_rungs(
+                arms_per_rung=counts,
+                plan=plan,
+                remaining_usd=remaining,
+                usd_per_s=guard.usd_per_s,
+                min_r0_steps=settings.min_r0_steps,
+            )
+        except BudgetTooSmallError as e:
+            _log.error("refusing to start: %s", e)  # obs: allow LOG006 (numbers and knobs; no traceback)
+            return None
+        rungs, cost, source = sizing.rungs, sizing.cost_usd, f"{LADDER_SHARE:.0%} of remaining"
+    _log.info(
+        "ladder: r0=%d (%s); expected arms per rung %s; projected USD per rung %s, total %.2f "
+        "of %.2f remaining",
+        rungs[0],
+        source,
+        ", ".join(f"{sum(c.values()):.1f}" for c in counts),
+        ", ".join(f"{c:.2f}" for c in cost),
+        sum(cost),
+        remaining,
+    )
+    return rungs
+
+
 def _sweep(
     settings: Settings,
     *,
@@ -734,20 +874,9 @@ def _run_sweep(
         scheduler = Scheduler.load(state, arm_id_of=arm_id_of)
         _log.info("resumed scheduler with rung budgets %s", scheduler.rung_budgets)
     else:
-        try:
-            if settings.r0_steps is not None:
-                r0 = settings.r0_steps
-                rungs = (r0, ETA * r0, ETA * ETA * r0)
-            else:
-                rungs = size_rungs(
-                    arms_per_family=arms_per_family,
-                    plan=plan,
-                    remaining_usd=guard.remaining(),
-                    usd_per_s=guard.usd_per_s,
-                )
-        except BudgetTooSmallError:
-            _log.exception("budget too small for rung 0")
-            return 3
+        rungs = _plan_rungs(settings, arms, plan, guard)
+        if rungs is None:
+            return 5
         scheduler = Scheduler(arms=arms, rung_budgets=rungs, state_dir=state, arm_id_of=arm_id_of)
         _log.info("new scheduler: %d arms, rung budgets %s", len(arms), rungs)
 

@@ -5,6 +5,7 @@ tests/sweep/test_scheduler.py does. Every seed of an arm gets the same AUC, so e
 that AUC and the normalised values below are hand-computed.
 """
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -366,3 +367,50 @@ def test_build_report_calls_tick_for_each_group(tmp_path: Path) -> None:
     report = build_report(_finished(tmp_path), tick=lambda: ticks.append(1))
 
     assert len(ticks) >= len(report["groups"]) > 0
+
+
+# --- provisional fallback (final-review ruling C2c) ----------------------------------------------
+
+PROVISIONAL_1 = "provisional: ranked at rung 1, final rung not reached"
+
+
+def test_report_falls_back_to_highest_rung_with_two_common_seeds(tmp_path: Path) -> None:
+    s, final = _to_final_rung(tmp_path)  # rung 1 done (3 seeds each); no final result yet
+    assert final
+    sink = RecordingSink()
+
+    report = write_report(s, tmp_path / "report.md", tmp_path / "report.json", sink)
+
+    assert report["rank_rung"] == 1
+    assert report["provisional"] == PROVISIONAL_1
+    assert {g["common_seeds"] for g in report["groups"]} == {3}
+    assert PROVISIONAL_1 in (tmp_path / "report.md").read_text()
+    assert json.loads((tmp_path / "report.json").read_text())["provisional"] == PROVISIONAL_1
+    assert sink.summaries[-1]["provisional"] == PROVISIONAL_1
+
+
+def test_report_falls_back_to_rung0_ranked_by_rung0_key(tmp_path: Path) -> None:
+    # Every rung-0 AUC ties at 0; only visited[0.2] reached any reward, so rung0_key puts it
+    # first. The scheduler has not run rung 1 at all.
+    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    v02 = _arm(TASK_A, "visited[p_task=0.2]/-")
+    for job in s.next_jobs(1000):
+        result = _result(job, 0.0)
+        if job.arm == v02:
+            result = dataclasses.replace(result, reached_reward=True, steps_to_first_reward=5)
+        s.report(result)
+
+    report = _write(tmp_path, s)
+
+    assert report["rank_rung"] == 0
+    assert report["provisional"] == "provisional: ranked at rung 0, final rung not reached"
+    group_a = next(g for g in report["groups"] if g["task"] == TASK_A)
+    assert group_a["arms"][0]["label"] == v02.label()
+
+
+def test_report_on_finished_sweep_is_not_provisional(tmp_path: Path) -> None:
+    report = _write(tmp_path, _finished(tmp_path))
+
+    assert report["rank_rung"] == 2
+    assert report["provisional"] is None
+    assert "provisional" not in (tmp_path / "report.md").read_text()

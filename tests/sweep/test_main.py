@@ -48,6 +48,8 @@ def _env(tmp_path: Path, **kw: str) -> dict[str, str]:
         "SWEEP_CALIB_STEPS": "4000",
         "SWEEP_THROUGHPUT_ITERS": "2",
         "SWEEP_EVAL_N": "16",
+        # The fake world's runs are tiny; the 2M default (a paid-run guard) would refuse them.
+        "SWEEP_MIN_R0_STEPS": "512",
     }
     return {**env, **kw}
 
@@ -175,18 +177,69 @@ PLAN = Plan(
 )
 
 
-def test_size_rungs_puts_rung0_at_35_percent_of_remaining() -> None:
-    # budget 0.35 * 10 / 0.01 = 350 s; overhead (10 * 4 + 5 * 4) / 2 = 30 s;
-    # pod-s per step: 10 / 1000 + 5 / 500 = 0.02 -> r0 = 320 / 0.02 = 16,000
-    rungs = size_rungs(arms_per_family={"a": 10, "b": 5}, plan=PLAN, remaining_usd=10.0, usd_per_s=0.01)
-
-    assert rungs == (16_000, 48_000, 144_000)
+COUNTS = ({"a": 10.0, "b": 5.0}, {"a": 4.0, "b": 2.0}, {"a": 2.0, "b": 1.0})
 
 
-def test_size_rungs_raises_when_budget_cannot_cover_one_rollout() -> None:
-    # 0.35 * 0.5 / 0.01 = 17.5 s < 30 s of overhead alone
-    with pytest.raises(BudgetTooSmallError, match="rung 0"):
-        size_rungs(arms_per_family={"a": 10, "b": 5}, plan=PLAN, remaining_usd=0.5, usd_per_s=0.01)
+def test_size_rungs_fits_the_whole_ladder_in_90_percent_of_remaining() -> None:
+    # Per-arm cost in r0 units: seeds x budget = 1x1, 3x3, 5x9 = 1, 9, 45.
+    # Pod-s per r0 step: rung 0 10/1000 + 5/500 = 0.02; rung 1 9 * (4/1000 + 2/500) = 0.072;
+    #   rung 2 45 * (2/1000 + 1/500) = 0.18; total 0.272.
+    # Overhead (4 s per job over 2 workers): rung 0 15 * 1 * 2 = 30; rung 1 6 * 3 * 2 = 36;
+    #   rung 2 3 * 5 * 2 = 30; total 96 s.
+    # Budget 0.9 * 10 USD / 0.01 USD/s = 900 s -> r0 = floor((900 - 96) / 0.272) = 2955.
+    sizing = size_rungs(
+        arms_per_rung=COUNTS, plan=PLAN, remaining_usd=10.0, usd_per_s=0.01, min_r0_steps=1000
+    )
+
+    assert sizing.rungs == (2955, 8865, 26595)
+    # USD per rung: (2955 * 0.02 + 30) * 0.01, (2955 * 0.072 + 36) * 0.01, (2955 * 0.18 + 30) * 0.01
+    assert sizing.cost_usd == pytest.approx((0.891, 2.48760, 5.619))
+    assert sum(sizing.cost_usd) <= 0.9 * 10.0
+
+
+def test_size_rungs_charges_a_full_job_wall_when_the_pool_is_not_full() -> None:
+    # One arm on 2 workers: the pod bills the whole job wall, r0 / (1000 / 2) + 4 s, not the
+    # 1/n_workers share (r0 / 1000 + 2 s). 900 s budget -> r0 = floor((900 - 4) / 0.002).
+    sizing = size_rungs(
+        arms_per_rung=({"a": 1.0},), plan=PLAN, remaining_usd=10.0, usd_per_s=0.01, min_r0_steps=1
+    )
+
+    assert sizing.rungs[0] == 448_000
+    assert sizing.cost_usd == pytest.approx(((448_000 * 0.002 + 4) * 0.01,))
+
+
+def test_size_rungs_refuses_r0_below_the_minimum() -> None:
+    with pytest.raises(BudgetTooSmallError) as info:
+        size_rungs(
+            arms_per_rung=COUNTS, plan=PLAN, remaining_usd=10.0, usd_per_s=0.01, min_r0_steps=3000
+        )
+    message = str(info.value)
+    for needle in ("2955", "3000", "SWEEP_MIN_R0_STEPS", "fewer tasks", "fewer arms", "fewer seeds"):
+        assert needle in message
+
+
+def test_size_rungs_raises_when_overhead_alone_exceeds_the_budget() -> None:
+    # 0.9 * 0.5 / 0.01 = 45 s < 96 s of overhead alone
+    with pytest.raises(BudgetTooSmallError, match="r0"):
+        size_rungs(
+            arms_per_rung=COUNTS, plan=PLAN, remaining_usd=0.5, usd_per_s=0.01, min_r0_steps=1
+        )
+
+
+def test_settings_min_r0_default_and_override(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    del env["SWEEP_MIN_R0_STEPS"]
+    assert load_settings(env).min_r0_steps == 2_000_000
+    assert load_settings(_env(tmp_path, SWEEP_MIN_R0_STEPS="512")).min_r0_steps == 512
+
+
+def test_main_returns_5_when_r0_would_be_below_the_minimum(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    env = _env(tmp_path, SWEEP_SMOKE="1", SWEEP_MIN_R0_STEPS="1000000000000")
+
+    assert _run(env, clock, pool_factory) == 5
+    assert not (tmp_path / "sweep" / "scheduler.json").exists()
 
 
 # --- the main loop -----------------------------------------------------------------------------
