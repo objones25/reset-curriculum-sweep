@@ -490,9 +490,22 @@ class _Parts:
     evaluator: Evaluator
 
 
+# Score seeds are derived apart from spec.seed, which already seeds the env/method generator
+# and torch's global RNG: equal seeds give equal streams, which would tie the `random`
+# control's per-IC values to the method's own first draws. Affine map, so distinct run
+# seeds keep distinct score seeds; it never equals spec.seed for any seed >= 0.
+_SCORE_SEED_MULTIPLIER = 1_000_003
+_SCORE_SEED_OFFSET = 17
+
+
+def _score_seed(run_seed: int) -> int:
+    return run_seed * _SCORE_SEED_MULTIPLIER + _SCORE_SEED_OFFSET
+
+
 def _seeded_score_kw(name: str, kw: Mapping[str, Any], seed: int) -> dict[str, Any]:
-    """`kw` plus `seed=seed` when score `name` takes a `seed` keyword and `kw` sets none,
-    applied recursively to an `inner` score's `inner_kw` (`inverted` wrapping `random`).
+    """`kw` plus `seed=seed` (already derived by `_score_seed`) when score `name` takes a
+    `seed` keyword and `kw` sets none, applied recursively with the same seed to an
+    `inner` score's `inner_kw` (`inverted` wrapping `random`).
     The seed is injected here, not stored in `score_kw`, so the arm id stays seed-free."""
     params = inspect.signature(SCORES.get(name)).parameters
     out = dict(kw)
@@ -506,15 +519,15 @@ def _seeded_score_kw(name: str, kw: Mapping[str, Any], seed: int) -> dict[str, A
 
 
 def build_score(spec: RunSpec, task: Task) -> Score | None:
-    """The arm's score with the method's IC capacity, seeded from `spec.seed` when it
-    draws random values; None for scoreless arms."""
+    """The arm's score with the method's IC capacity, seeded with `_score_seed(spec.seed)`
+    (inner scores too) when it draws random values; None for scoreless arms."""
     if spec.score is None:
         return None
     method_kw = {k: v for k, v in spec.method_kw.items() if k != "p_task"}
     capacity = score_capacity(
         spec.method, task=task, num_envs=spec.num_envs, method_kw=method_kw
     )
-    kw = _seeded_score_kw(spec.score, spec.score_kw, spec.seed)
+    kw = _seeded_score_kw(spec.score, spec.score_kw, _score_seed(spec.seed))
     return SCORES.construct(spec.score, capacity=capacity, device=spec.device, **kw)  # pyright: ignore[reportReturnType] # registry returns object
 
 

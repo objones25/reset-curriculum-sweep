@@ -10,6 +10,7 @@ from torch import Tensor
 from resetsweep import train
 from resetsweep.methods._population import population_size
 from resetsweep.methods.own_success import table_capacity
+from resetsweep.methods.uniform import Uniform
 from resetsweep.ppo.networks import ActorCritic
 from resetsweep.ppo.normalizer import RunningNorm
 from resetsweep.ppo.update import PPOConfig
@@ -241,6 +242,15 @@ def test_inverted_random_score_is_seeded_from_the_run_seed() -> None:
 
     assert not torch.equal(draws(0), draws(1))
     torch.testing.assert_close(draws(2), draws(2), rtol=0, atol=0)
+
+
+def test_score_seed_differs_from_env_generator_seed() -> None:
+    # The env/method generator and torch.manual_seed use spec.seed itself; the random
+    # score's draws must not repeat that stream.
+    lp = _random_draws(seed=0)
+    env_stream = torch.rand(lp.numel(), generator=torch.Generator().manual_seed(0))
+
+    assert not torch.equal(lp, env_stream)
 
 
 def test_seeding_does_not_change_arm_id() -> None:
@@ -496,17 +506,20 @@ def test_run_records_first_reward_step_on_dense_task() -> None:
     assert 0 < first <= result.env_steps_train
 
 
-def test_run_namespaces_method_update_stats_apart_from_diagnostics() -> None:
+def test_run_logs_update_stats_and_diagnostics_that_share_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # uniform's diagnostics report buffer_size 0.0; make its update report 7.0 under the
+    # same key. Both must reach the sink, neither overwriting the other.
+    monkeypatch.setattr(Uniform, "update", lambda self, it, stats: {"buffer_size": 7.0})
     torch.manual_seed(0)
     sink = _Recorder()
 
-    run(_spec(method="walk", method_kw={"R": 2}, score="random"), sink)
+    run(_spec(), sink)
 
-    keys = sink.logged_keys()
-    assert "method/buffer_size" in keys  # diagnostics keep the method/ prefix
-    assert not any(
-        k.startswith("method_update/") for k in keys
-    )  # walk.update returns {}
+    last = sink.logs[-1][1]
+    assert last["method/buffer_size"] == pytest.approx(0.0, abs=0)
+    assert last["method_update/buffer_size"] == pytest.approx(7.0, abs=0)
 
 
 def test_run_propagates_exceptions() -> None:
