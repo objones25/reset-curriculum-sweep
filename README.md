@@ -23,14 +23,12 @@ Requires Python 3.12 (`requires-python = ">=3.12,<3.13"`) and [uv](https://docs.
 uv sync
 ```
 
-Create a `.env` file in the repo root with these two keys. Names only; get the values from
-RunPod and Weights & Biases. `.env` is git-ignored. The launcher reads it and never prints a
-value.
+Create a `.env` file in the repo root that sets these two keys, written as `NAME=value` lines:
 
-```text
-RUNPOD_API_KEY=
-WANDB_API_KEY=
-```
+- `RUNPOD_API_KEY`, from the RunPod console
+- `WANDB_API_KEY`, from Weights & Biases
+
+`.env` is git-ignored. The launcher reads it and never prints a value.
 
 ## Tests
 
