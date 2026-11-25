@@ -86,6 +86,18 @@ class Method(Protocol):
 
     def diagnostics(self) -> dict[str, float]: ...
 
+    def ic_states(self) -> StartStates | None:
+        """The IC table, or None for a method without stable IC ids.
+
+        When not None it has exactly `capacity` rows (the score's capacity) and row `i` is the
+        start state of IC `i`, so `reset` only returns ic ids `-1` or in `[0, capacity)`. Rows
+        of ICs not yet filled hold zeros: they are placeholders, never drawn and never valid
+        states. train.py builds `RolloutStats.start_obs` and `start_features` from this table
+        (via `task.observe` / `task.state_features`) so both stay aligned by IC id. The table
+        is a copy; it changes whenever an IC is replaced, so rebuild it once per update.
+        """
+        ...
+
 
 class MethodBase:
     """Defaults for methods with no visited-state intake, no learning and no pool."""
@@ -109,6 +121,9 @@ class MethodBase:
     def update(self, it: int, stats: RolloutStats) -> dict[str, float]:
         del it, stats
         return {}
+
+    def ic_states(self) -> StartStates | None:
+        return None
 
     def diagnostics(self) -> dict[str, float]:
         return {

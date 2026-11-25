@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from resetsweep.methods.base import P_TASK_DEFAULT, MethodContext
+from resetsweep.scores.base import Score
 from resetsweep.sim.rollouts import Rollouts
 from resetsweep.tasks.base import TASKS, Task
 from resetsweep.types import StepCounter
@@ -25,6 +26,7 @@ def make_ctx(pendulum: Task) -> Callable[..., MethodContext]:
         task: Task | None = None,
         p_task: float = P_TASK_DEFAULT,
         num_envs: int = NUM_ENVS,
+        score: Score | None = None,
     ) -> MethodContext:
         task = task or pendulum
         gen = torch.Generator().manual_seed(0)
@@ -35,7 +37,7 @@ def make_ctx(pendulum: Task) -> Callable[..., MethodContext]:
             num_envs=num_envs,
             device="cpu",
             gen=gen,
-            score=None,
+            score=score,
             rollouts=rollouts,
             counter=counter,
             p_task=p_task,

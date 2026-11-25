@@ -1,6 +1,6 @@
 """Reset methods. Importing the package registers every method."""
 
-from resetsweep.methods import point, uniform, visited
+from resetsweep.methods import buffer_scored, point, uniform, visited, visited_count
 from resetsweep.methods.base import (
     METHODS,
     P_TASK_DEFAULT,
@@ -18,8 +18,10 @@ __all__ = [
     "Method",
     "MethodBase",
     "MethodContext",
+    "buffer_scored",
     "mix_task_start",
     "point",
     "uniform",
     "visited",
+    "visited_count",
 ]

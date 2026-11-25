@@ -11,8 +11,9 @@ class Registry:
         self._kind = kind
         self._classes: dict[str, type] = {}
 
-    def register(self, name: str) -> Callable[[type], type]:
-        def decorator(cls: type) -> type:
+    def register[C: type](self, name: str) -> Callable[[C], C]:
+        # Generic so a decorated class keeps its own type for the checker (not plain `type`).
+        def decorator(cls: C) -> C:
             existing = self._classes.get(name)
             if existing is not None and existing is not cls:
                 raise ValueError(

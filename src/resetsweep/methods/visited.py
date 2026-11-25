@@ -77,6 +77,10 @@ class Visited(MethodBase):
         ep_step: Tensor,
     ) -> None:
         del env_ids, ep_step
+        self._write(qpos, qvel, extra)
+
+    def _write(self, qpos: Tensor, qvel: Tensor, extra: Tensor) -> Tensor:
+        """Store the valid rows; return each row's slot (`capacity` = rejected, the spare row)."""
         states = StartStates(qpos, qvel, extra)
         valid = (
             self.ctx.task.is_valid(states)
@@ -96,6 +100,7 @@ class Visited(MethodBase):
         added = valid.sum()
         self._ptr = (self._ptr + added) % self._capacity
         self._size = (self._size + added).clamp(max=self._capacity)
+        return slot
 
     def reset(
         self, env_ids: Tensor, outcomes: Outcomes | None
