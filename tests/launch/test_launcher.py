@@ -1017,3 +1017,38 @@ def test_ledger_save_failure_after_pod_create_prints_pod_id_and_exits_1(
     assert "pod-1" in err
     assert "vol-1" in err
     assert "ledger" in err
+
+
+def test_connect_failure_on_pod_create_is_not_created_not_unresolved(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        is_create = (request.method, request.url.path) == ("POST", "/v2/pods")
+        if is_create:  # audit: ignore[BRANCHING] fake transport routing
+            fake_runpod.requests.append(request)
+            raise httpx.ConnectError("connection refused", request=request)
+        return fake_runpod.handler(request)
+
+    ledger = tmp_path / "ledger.json"
+
+    code = main(
+        ["--repo-url", REPO, "--ref", "feat/sweep"],
+        transport=httpx.MockTransport(handler),
+        env_path=env_file,
+        ledger_path=ledger,
+        sleep=lambda _: None,
+        now=lambda: NOW,
+    )
+
+    err = capsys.readouterr().err
+    [launch] = json.loads(ledger.read_text(encoding="utf-8"))["launches"]
+    assert code == 2
+    assert (
+        fake_runpod.sent("GET", "/v2/pods") == []
+    )  # no lookup: nothing reached the server
+    assert "a pod may exist" not in err
+    assert "orphaned" in err
+    assert launch["unresolved"] is False

@@ -5,8 +5,10 @@ fake `uv` fails the step named in `FAIL_STEP`. Nothing touches the network.
 """
 
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,7 @@ fi
 if [[ $name == runpodctl ]]; then exit "${RUNPODCTL_RC:-0}"; fi
 if [[ $name == sleep ]]; then /bin/sleep 0.05; exit 0; fi
 if [[ $name != curl && -n ${FAIL_STEP:-} && "$name $*" == *"$FAIL_STEP"* ]]; then exit 7; fi
+if [[ -n ${SLOW_STEP:-} && "$name $*" == *"$SLOW_STEP"* ]]; then exec /bin/sleep 30; fi
 if [[ $name == git && $1 == clone ]]; then
   for last; do :; done
   mkdir -p "$last/scripts"
@@ -87,7 +90,20 @@ def test_bootstrap_script_passes_bash_n_and_shellcheck() -> None:
     assert one_liner.returncode == 0, one_liner.stdout
 
 
-def _stub_bin(tmp_path: Path, *, runpodctl: bool = False) -> Path:
+def _gnu_timeout() -> str | None:
+    """A GNU coreutils `timeout` on this machine, or None (then the watchdog path is used)."""
+    path = shutil.which("timeout") or shutil.which("gtimeout")
+    if path is None:
+        return None
+    version = subprocess.run(
+        [path, "--version"], capture_output=True, text=True, timeout=10, check=False
+    ).stdout
+    return path if "coreutils" in version else None
+
+
+def _stub_bin(
+    tmp_path: Path, *, runpodctl: bool = False, gnu_timeout: bool = False
+) -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     names = ["python3", "uv", "curl", "git", "sleep"] + (
@@ -97,6 +113,9 @@ def _stub_bin(tmp_path: Path, *, runpodctl: bool = False) -> Path:
         stub = bin_dir / name
         stub.write_text(STUB, encoding="utf-8")
         stub.chmod(0o755)
+    real_timeout = _gnu_timeout()
+    if gnu_timeout and real_timeout is not None:
+        (bin_dir / "timeout").symlink_to(real_timeout)
     return bin_dir
 
 
@@ -106,9 +125,10 @@ def _run(
     pod_id: str = "pod-xyz",
     fail_step: str = "",
     runpodctl: bool = False,
+    gnu_timeout: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> tuple[int, list[str], str]:
-    bin_dir = _stub_bin(tmp_path, runpodctl=runpodctl)
+    bin_dir = _stub_bin(tmp_path, runpodctl=runpodctl, gnu_timeout=gnu_timeout)
     calls = tmp_path / "calls.log"
     state = tmp_path / "state"
     env = {
@@ -120,6 +140,7 @@ def _run(
         "SWEEP_RUNPOD_API_KEY": FAKE_RUNPOD_KEY,
         "RUNPOD_API_KEY": INJECTED_KEY,
         "SWEEP_STATE_DIR": str(state),
+        "SWEEP_MAX_HOURS": "1",
         **(extra_env or {}),
     }
     result = subprocess.run(
@@ -132,6 +153,9 @@ def _run(
         check=False,
     )
     lines = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+    # `sleep` calls are the watchdog's polls and the delete backoff, not steps; the backoff is
+    # checked through its "retrying in N s" log lines instead.
+    lines = [c for c in lines if not c.startswith("sleep ")]
     log = (state / "bootstrap.log").read_text(encoding="utf-8")
     return result.returncode, lines, log + result.stdout + result.stderr
 
@@ -372,28 +396,33 @@ def test_delete_falls_back_to_runpodctl_when_both_keys_fail(tmp_path: Path) -> N
 def test_all_deletes_failing_retries_with_backoff_until_the_deadline_then_exits(
     tmp_path: Path,
 ) -> None:
-    code, calls, output = _run(
+    code, _, output = _run(
         tmp_path,
         fail_step="sweep-run",
-        extra_env={"CURL_FAIL_MATCH": "Bearer", "SWEEP_MAX_HOURS": "0.001"},
+        extra_env={
+            "CURL_FAIL_MATCH": "Bearer",
+            "SWEEP_MAX_HOURS": "0.001",
+            "SWEEP_DEADLINE_RESERVE_S": "1",
+        },
     )
 
-    sleeps = [c for c in calls if c.startswith("sleep ")]
+    waits = [int(w) for w in re.findall(r"retrying in (\d+) s", output)]
     assert code == 7
-    assert len(sleeps) >= 1
-    # waits never run past the 3 s deadline
-    assert all(int(c.split()[1]) <= 3 for c in sleeps)
+    assert len(waits) >= 1
+    assert all(
+        1 <= w <= 3 for w in waits
+    )  # waits never run past the 3.6 s pod deadline
     assert len(_curl_headers(tmp_path)) > 2
     assert "giving up" in output
     assert FAKE_RUNPOD_KEY not in output
 
 
 def test_zero_deadline_means_a_single_round_of_attempts(tmp_path: Path) -> None:
-    _, calls, output = _run(
+    _, _, output = _run(
         tmp_path, extra_env={"CURL_FAIL_MATCH": "Bearer", "SWEEP_MAX_HOURS": "0"}
     )
 
-    assert [c for c in calls if c.startswith("sleep ")] == []
+    assert "retrying in" not in output
     assert len(_curl_headers(tmp_path)) == 2
     assert "giving up" in output
 
@@ -414,3 +443,134 @@ def test_one_liner_ignores_another_pods_done_marker(tmp_path: Path) -> None:
     assert code == 0
     assert calls[0].startswith("git clone")
     assert calls[-1] == "bootstrap ran"
+
+
+# -- fix round 2: SWEEP_MAX_HOURS is the pod's hard wall-clock bound ---------------------
+
+
+@pytest.mark.parametrize(
+    "killer",
+    [
+        "watchdog",
+        pytest.param(
+            "gnu-timeout",
+            marks=pytest.mark.skipif(
+                _gnu_timeout() is None,
+                reason="no GNU coreutils timeout on this machine",
+            ),
+        ),
+    ],
+)
+def test_bootstrap_kills_sweep_run_at_deadline_and_self_deletes(
+    tmp_path: Path, killer: str
+) -> None:
+    started = time.monotonic()
+
+    code, calls, output = _run(
+        tmp_path,
+        gnu_timeout=killer == "gnu-timeout",
+        extra_env={
+            "SLOW_STEP": "sweep-run",
+            "SWEEP_MAX_HOURS": "0.001",  # 3.6 s for the whole pod
+            "SWEEP_DEADLINE_RESERVE_S": "1",  # steps must end 2.6 s after start
+        },
+    )
+
+    elapsed = time.monotonic() - started
+    assert code == 124
+    assert "uv run sweep-run" in calls
+    assert calls[-1].endswith(DELETE_URL)
+    assert elapsed < 20  # the 30 s step was cut off, not waited for
+    assert "deadline" in output
+
+
+def test_bootstrap_refuses_to_start_when_deadline_already_passed(
+    tmp_path: Path,
+) -> None:
+    code, calls, output = _run(
+        tmp_path,
+        extra_env={"SWEEP_MAX_HOURS": "0.0001", "SWEEP_DEADLINE_RESERVE_S": "1"},
+    )
+
+    assert code == 1
+    assert not any(c.startswith(("python3", "uv")) for c in calls)
+    assert calls[-1].endswith(DELETE_URL)
+    assert "deadline" in output
+
+
+@pytest.mark.parametrize(
+    "hours", ["", "abc", "-1"], ids=["missing", "text", "negative"]
+)
+def test_bootstrap_refuses_to_start_without_a_valid_max_hours(
+    tmp_path: Path, hours: str
+) -> None:
+    code, calls, output = _run(tmp_path, extra_env={"SWEEP_MAX_HOURS": hours})
+
+    assert code == 1
+    assert not any(c.startswith(("python3", "uv")) for c in calls)
+    assert "SWEEP_MAX_HOURS" in output
+
+
+def test_deadline_survives_container_restart(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    first_start = int(time.time()) - 100  # this pod first started 100 s ago
+    (state / "START-pod-xyz").write_text(f"{first_start}\n", encoding="utf-8")
+
+    code, calls, _ = _run(
+        tmp_path,
+        extra_env={"SWEEP_MAX_HOURS": "0.01", "SWEEP_DEADLINE_RESERVE_S": "1"},  # 36 s
+    )
+
+    assert code == 1
+    assert not any(c.startswith(("python3", "uv")) for c in calls)
+    assert (state / "START-pod-xyz").read_text(encoding="utf-8") == f"{first_start}\n"
+
+
+def test_first_start_records_the_start_time(tmp_path: Path) -> None:
+    before = int(time.time())
+
+    _run(tmp_path)
+
+    recorded = int((tmp_path / "state" / "START-pod-xyz").read_text(encoding="utf-8"))
+    assert before <= recorded <= int(time.time())
+
+
+def test_corrupt_start_file_refuses_to_start(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "START-pod-xyz").write_text("yesterday\n", encoding="utf-8")
+
+    code, calls, _ = _run(tmp_path)
+
+    assert code == 1
+    assert not any(c.startswith(("python3", "uv")) for c in calls)
+    assert calls[-1].endswith(DELETE_URL)
+
+
+def test_unwritable_state_dir_still_self_deletes(tmp_path: Path) -> None:
+    blocker = tmp_path / "state-is-a-file"
+    blocker.write_text("x", encoding="utf-8")
+    bin_dir = _stub_bin(tmp_path)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "CALLS_LOG": str(tmp_path / "calls.log"),
+        "RUNPOD_POD_ID": "pod-xyz",
+        "SWEEP_RUNPOD_API_KEY": FAKE_RUNPOD_KEY,
+        "SWEEP_STATE_DIR": str(blocker / "sweep"),
+        "SWEEP_MAX_HOURS": "1",
+    }
+
+    result = subprocess.run(
+        [BASH, str(SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
+    assert result.returncode != 0
+    assert calls[-1].endswith(DELETE_URL)

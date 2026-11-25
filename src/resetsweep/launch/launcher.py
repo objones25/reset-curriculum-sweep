@@ -15,7 +15,14 @@ Steps:
    `--max-usd-per-h` (default 1.20); a GPU named with `--gpu` ignores that ceiling. If nothing
    at or under the ceiling has stock, exit 2 listing the in-stock GPUs above it, their prices
    and the command that picks each.
-5. `max_hours = (remaining - margin) / (gpu_usd_per_h + volume_usd_per_h)`, printed.
+5. `max_hours = (remaining - margin) / (gpu_usd_per_h + volume_usd_per_h)`, printed and sent as
+   `SWEEP_MAX_HOURS`. It is the pod's hard wall-clock bound: `scripts/pod_bootstrap.sh`
+   counts it from the pod's first start (kept on the volume, so a restart does not reset it),
+   runs uv sync, the GPU tests and sweep-run under `timeout` until `SWEEP_MAX_HOURS` minus a
+   10-minute reserve, and stops its self-delete retries at `SWEEP_MAX_HOURS`. So the pod's own
+   time costs at most `remaining - margin` at the quoted hourly price, whatever `SWEEP_CAP_USD`
+   says. Not bounded by it: time before the bootstrap starts (image pull, clone) and volume
+   storage billed while no pod runs.
 6. `--dry-run`: print the request bodies with secrets as "***" and stop (GETs only).
    Otherwise create one 20 GB STANDARD volume (or reuse `--volume-id`), then the pod. A
    pod-create 400 (no capacity) moves to the next candidate; another 4xx, or 400 on every
@@ -29,7 +36,8 @@ Steps:
 
 Pod cap: `SWEEP_CAP_USD` is `cap - spent` for a new volume. For a reused volume it is
 `cap - (spend on other volumes) - SETUP_ALLOWANCE_USD x (earlier launches on it)`, because the
-in-pod guard already subtracts that volume's own ledger (see `_pod_cap_usd`).
+in-pod guard already subtracts that volume's own ledger (see `_pod_cap_usd`). That is a soft,
+in-pod limit on scheduling; the hard limit on new spend is `SWEEP_MAX_HOURS` (step 5).
 
 Resume: the pod deletes itself on any exit, SIGTERM included (budget safety over in-place
 resume). The sweep state lives on the network volume, so `sweep-launch --volume-id <id>`
@@ -425,9 +433,10 @@ CreateOutcome = Literal["created", "failed", "ambiguous"]
 def _create_pod(
     client: RunPodClient, plan: Plan, volume_id: str, pod_args: "_PodArgs"
 ) -> tuple[CreateOutcome, dict[str, object] | None, GpuType]:
-    """Try the candidates in order. 400 moves on; another 4xx stops. A 5xx or a transport
-    failure may have created the pod, so it is looked up by its unique name and never retried
-    on another GPU (that could make a second pod)."""
+    """Try the candidates in order. 400 moves on; another 4xx stops; a connect failure that
+    outlasted the client's retries stops as "not created" (nothing reached the server). A 5xx
+    or a read timeout may have created the pod, so it is looked up by its unique name and never
+    retried on another GPU (that could make a second pod)."""
     gpu = plan.candidates[0]
     for gpu in plan.candidates:
         try:
@@ -438,8 +447,10 @@ def _create_pod(
             )
         except RunPodError as e:
             _err(f"sweep-launch: pod create on {gpu.id} failed: {e}")
-            if e.status == 0 or e.status >= 500:
+            if e.status >= 500 or (e.status == 0 and not e.connect_failed):
                 return _lookup_after_ambiguous_create(client, pod_args.name, gpu)
+            if e.connect_failed:
+                break  # nothing reached the server, after the client's own retries
             if e.status != 400:
                 break
     return "failed", None, gpu

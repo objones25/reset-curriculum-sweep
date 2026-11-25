@@ -419,3 +419,26 @@ def test_find_pod_by_name_with_two_matches_raises() -> None:
 
     with pytest.raises(RunPodError, match="2 pods named"):
         client.find_pod_by_name("dup")
+
+
+@pytest.mark.parametrize(
+    ("error", "connect_failed"),
+    [
+        (httpx.ConnectError, True),
+        (httpx.ConnectTimeout, True),
+        (httpx.ReadTimeout, False),
+    ],
+)
+def test_transport_errors_say_whether_the_request_could_have_reached_the_server(
+    error: type[httpx.TransportError], connect_failed: bool
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error("boom", request=request)
+
+    client = _client(handler, RecordingSleep(), max_retries=1)
+
+    with pytest.raises(RunPodError, match=error.__name__) as info:
+        client.create_pod({"name": "x"})
+
+    assert info.value.status == 0
+    assert info.value.connect_failed is connect_failed

@@ -58,12 +58,23 @@ POST_RETRY_STATUSES: Final = frozenset({408, 425, 429})
 
 
 class RunPodError(Exception):
-    """A RunPod API call failed. `status` is the HTTP status, or 0 for a transport failure."""
+    """A RunPod API call failed. `status` is the HTTP status, or 0 for a transport failure.
 
-    def __init__(self, status: int, detail: str) -> None:
+    `connect_failed` is True when the connection was never made (httpx ConnectError or
+    ConnectTimeout), so the request cannot have reached the server; a read timeout or a 5xx
+    after sending leaves it unknown whether the server acted."""
+
+    def __init__(
+        self, status: int, detail: str, *, connect_failed: bool = False
+    ) -> None:
         super().__init__(f"RunPod API {status}: {detail}")
+        if connect_failed and status != 0:
+            raise AssertionError(
+                "connect_failed only applies to transport failures (status 0)"
+            )
         self.status = status
         self.detail = detail
+        self.connect_failed = connect_failed
 
 
 @dataclass(frozen=True)
@@ -273,13 +284,13 @@ class RunPodClient:
             try:
                 response = self._http.request(method, path, params=params, json=body)
             except httpx.TransportError as e:
-                replay_safe = idempotent or isinstance(
-                    e, httpx.ConnectError | httpx.ConnectTimeout
-                )
-                if replay_safe and not last:
+                not_sent = isinstance(e, httpx.ConnectError | httpx.ConnectTimeout)
+                if (idempotent or not_sent) and not last:
                     self._sleep(self._backoff_s(attempt, None))
                     continue
-                raise RunPodError(0, f"{method} {path}: {type(e).__name__}") from e
+                raise RunPodError(
+                    0, f"{method} {path}: {type(e).__name__}", connect_failed=not_sent
+                ) from e
             if response.status_code in retry_statuses and not last:
                 self._sleep(
                     self._backoff_s(attempt, response.headers.get("Retry-After"))
