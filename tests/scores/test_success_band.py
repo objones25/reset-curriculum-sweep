@@ -102,12 +102,31 @@ def test_forget_resets_history(make_outcomes: MakeOutcomes) -> None:
     assert lp.tolist() == [0.25, 0.25]  # IC 0 untrusted -> median of {0.25}
 
 
-def test_pq_probs_fall_back_to_rank_proportional(make_outcomes: MakeOutcomes) -> None:
+def test_pq_probs_fall_back_to_plr_rank_rule(make_outcomes: MakeOutcomes) -> None:
     score = SuccessBand(capacity=3, device="cpu", form="pq")
     score.record(_rates(make_outcomes, [0, 2, 1], total=4))  # lp 0, 0.25, 0.1875
-    # Ranks (1 = highest lp): IC1 -> 1, IC2 -> 2, IC0 -> 3; p ~ 1/rank, norm 11/6.
+    # Ranks (1 = highest lp): IC1 -> 1, IC2 -> 2, IC0 -> 3. PLR with beta = 0.1:
+    # weights rank^-10 = 1, 9.765625e-4, 1.6935e-5; Z = 1.00099350.
     probs = score.probs(_ids(0, 1, 2))
-    assert probs.tolist() == pytest.approx([(1 / 3) * 6 / 11, 6 / 11, (1 / 2) * 6 / 11])
+    assert probs.tolist() == pytest.approx([1.6918e-5, 0.99900757, 9.7560e-4], abs=1e-7)
+
+
+def test_tied_lp_ranks_follow_input_order() -> None:
+    score = SuccessBand(capacity=3, device="cpu", form="pq")
+    # No data: every IC is untrusted with the same filled lp (0), so all tie.
+    # Stable ranking gives the first listed id rank 1, whatever the ids are.
+    probs = score.probs(_ids(2, 0, 1))
+    assert probs.tolist() == pytest.approx([0.99900757, 9.7560e-4, 1.6918e-5], abs=1e-7)
+    assert probs.tolist() == score.probs(_ids(2, 0, 1)).tolist()
+
+
+def test_forget_and_values_reject_ids_outside_capacity() -> None:
+    score = SuccessBand(capacity=3, device="cpu")
+    for bad in (_ids(3), _ids(-1)):
+        with pytest.raises(ValueError, match="ic_ids"):
+            score.values(bad)
+        with pytest.raises(ValueError, match="ic_ids"):
+            score.forget(bad)
 
 
 def test_registry_constructs_success_band() -> None:
@@ -124,6 +143,8 @@ def test_registry_constructs_success_band() -> None:
         ({"target": 1.5}, "target"),
         ({"history": 0}, "history"),
         ({"min_count": 0}, "min_count"),
+        ({"min_count": 11, "history": 10}, "min_count"),
+        ({"beta": 0.0}, "beta"),
         ({"temperature": 0.0}, "temperature"),
         ({"eps": 0.0}, "eps"),
         ({"kappa": -1.0}, "kappa"),

@@ -77,7 +77,13 @@ class ICTable:
         self._seen.scatter_add_(0, ic, torch.ones_like(ic))
         self._succeeded.scatter_add_(0, ic, success.to(torch.int64))
 
+    def check_ids(self, ic_ids: Tensor) -> None:
+        """Reject ids outside [0, capacity); the spare row at `capacity` is not addressable."""
+        if ic_ids.numel() and bool(((ic_ids < 0) | (ic_ids >= self.capacity)).any()):
+            raise ValueError(f"ic_ids must be in [0, {self.capacity})")
+
     def forget(self, ic_ids: Tensor) -> None:
+        self.check_ids(ic_ids)
         self._success[ic_ids] = False
         self._ret[ic_ids] = 0.0
         self._seen[ic_ids] = 0
@@ -85,6 +91,7 @@ class ICTable:
 
     def count(self, ic_ids: Tensor) -> Tensor:
         """Outcomes currently in each IC's window (at most `history`)."""
+        self.check_ids(ic_ids)
         return self._seen[ic_ids].clamp(max=self.history)
 
     def success_rate(self, ic_ids: Tensor) -> Tensor:
@@ -98,6 +105,7 @@ class ICTable:
     def recent(self, ic_ids: Tensor, n: int) -> tuple[Tensor, Tensor, Tensor]:
         """Last `n` outcomes per IC in time order (oldest first), as `(ret, success, valid)`
         of shape `(k, n)`. `valid` is False where the IC has fewer than `n` outcomes."""
+        self.check_ids(ic_ids)
         if not 0 < n <= self.history:
             raise ValueError(f"n must be in [1, history={self.history}], got {n}")
         seen = self._seen[ic_ids].unsqueeze(1)
@@ -121,7 +129,17 @@ def median_fill(lp: Tensor, trusted: Tensor) -> Tensor:
 
 
 class BaseScore:
-    """Defaults: no rollout data used, and rank-proportional sampling from `values`."""
+    """Defaults: no rollout data used, and PLR rank sampling from `values`.
+
+    `beta` is PLR's temperature (default 0.1, the Procgen setting): see `probs`.
+    """
+
+    beta: float = 0.1
+
+    def _set_beta(self, beta: float) -> None:
+        if beta <= 0.0:
+            raise ValueError(f"beta must be positive, got {beta}")
+        self.beta = beta
 
     def record(self, outcomes: Outcomes) -> None:
         raise NotImplementedError
@@ -136,12 +154,17 @@ class BaseScore:
         raise NotImplementedError
 
     def probs(self, ic_ids: Tensor) -> Tensor:
-        """p ~ 1/rank, rank 1 being the largest lp, normalised over `ic_ids`."""
+        """PLR rank prioritisation: p_i = h_i^(1/beta) / sum_j h_j^(1/beta), h = 1/rank.
+
+        Rank 1 is the largest lp; ties rank in input order (stable sort). Source:
+        papers/text/2010.03934_prioritized-level-replay.txt L204-214 (definition) and
+        L299, L848 (beta = 0.1 for Procgen).
+        """
         lp, _ = self.values(ic_ids)
-        order = torch.argsort(lp, descending=True)
+        order = torch.argsort(lp, descending=True, stable=True)
         rank = torch.empty_like(order)
         rank[order] = torch.arange(1, order.numel() + 1, device=order.device)
-        weight = 1.0 / rank.to(torch.float32)
+        weight = rank.to(torch.float32) ** (-1.0 / self.beta)
         return weight / weight.sum()
 
 
@@ -149,10 +172,13 @@ class TableScore(BaseScore):
     """A score computed from an `ICTable`; subclasses implement `_raw_values`."""
 
     def __init__(
-        self, *, capacity: int, device: str, history: int, min_count: int
+        self, *, capacity: int, device: str, history: int, min_count: int, beta: float
     ) -> None:
-        if min_count < 1:
-            raise ValueError(f"min_count must be at least 1, got {min_count}")
+        if not 1 <= min_count <= history:
+            raise ValueError(
+                f"min_count must be in [1, history={history}], got {min_count}"
+            )
+        self._set_beta(beta)
         self.table = ICTable(capacity, device, history=history)
         self._min_count = min_count
 

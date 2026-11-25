@@ -11,20 +11,30 @@ from resetsweep.types import Outcomes, RolloutStats
 class Random(BaseScore):
     """An iid uniform value per IC, fixed until that IC is forgotten. Always trusted."""
 
-    def __init__(self, *, capacity: int, device: str, seed: int = 0) -> None:
+    def __init__(
+        self, *, capacity: int, device: str, seed: int = 0, beta: float = 0.1
+    ) -> None:
+        self._set_beta(beta)
         if capacity <= 0:
             raise ValueError(f"capacity must be positive, got {capacity}")
         self._generator = torch.Generator(device=device).manual_seed(seed)
         self._device = device
+        self._capacity = capacity
         self._lp = torch.rand(capacity, generator=self._generator, device=device)
 
     def record(self, outcomes: Outcomes) -> None:
         del outcomes
 
+    def _check_ids(self, ic_ids: Tensor) -> None:
+        if ic_ids.numel() and bool(((ic_ids < 0) | (ic_ids >= self._capacity)).any()):
+            raise ValueError(f"ic_ids must be in [0, {self._capacity})")
+
     def values(self, ic_ids: Tensor) -> tuple[Tensor, Tensor]:
+        self._check_ids(ic_ids)
         return self._lp[ic_ids], torch.ones_like(ic_ids, dtype=torch.bool)
 
     def forget(self, ic_ids: Tensor) -> None:
+        self._check_ids(ic_ids)
         self._lp[ic_ids] = torch.rand(
             ic_ids.numel(), generator=self._generator, device=self._device
         )
@@ -43,7 +53,9 @@ class Inverted(BaseScore):
         device: str,
         inner: str,
         inner_kw: dict[str, object] | None = None,
+        beta: float = 0.1,
     ) -> None:
+        self._set_beta(beta)
         built = SCORES.construct(
             inner, capacity=capacity, device=device, **(inner_kw or {})
         )

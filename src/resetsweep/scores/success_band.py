@@ -40,6 +40,7 @@ class SuccessBand(TableScore):
         kappa: float = 1.0,
         eps: float = 1e-4,
         temperature: float = 2.0,
+        beta: float = 0.1,
     ) -> None:
         if form not in _FORMS:
             raise ValueError(f"form must be one of {_FORMS}, got {form!r}")
@@ -52,7 +53,11 @@ class SuccessBand(TableScore):
         if temperature <= 0.0:
             raise ValueError(f"temperature must be positive, got {temperature}")
         super().__init__(
-            capacity=capacity, device=device, history=history, min_count=min_count
+            capacity=capacity,
+            device=device,
+            history=history,
+            min_count=min_count,
+            beta=beta,
         )
         self._form: Form = form
         self._target = target

@@ -99,6 +99,7 @@ def test_registry_constructs_slope() -> None:
         ({"form": "nope"}, "form"),
         ({"window": 1}, "window"),
         ({"window": 20, "history": 10}, "window"),
+        ({"min_count": 11, "history": 10, "window": 5}, "min_count"),
         ({"fast": 0.0}, "fast"),
         ({"slow": 1.5}, "slow"),
         ({"fast": 0.01, "slow": 0.1}, "fast"),

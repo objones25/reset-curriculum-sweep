@@ -32,6 +32,7 @@ class Slope(TableScore):
         slow: float = 0.01,
         history: int = 100,
         min_count: int = 2,
+        beta: float = 0.1,
     ) -> None:
         if form not in _FORMS:
             raise ValueError(f"form must be one of {_FORMS}, got {form!r}")
@@ -45,7 +46,11 @@ class Slope(TableScore):
         if min_count < 2:
             raise ValueError(f"min_count must be at least 2, got {min_count}")
         super().__init__(
-            capacity=capacity, device=device, history=history, min_count=min_count
+            capacity=capacity,
+            device=device,
+            history=history,
+            min_count=min_count,
+            beta=beta,
         )
         self._form: Form = form
         self._window = window
