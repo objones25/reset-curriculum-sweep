@@ -68,11 +68,15 @@ class CriticLoss(_PerICScore):
     With rows `t` of one IC (rollout rows with `ic_id == -1` are excluded):
     - `pos_value_loss`: mean of `relu(adv_t)`, the GAE advantage being the positive-clipped
       value loss of PVL (papers/text/2408.15099 L125-138).
-    - `max_mc`: `max(returns) - mean(values)`. The paper defines MaxMC as
-      `mean_t(Rmax - V(o_t))` (L140-146), which equals `Rmax - mean(V)` for a fixed `Rmax`;
-      the paper's Rmax is the highest return ever obtained on the level, here it is the
-      highest of this rollout's rows for the IC, since no history is kept.
+    - `max_mc`: `Rmax - mean(values)`. The paper defines MaxMC as `mean_t(Rmax - V(o_t))`
+      with Rmax "the highest return obtained on a particular level" (L140-146), which
+      equals `Rmax - mean(V)` for a fixed Rmax. Rmax is a per-IC running max over every
+      `stats.returns` row seen since the IC was last forgotten. Those are the lambda-return
+      targets, in the same discounted units as V; undiscounted `Outcomes.ret` is not.
     - `abs_gae`: mean of `|adv_t|`.
+
+    `stats.adv` must be raw GAE (un-normalised): `pos_value_loss` and `abs_gae` read its sign
+    and scale, which per-batch normalisation would change.
     """
 
     def __init__(
@@ -82,6 +86,11 @@ class CriticLoss(_PerICScore):
             raise ValueError(f"form must be one of {_FORMS}, got {form!r}")
         super().__init__(capacity=capacity, device=device, beta=beta)
         self._form: Form = form
+        self._rmax = torch.full((capacity + 1,), -torch.inf, device=device)
+
+    def forget(self, ic_ids: Tensor) -> None:
+        super().forget(ic_ids)
+        self._rmax[ic_ids] = -torch.inf
 
     def observe_rollout(self, stats: RolloutStats) -> None:
         slots = self._slots(stats.ic_ids)
@@ -90,13 +99,13 @@ class CriticLoss(_PerICScore):
             0, slots, torch.ones_like(slots, dtype=torch.float32)
         )
         if self._form == "max_mc":
-            top = torch.full((rows,), -torch.inf, device=self._device).scatter_reduce(
-                0, slots, stats.returns.reshape(-1).float(), "amax"
+            self._rmax = self._rmax.scatter_reduce(
+                0, slots, stats.returns.reshape(-1).float(), "amax", include_self=True
             )
             total = torch.zeros(rows, device=self._device).scatter_add_(
                 0, slots, stats.values.reshape(-1).float()
             )
-            new_lp = top - total / count.clamp(min=1.0)
+            new_lp = self._rmax - total / count.clamp(min=1.0)
         else:
             adv = stats.adv.reshape(-1).float()
             term = adv.clamp(min=0.0) if self._form == "pos_value_loss" else adv.abs()
@@ -117,7 +126,8 @@ class CriticValue(_PerICScore):
 
     `stats.start_obs` must have one row per IC id (shape `(capacity, obs_dim)`, row `i` the
     observation at IC `i`'s start state). Only ICs that appear in the rollout are updated
-    and trusted, so rows for other ICs may hold anything.
+    and trusted, so rows for other ICs may hold anything. The critic is called on the
+    `T * N` rows the rollout touches (gathered by id), not on all `capacity` rows.
     """
 
     def __init__(
@@ -146,13 +156,19 @@ class CriticValue(_PerICScore):
         slots = self._slots(stats.ic_ids)
         present = torch.zeros(self._capacity + 1, dtype=torch.bool, device=self._device)
         present[slots] = True
+        # Fixed shape (T * N): task-start cells (slot == capacity) read a dummy row and land
+        # in the spare row, which `_store` ignores.
+        obs = stats.start_obs[slots.clamp(max=self._capacity - 1)]
         with torch.no_grad():
-            v = stats.critic(stats.start_obs).reshape(-1).float()
-        if v.shape != (self._capacity,):
+            v = stats.critic(obs).reshape(-1).float()
+        if v.shape != slots.shape:
             raise ValueError(
-                f"critic must return one value per start_obs row, got shape {tuple(v.shape)}"
+                f"critic must return one value per input row ({slots.numel()}), "
+                f"got shape {tuple(v.shape)}"
             )
-        new_lp = torch.cat([v * (self._vmax - v), v.new_zeros(1)])
+        # Cells of one IC share a start obs, hence a value, so duplicate writes agree.
+        new_lp = self._lp.clone()
+        new_lp[slots] = v * (self._vmax - v)
         self._store(slots, new_lp, present)
 
     def probs(self, ic_ids: Tensor) -> Tensor:

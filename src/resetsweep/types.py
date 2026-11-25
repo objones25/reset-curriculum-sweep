@@ -158,7 +158,8 @@ class StepOut:
 class RolloutStats:
     """PPO rollout data handed to scores. `ic_ids`, `adv`, `returns` and `values` are `(T, N)`
     (`T` vector steps, `N` envs); `start_obs` holds the observation at each IC's start, and
-    `critic` maps a batch of observations to values in one call."""
+    `critic` maps a batch of observations to values in one call. `adv` must be raw GAE, not
+    normalised per batch: the critic-loss scores read its sign and scale."""
 
     ic_ids: Tensor
     adv: Tensor

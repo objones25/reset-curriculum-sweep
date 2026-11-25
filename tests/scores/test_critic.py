@@ -50,6 +50,29 @@ def test_max_mc_matches_manual(make_stats: MakeStats) -> None:
     assert lp.tolist() == [4.0, 2.0, 6.0, 4.0]
 
 
+def test_max_mc_keeps_running_rmax_across_rollouts(make_stats: MakeStats) -> None:
+    score = CriticLoss(capacity=4, device="cpu", form="max_mc")
+    score.observe_rollout(_rollout(make_stats))
+    # Second rollout: IC 0 only, lower return 1, value 1. Rmax stays 6 -> 6 - 1 = 5.
+    score.observe_rollout(make_stats(ic_ids=[[0]], returns=[[1.0]], values=[[1.0]]))
+    lp, _ = score.values(_ids(0, 1, 2))
+    assert lp.tolist() == [5.0, 2.0, 6.0]
+    # A higher return raises Rmax: 9 - 1 = 8.
+    score.observe_rollout(make_stats(ic_ids=[[0]], returns=[[9.0]], values=[[1.0]]))
+    lp, _ = score.values(_ids(0))
+    assert lp.tolist() == [8.0]
+
+
+def test_max_mc_forget_clears_rmax(make_stats: MakeStats) -> None:
+    score = CriticLoss(capacity=4, device="cpu", form="max_mc")
+    score.observe_rollout(_rollout(make_stats))
+    score.forget(_ids(0))
+    score.observe_rollout(make_stats(ic_ids=[[0]], returns=[[1.0]], values=[[1.0]]))
+    lp, _ = score.values(_ids(0))
+    # Rmax restarted at 1 (not 6): 1 - 1 = 0.
+    assert lp.tolist() == [0.0]
+
+
 def test_abs_gae_matches_manual(make_stats: MakeStats) -> None:
     score = CriticLoss(capacity=4, device="cpu", form="abs_gae")
     score.observe_rollout(_rollout(make_stats))
@@ -108,6 +131,28 @@ def test_critic_value_peaks_at_half_vmax(make_stats: MakeStats) -> None:
     assert lp.tolist() == pytest.approx([0.0, 0.1875, 0.25, 0.0])
     assert trusted.tolist() == [True] * 4
     assert int(torch.argmax(lp)) == 2
+
+
+def test_critic_value_evaluates_only_rollout_rows(make_stats: MakeStats) -> None:
+    seen_rows: list[int] = []
+
+    def critic(obs: torch.Tensor) -> torch.Tensor:
+        seen_rows.append(obs.shape[0])
+        return obs[:, 0]
+
+    score = CriticValue(capacity=6, device="cpu", vmax=1.0)
+    # T*N = 4 rows, with IC 0 twice and one task-start (-1) cell; capacity is 6.
+    stats = make_stats(
+        ic_ids=[[0, 1], [0, -1]],
+        start_obs=[[0.5], [0.25], [0.9], [0.9], [0.9], [0.9]],
+        critic=critic,
+    )
+    score.observe_rollout(stats)
+    assert seen_rows == [4]
+    lp, trusted = score.values(_ids(0, 1, 2))
+    # Same as evaluating every row: V(1 - V) = 0.25 and 0.1875; IC 2 untouched.
+    assert lp[:2].tolist() == pytest.approx([0.25, 0.1875])
+    assert trusted.tolist() == [True, True, False]
 
 
 def test_critic_value_only_updates_ics_in_rollout(make_stats: MakeStats) -> None:
