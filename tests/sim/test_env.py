@@ -231,6 +231,32 @@ def test_outcomes_report_first_reward_step_or_minus_one(
     assert oc.first_reward_step[order].tolist() == [1, -1]
 
 
+def test_first_reward_step_on_last_step(make_task: Callable[..., Task]) -> None:
+    # Reward first on step 3, the step the 3-step episode truncates on.
+    task = make_task(max_steps=3, hold_steps=10, success_script=[False, False, True])
+    env, _, _ = _env(task, num_envs=1)
+    env.reset_all()
+    env.ep_step.zero_()  # no stagger: the episode spans steps 1-3
+
+    ((_, oc),) = _collect(env, 3)
+
+    assert oc.first_reward_step.tolist() == [3]
+
+
+def test_first_reward_step_on_reset_step(make_task: Callable[..., Task]) -> None:
+    # Reward on step 3 (the reset step) belongs to the ending episode; the next episode,
+    # never rewarded, must report -1 rather than inherit the 3.
+    script = [False, False, True, False]
+    task = make_task(max_steps=3, hold_steps=10, success_script=script)
+    env, _, _ = _env(task, num_envs=1)
+    env.reset_all()
+    env.ep_step.zero_()
+
+    waves = _collect(env, 6)
+
+    assert [o.first_reward_step.tolist() for _, o in waves] == [[3], [-1]]
+
+
 def test_reset_all_gives_method_no_outcomes(make_task: Callable[..., Task]) -> None:
     env, method, _ = _env(make_task())
 

@@ -151,3 +151,72 @@ def test_phased_drops_pre_switch_rollout_cells(
 
     assert method.episode_versions().tolist() == [1, -1]  # env 0: own slot, phase 1
     assert seen[0].tolist() == [[-1, 1]]
+
+
+def _switched(make_ctx: MakeCtx) -> Phased:
+    """A phased method that switched on env 0's reward; env 1 is still in its phase-0
+    episode."""
+    method = Phased(make_ctx(num_envs=2, p_task=0.0))
+    method.reset(torch.arange(2), None)
+    _offer(method, [0.1, 0.5], 8)
+    method.reset(torch.tensor([0]), _outcome(0, first_reward_step=10))
+    return method
+
+
+def test_phased_switch_with_rewarded_outcome_from_high_visited_slot(
+    make_ctx: MakeCtx,
+) -> None:
+    torch.manual_seed(0)
+    method = Phased(make_ctx(num_envs=2, p_task=0.0))
+    method.reset(torch.arange(2), None)
+    _offer(method, [0.1, 0.5], 8)
+    high = (
+        table_capacity(method.ctx.task) + 300
+    )  # a visited_count slot own_success lacks
+    rewarded = dataclasses.replace(
+        _outcome(0, first_reward_step=10), ic_ids=torch.tensor([high])
+    )
+
+    method.reset(torch.tensor([0]), rewarded)
+
+    assert method.phase == 1
+    assert method.ic_states().qpos[:2, 0].tolist() == pytest.approx([0.1, 0.0])
+
+
+def test_phased_post_switch_stale_outcome_from_visited_slot(
+    make_ctx: MakeCtx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.manual_seed(0)
+    method = _switched(make_ctx)
+    recorded: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        method.score, "record", lambda outcomes: recorded.append(outcomes.ic_ids)
+    )
+    high = table_capacity(method.ctx.task) + 300
+    stale = dataclasses.replace(
+        _outcome(1, first_reward_step=-1), ic_ids=torch.tensor([high])
+    )
+
+    method.reset(torch.tensor([1]), stale)
+
+    assert recorded[0].tolist() == [-1]
+
+
+def test_phased_update_masks_negative_tag_cells(
+    make_ctx: MakeCtx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.manual_seed(0)
+    method = _switched(make_ctx)
+    seen: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        method.score, "observe_rollout", lambda stats: seen.append(stats.ic_ids)
+    )
+    # env 0: own_success slot 1 (tag 2 * 0 + 1); env 1: still in its visited_count
+    # episode from slot 500, which own_success stamps -1.
+    stats = dataclasses.replace(
+        _stats(torch.tensor([1, -1])), ic_ids=torch.tensor([[1, 500]])
+    )
+
+    method.update(1, stats)
+
+    assert seen[0].tolist() == [[1, -1]]

@@ -20,11 +20,15 @@ Contract for train.py:
   object, so train.py reads both once per update, after the rollout, as for any IC method.
 - Phase epoch: `episode_versions()` returns the active inner version `v` tagged with the
   phase, `2 * v + phase` (task starts stay -1). `update` decodes the tags and turns every
-  rollout cell recorded under the other phase into ic id -1 before forwarding,
+  rollout cell recorded under the other phase, or with a negative tag, into ic id -1
+  before forwarding,
   so no cell from before the switch reaches `own_success`, whatever the inner versions are.
   train.py stacks `episode_versions()` per step as for any IC method and never decodes it.
-  Outcomes of episodes `visited_count` started that end after the switch are dropped by
-  `own_success` itself: it stamped those envs -1 when `capture` saw their reset.
+- Outcomes: phased remembers the phase each env's episode started in and sets ic id -1 on
+  outcomes of episodes from the other phase before forwarding, so a `visited_count` slot
+  id (up to 1023) never indexes `own_success`'s smaller table. The rewarded outcome that
+  triggers the switch is one of these; `own_success` still captures its trajectory, since
+  capture keys on the env (stamped -1 by `capture`), not on the ic id.
 - As with every IC method, the method drives the active score (`record`,
   `observe_rollout`); train.py must not call those itself.
 """
@@ -109,6 +113,8 @@ class Phased(MethodBase):
         self._scores: tuple[Score, Score] = (explore_score, exploit_score)
         self._phase = 0
         self._switch_step = float("nan")
+        # Phase each env's current episode started in; its ic id names that phase's table.
+        self._env_phase = torch.zeros(ctx.num_envs, dtype=torch.long, device=ctx.device)
 
     @property
     def phase(self) -> int:
@@ -141,23 +147,37 @@ class Phased(MethodBase):
         ):
             self._phase = 1
             self._switch_step = float(self.ctx.counter.total)
+        if outcomes is not None:
+            outcomes = self._same_phase(outcomes)
+        self._env_phase[env_ids] = self._phase
         if self._phase == 1:
             return self._exploit.reset(env_ids, outcomes)
         starts = self._explore.reset(env_ids, outcomes)
         self._exploit.capture(env_ids, outcomes)
         return starts
 
+    def _same_phase(self, outcomes: Outcomes) -> Outcomes:
+        """`outcomes` with ic id -1 for episodes that started in the other phase: their ic
+        ids name the other inner method's table, which may be larger than the active one."""
+        other = self._env_phase[outcomes.env_ids] != self._phase
+        ic = outcomes.ic_ids
+        return dataclasses.replace(
+            outcomes, ic_ids=torch.where(other, torch.full_like(ic, -1), ic)
+        )
+
     def update(self, it: int, stats: RolloutStats) -> dict[str, float]:
         tags = stats.ic_versions
         if tags is None or tags.shape != stats.ic_ids.shape:
             return self._active().update(it, stats)  # the inner method raises on these
-        other_phase = (tags >= 0) & (tags % _PHASES != self._phase)
+        # Keep only cells of IC-started episodes recorded in the active phase. A negative tag
+        # is a task start or an episode the active method did not start (own_success stamps
+        # -1 on episodes visited_count began), whose ic id may be out of its range.
+        keep = (tags >= 0) & (tags % _PHASES == self._phase)
         versions = torch.where(tags >= 0, tags // _PHASES, tags)
         # The decoded inner versions are kept: an ic id of -1 alone makes scores skip a cell.
-        minus_one = torch.full_like(tags, -1)
         current = dataclasses.replace(
             stats,
-            ic_ids=torch.where(other_phase, minus_one, stats.ic_ids),
+            ic_ids=torch.where(keep, stats.ic_ids, torch.full_like(tags, -1)),
             ic_versions=versions,
         )
         return self._active().update(it, current)
