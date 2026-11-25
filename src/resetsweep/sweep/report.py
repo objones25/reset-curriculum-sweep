@@ -9,7 +9,7 @@ Rules:
   report ranks at the highest rung where some group has one, else at rung 0. It then says
   "provisional: ranked at rung k, final rung not reached" in report.md, report.json
   (`provisional`) and the W&B summary. At rung 0 (one seed per arm) arms are ordered by
-  `stats.rung0_key`, the scheduler's own rung-0 order; elsewhere by IQM AUC.
+  `stats.rung0_group_keys`, the scheduler's own rung-0 order; elsewhere by IQM AUC.
 - Equal seeds (spec section 6; controller ruling, fix round 1): a sweep stopped by the budget
   mid-rung leaves arms with different seed counts. Each group is ranked on its common seed
   count k = the fewest ok seeds among its ranked arms, using each arm's first k ok seeds in
@@ -56,7 +56,7 @@ from resetsweep.sweep.scheduler import (
     GroupKey,
     group_of,
 )
-from resetsweep.sweep.stats import bootstrap_ci, iqm, normalise, rung0_key
+from resetsweep.sweep.stats import bootstrap_ci, iqm, normalise, rung0_group_keys
 from resetsweep.train import RunResult
 
 _log = logging.getLogger(__name__)
@@ -391,7 +391,9 @@ def build_report(
         common[group] = k
         rows = [_arm_row(st, results, rung, k) for st, results in members]
         if rung == 0:
-            keys = {st.arm.label(): rung0_key(_first_ok(results, k)) for st, results in members}
+            keys = rung0_group_keys(
+                {st.arm.label(): _first_ok(results, k) for st, results in members}
+            )
             for r in rows:
                 r["rung0_order"] = keys[r["label"]]
         by_group[group] = rows

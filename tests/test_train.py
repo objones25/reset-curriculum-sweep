@@ -355,9 +355,10 @@ def test_evaluator_plays_exactly_one_episode_of_max_steps() -> None:
         calls.append(obs.shape[0])
         return torch.zeros(obs.shape[0], task.act_dim)
 
-    success, ret = evaluator.run(policy)
+    success, ret, reached = evaluator.run(policy)
 
     assert calls == [3] * task.max_steps
+    assert reached == pytest.approx(0.0, abs=0)
     assert success == pytest.approx(
         0.0, abs=0
     )  # hanging with zero torque never succeeds
@@ -486,24 +487,52 @@ def test_run_reports_ever_succeeded_share_for_ic_methods() -> None:
 def test_run_reports_nan_ever_succeeded_share_without_ics() -> None:
     torch.manual_seed(0)
 
-    result = run(_spec(), _Recorder())
+    sink = _Recorder()
+    result = run(_spec(), sink)
 
     assert math.isnan(result.ever_succeeded_share)
+    # Final-review I4: reached_reward now comes from eval. Here the trained policy swings an
+    # eval episode through upright (eval/return 0.30 at step 128), so it is True; that it
+    # matches the eval log is checked in the first-reward tests below.
+    evals = [d["eval/reached_reward"] for _, d in sink.logs if "eval/reached_reward" in d]
+    assert result.reached_reward is any(share > 0 for share in evals)
+
+
+def test_first_reward_step_is_the_first_eval_where_an_eval_episode_reached_reward() -> None:
+    # Final-review I4: from eval (task-start states), not from curriculum episodes.
+    torch.manual_seed(0)
+    sink = _Recorder()
+
+    result = run(_spec(task="pendulum_dense"), sink)
+
+    evals = [(step, d["eval/reached_reward"]) for step, d in sink.logs if "eval/reached_reward" in d]
+    first_hit = next(step for step, share in evals if share > 0)
+    assert result.reached_reward is True
+    assert result.steps_to_first_reward == first_hit
+    assert all(share == 0 for step, share in evals if step < first_hit)
+
+
+def test_reached_reward_ignores_rewards_from_curriculum_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every training episode starts upright (point at a patched canonical start), so the
+    # curriculum envs collect reward from their first step. The eval episodes start from the
+    # task's own (hanging) states and an untrained policy never swings up: no reward there.
+    pendulum = type(TASKS.construct("pendulum_sparse"))
+
+    def upright(self: object) -> StartStates:
+        del self
+        return StartStates(torch.full((1, 1), math.pi), torch.zeros(1, 1), torch.zeros(1, 0))
+
+    monkeypatch.setattr(pendulum, "canonical_start", upright)
+    torch.manual_seed(0)
+    sink = _Recorder()
+
+    result = run(_spec(method="point"), sink)
+
+    assert max(d.get("train/curriculum_return", 0.0) for _, d in sink.logs) > 0
     assert result.reached_reward is False
     assert result.steps_to_first_reward is None
-
-
-def test_run_records_first_reward_step_on_dense_task() -> None:
-    torch.manual_seed(0)
-
-    result = run(_spec(task="pendulum_dense"), _Recorder())
-
-    assert result.reached_reward is True
-    first = result.steps_to_first_reward
-    assert first is not None
-    # Counted in vector steps of NUM_ENVS; dense height reward appears within the run.
-    assert first % NUM_ENVS == 0
-    assert 0 < first <= result.env_steps_train
 
 
 def test_run_logs_update_stats_and_diagnostics_that_share_a_key(

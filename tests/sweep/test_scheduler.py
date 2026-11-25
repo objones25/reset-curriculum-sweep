@@ -1229,3 +1229,20 @@ def test_final_expansion_survives_save_and_load(tmp_path: Path) -> None:
     loaded = Scheduler.load(tmp_path, arm_id_of=_arm_id)
 
     assert {(st.arm, st.rung, st.status) for st in loaded.states()} == before
+
+
+def test_rung0_nan_ever_succeeded_is_neutral_not_worst(tmp_path: Path) -> None:
+    # Final-review I4. All AUCs 0, no reward. walk has ever_succeeded_share 0.9; visited has
+    # none (NaN). The component is dropped for the group, so visited and walk tie, and the
+    # tie goes to arm order: visited (listed first) takes the single quota place
+    # (ceil(2 non-protected / 3) = 1). Under "NaN ranks worst" walk would win.
+    s = _new(tmp_path, [UNIFORM_A, POINT_A, V00_A, WALK_A])
+    for job in s.next_jobs(100):
+        result = _result(job, 0.0)
+        if job.arm == WALK_A:
+            result = replace(result, ever_succeeded_share=0.9)
+        s.report(result)
+    s.promotions()
+
+    assert s.state(V00_A).status == "promoted"
+    assert s.state(WALK_A).status == "pruned"

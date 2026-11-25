@@ -277,3 +277,37 @@ def test_rung0_key_raises_when_no_ok_runs() -> None:
 def test_rung0_key_rejects_nan_auc() -> None:
     with pytest.raises(ValueError, match="non-finite"):
         rung0_key([_run(auc=NAN)])
+
+
+# --- group keys: NaN ever_succeeded_share is neutral (final-review I4) ---------------------------
+
+
+def test_group_keys_drop_ever_succeeded_when_any_arm_has_no_ics() -> None:
+    from resetsweep.sweep.stats import rung0_group_keys
+
+    keys = rung0_group_keys(
+        {"uniform": [_run(ever=NAN)], "walk_low": [_run(ever=0.1)], "walk_high": [_run(ever=0.9)]}
+    )
+
+    # Same AUC, reward share and steps: without the dropped component all three tie.
+    assert keys["uniform"] == keys["walk_low"] == keys["walk_high"] == (0.0, 0.0, -math.inf)
+
+
+def test_group_keys_keep_ever_succeeded_when_every_arm_has_it() -> None:
+    from resetsweep.sweep.stats import rung0_group_keys
+
+    keys = rung0_group_keys({"low": [_run(ever=0.1)], "high": [_run(ever=0.9)]})
+
+    assert keys["low"] < keys["high"]
+    assert keys["high"] == pytest.approx((0.0, 0.0, -math.inf, 0.9))
+
+
+def test_group_keys_still_order_by_earlier_components_with_nan_present() -> None:
+    from resetsweep.sweep.stats import rung0_group_keys
+
+    keys = rung0_group_keys(
+        {"none": [_run(ever=NAN)], "reached": [_run(ever=0.1, reached=True, steps=5)]}
+    )
+
+    assert keys["none"] < keys["reached"]
+    assert not any(math.isnan(c) for k in keys.values() for c in k)

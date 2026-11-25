@@ -41,7 +41,8 @@ Decisions (all binding rulings unless marked "ours"):
   the group's non-failed arms at that rung; 1.0, the AUC range, if fewer than 2 have results).
   An arm with no result yet (n = 0, e.g. a rung-1 expansion) has UCB +inf and LCB -inf: it is
   explored first and can be neither pruned nor the leader until it has a result.
-- Rung 0: the "mean" is the `rung0_key` order rank-transformed to [0, 1] within the group (ties
+- Rung 0: the "mean" is the `rung0_group_keys` order (NaN ever-succeeded share neutral)
+  rank-transformed to [0, 1] within the group (ties
   share the average rank). Every arm has one seed there, so the spread term is the same for
   all arms and UCB order equals rank order; rung 0 only uses it to rank promotions, and
   pruning starts at rung 1.
@@ -110,7 +111,7 @@ import numpy as np
 
 from resetsweep.ppo.update import PPOConfig
 from resetsweep.sweep.arms import SPARSE_TASKS, Arm, Kw, arm_space
-from resetsweep.sweep.stats import iqm, rung0_key
+from resetsweep.sweep.stats import iqm, rung0_group_keys
 from resetsweep.train import RunResult, RunSpec
 
 _log = logging.getLogger(__name__)
@@ -608,7 +609,7 @@ class Scheduler:
         return jobs
 
     def _rung0_ranks(self, members: Sequence[int]) -> dict[int, float]:
-        keys = {i: rung0_key(self._rung_results(i, 0)) for i in members}
+        keys = rung0_group_keys({i: self._rung_results(i, 0) for i in members})
         m = len(keys)
         ranks: dict[int, float] = {}
         for i, key in keys.items():

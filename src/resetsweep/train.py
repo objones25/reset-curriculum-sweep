@@ -142,7 +142,9 @@ def _plain(value: object, path: str) -> object:
 class RunResult:
     """Outcome of one run. `ever_succeeded_share` is `1 - never_succeeded_share` from the
     method's last diagnostics, and NaN for methods without per-IC outcomes (uniform, point,
-    visited): ranking code must treat NaN as "not applicable", not as 0."""
+    visited): ranking code must treat NaN as "not applicable", not as 0. `reached_reward` and
+    `steps_to_first_reward` come from eval (task-start states): the env-step count at the first
+    eval in which any eval episode had a reward > 0 (final-review I4)."""
 
     arm_id: str
     seed: int
@@ -226,7 +228,9 @@ class Rollout:
     ic_versions: Tensor | None
     outcomes: list[Outcomes]
     next_obs: Tensor
-    first_reward_step: Tensor  # () long: counter total at the first reward > 0, or -1
+    # () long: counter total at the first reward > 0 in any training (curriculum) episode, or
+    # -1. Logged per iteration only; RunResult uses the eval-based step instead (I4).
+    first_reward_step: Tensor
 
 
 def collect_rollout(
@@ -389,13 +393,15 @@ class Evaluator:
             )
         )
 
-    def run(self, policy: Callable[[Tensor], Tensor]) -> tuple[float, float]:
-        """`(success rate, mean return)` over the fixed states under `policy`."""
+    def run(self, policy: Callable[[Tensor], Tensor]) -> tuple[float, float, float]:
+        """`(success rate, mean return, share of episodes whose reward was ever > 0)` over the
+        fixed states under `policy`."""
         env = self._env
         self._gen.manual_seed(self._seed)
         n, d = env.num_envs, env.device
         done = torch.zeros(n, dtype=torch.bool, device=d)
         success = torch.zeros(n, dtype=torch.bool, device=d)
+        reached = torch.zeros(n, dtype=torch.bool, device=d)
         ret = torch.zeros(n, device=d)
         obs = env.reset_all(stagger=False)
         # Every episode lasts at most max_steps, so max_steps steps finish each env once.
@@ -405,12 +411,13 @@ class Evaluator:
                 o = out.outcomes
                 first = ~done[o.env_ids]
                 success[o.env_ids] = torch.where(first, o.success, success[o.env_ids])
+                reached[o.env_ids] = torch.where(first, o.reached_reward, reached[o.env_ids])
                 ret[o.env_ids] = torch.where(first, o.ret, ret[o.env_ids])
                 done[o.env_ids] = True
             obs = out.obs
         if not bool(done.all()):
             raise RuntimeError("eval ended with envs that never finished an episode")
-        return float(success.float().mean()), float(ret.mean())
+        return float(success.float().mean()), float(ret.mean()), float(reached.float().mean())
 
 
 # --- metrics helpers -------------------------------------------------------------------------
@@ -715,12 +722,18 @@ def run(spec: RunSpec, sink: MetricsSink) -> RunResult:
 
     curve_steps: list[int] = []
     curve_success: list[float] = []
+    # RunResult's reached_reward / steps_to_first_reward (final-review I4): the first eval at
+    # which any eval episode (task-start states) reached reward, so curriculum starts near the
+    # goal cannot win the rung-0 tie-break without learning.
+    first_eval_reward: list[int] = []
 
     def evaluate() -> dict[str, float]:
-        success, ret = parts.evaluator.run(policy)
+        success, ret, reached = parts.evaluator.run(policy)
         curve_steps.append(counter.total)
         curve_success.append(success)
-        return {"eval/success": success, "eval/return": ret}
+        if reached > 0 and not first_eval_reward:
+            first_eval_reward.append(counter.total)
+        return {"eval/success": success, "eval/return": ret, "eval/reached_reward": reached}
 
     sink.log(counter.total, {"env_steps/total": float(counter.total), **evaluate()})
     next_eval = spec.eval_every_steps
@@ -787,7 +800,7 @@ def run(spec: RunSpec, sink: MetricsSink) -> RunResult:
         sink.log(counter.total, data)
         it += 1
 
-    first = int(first_reward)
+    first = first_eval_reward[0] if first_eval_reward else -1
     never = diag.get("never_succeeded_share", float("nan"))
     result = RunResult(
         arm_id=spec.arm_id(),

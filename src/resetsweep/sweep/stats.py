@@ -118,8 +118,9 @@ def rung0_key(results: Sequence[RunResult]) -> tuple[float, float, float, float]
     - A run with ``steps_to_first_reward is None`` counts as infinite steps, so a median of
       infinity gives ``-inf`` in the key (worse than any finite step count).
     - ``ever_succeeded_share`` is NaN for methods without per-IC outcomes. NaN entries are
-      dropped from the mean; if none are finite the component is ``-inf``: "no information"
-      ranks below every finite share, and the key never contains NaN, so it stays a total order.
+      dropped from the mean; if none are finite the component is ``-inf``, so the key never
+      contains NaN and stays a total order. Rankings compare arms with `rung0_group_keys`,
+      which treats "no information" as neutral by dropping the component for the group.
     """
     ok = [r for r in results if r.status == "ok"]
     if not ok:
@@ -135,3 +136,20 @@ def rung0_key(results: Sequence[RunResult]) -> tuple[float, float, float, float]
     ]
     ever_mean = sum(ever) / len(ever) if ever else -math.inf
     return (auc_iqm, reached, -float(np.median(steps)), ever_mean)
+
+
+def _has_no_ic_info(results: Sequence[RunResult]) -> bool:
+    return all(math.isnan(r.ever_succeeded_share) for r in results if r.status == "ok")
+
+
+def rung0_group_keys[K](groups: Mapping[K, Sequence[RunResult]]) -> dict[K, tuple[float, ...]]:
+    """`rung0_key` for every arm of one ranking group, compared within the group.
+
+    ``ever_succeeded_share`` is NaN for methods without per-IC outcomes (uniform, point,
+    visited). It is neutral, not worst (final-review ruling I4): when any arm in the group has
+    no finite share, the component is dropped for the whole group, so the keys are 3-tuples
+    that stay a total order. Otherwise the full 4-tuples are returned."""
+    keys = {k: rung0_key(v) for k, v in groups.items()}
+    if any(_has_no_ic_info(v) for v in groups.values()):
+        return {k: key[:3] for k, key in keys.items()}
+    return dict(keys)
