@@ -44,12 +44,12 @@ class Task(Protocol):
 
 
 @runtime_checkable
-class ControlsAction(Protocol):
+class AppliesForce(Protocol):
     """Optional hook: tasks whose dynamics depend on where the agent is (a pit that pulls it
-    back) turn the policy's action into the sim control. `VecEnv.step` calls it when present;
-    without it the action goes to the sim unchanged."""
+    back and slows it) return the generalized force `(nworld, nv)` to apply, or None. Called
+    before every physics substep by `resetsweep.sim.dynamics.step_task`."""
 
-    def control(self, sim: BatchSim, extra: Tensor, action: Tensor) -> Tensor: ...
+    def applied_force(self, sim: BatchSim, extra: Tensor) -> Tensor | None: ...
 
 
 @runtime_checkable

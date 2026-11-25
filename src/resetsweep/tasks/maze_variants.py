@@ -18,7 +18,7 @@ from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
 from resetsweep.tasks.base import TASKS
-from resetsweep.tasks.maze import FORCE_LIMIT_N, Maze, MazeGrid
+from resetsweep.tasks.maze import LANE_CELLS, Maze, MazeGrid
 from resetsweep.types import StartStates
 
 
@@ -50,21 +50,22 @@ def _rect_mask(grid: MazeGrid, rect: tuple[int, int, int, int]) -> Tensor:
 
 # --- T3: trap and twin -----------------------------------------------------
 
-# The pit pulls the point toward its centre with a constant 6 N (ramped over 5 cm so the point
-# can rest at the centre). The motors give 4 N per axis, at most 5.7 N along a diagonal, so
-# from rest nothing inside the pit gets out: the lip needs more than the motors have. Constant
-# magnitude toward a point also means the pull's component across any edge of a square pit is
-# at least 6 / sqrt(2) = 4.24 N, above one motor's 4 N, so edges and corners are no weaker. The
-# twin's motors get gain 2 inside the pit (8 N per axis), which nets 2 N or more outward.
-_PIT_PULL_N = 6.0
+# Inside the pit the sim gets an applied force: a constant-magnitude pull toward the pit centre
+# (ramped over 5 cm so the point can rest there) and linear drag. The motors give 4 N per axis,
+# at most 5.7 N along a diagonal, so against the trap's 6 N pull nothing escapes from rest. The
+# pull alone is conservative, though: a controller can pump energy by pushing along its velocity
+# and orbit out (a circular orbit at r = 0.4 m needs 1.55 m/s). Drag kills that: sustaining speed
+# v costs 10 v newtons, so the motors can hold at most about 0.57 m/s, and an orbit of radius r
+# needs sqrt(6 r) m/s, which only exists for r below about 5 cm, inside the pull's ramp.
+# The twin has the same walls, MJCF, pit and drag but a 2 N pull, which the motors beat (net 2 N
+# outward from rest, terminal speed 0.2 m/s).
 _PIT_RAMP_M = 0.05
-_TWIN_PIT_GAIN = 2.0
-# The motors' range must hold the largest control `control` produces: gain plus the pull.
-_TRAP_CTRL_LIMIT = _TWIN_PIT_GAIN + _PIT_PULL_N / FORCE_LIMIT_N
+_PIT_DRAG_N_S_M = 10.0
+_TRAP_PULL_N = 6.0
+_TWIN_PULL_N = 2.0
 _TRAP_LANE_ROWS = (
     5  # wide lanes: a pit up to 3 cells across leaves a free row on each side
 )
-_LANE_CELLS_FREE = 8  # free cells per lane along x (maze.py's `_LANE_CELLS`)
 _PIT_BASE_CELLS = 2  # pit side at trap_scale 1
 _PIT_SIDE_CELLS_MAX = 3
 
@@ -72,7 +73,7 @@ _PIT_SIDE_CELLS_MAX = 3
 class _MazeTrap(Maze):
     """First lane holds a square pit at its middle; `trap_scale` scales its side length."""
 
-    pit_gain: float
+    pit_pull_n: float
 
     def __init__(self, trap_scale: float = 1.0) -> None:
         if trap_scale <= 0:
@@ -82,13 +83,12 @@ class _MazeTrap(Maze):
             passage_width=0.4,
             layout="horizontal",
             lane_rows=_TRAP_LANE_ROWS,
-            ctrl_limit=_TRAP_CTRL_LIMIT,
         )
         side = min(
             max(math.floor(_PIT_BASE_CELLS * trap_scale + 0.5), 1), _PIT_SIDE_CELLS_MAX
         )
         row_lo = 1 + (_TRAP_LANE_ROWS - side) // 2
-        col_lo = 1 + (_LANE_CELLS_FREE - side) // 2
+        col_lo = 1 + (LANE_CELLS - side) // 2
         self.pit_rect = (row_lo, row_lo + side - 1, col_lo, col_lo + side - 1)
         pit = _rect_mask(self.grid, self.pit_rect)
         self._in_pit = _CellMask(self.grid, pit)
@@ -101,24 +101,20 @@ class _MazeTrap(Maze):
     def diagnostic_region(self, qpos: Tensor) -> Tensor:
         return self._in_pit(qpos)
 
-    def control(self, sim: BatchSim, extra: Tensor, action: Tensor) -> Tensor:
-        """Motor command: the action (clamped to the motors' unit range) times the pit gain, plus
-        the pit's pull toward its centre, in units of the motor's full force."""
+    def applied_force(self, sim: BatchSim, extra: Tensor) -> Tensor:
+        """Generalized force (N, the joints are slides): pull toward the pit centre minus drag,
+        inside the pit; zero elsewhere."""
         xy = sim.qpos
         inside = self._in_pit(xy).unsqueeze(1)
         offset = self._centre(xy.device) - xy
         dist = offset.norm(dim=1, keepdim=True)
         pull = (
-            _PIT_PULL_N
-            / FORCE_LIMIT_N
+            self.pit_pull_n
             * (dist / _PIT_RAMP_M).clamp(max=1.0)
             * offset
             / dist.clamp(min=1e-9)
         )
-        gain = torch.where(inside, self.pit_gain, 1.0)
-        return action.clamp(-1.0, 1.0) * gain + torch.where(
-            inside, pull, torch.zeros_like(pull)
-        )
+        return torch.where(inside, pull - _PIT_DRAG_N_S_M * sim.qvel, 0.0)
 
     def _centre(self, device: torch.device) -> Tensor:
         cached = self._centre_on_device.get(device)
@@ -132,15 +128,15 @@ class MazeTrap(_MazeTrap):
     """Pit the point cannot climb out of: full motor force (4 N) loses to the 6 N pull."""
 
     name = "maze_trap"
-    pit_gain = 1.0
+    pit_pull_n = _TRAP_PULL_N
 
 
 @TASKS.register("maze_trap_twin")
 class MazeTrapTwin(_MazeTrap):
-    """`maze_trap` with identical MJCF and walls, but motors with gain 2 inside the pit."""
+    """`maze_trap` with identical MJCF, walls and pit, but a 2 N pull the motors can beat."""
 
     name = "maze_trap_twin"
-    pit_gain = _TWIN_PIT_GAIN
+    pit_pull_n = _TWIN_PULL_N
 
 
 # --- T4: infeasible mass ---------------------------------------------------
@@ -231,8 +227,8 @@ class MazeCoinflip(Maze):
 
     `extra = (draw, started_in_block)`. `init_extra` makes the draw at every episode start. An
     episode that started in the block has `success_now == draw` whatever the policy does; any
-    other episode succeeds by reaching the goal. The block is off the path from the start, so
-    the task's own start is solved normally.
+    other episode succeeds by reaching the goal. The block is in lane 1, which the shortest path
+    crosses, but only where an episode starts matters, and the task's own start is outside it.
     """
 
     name = "maze_coinflip"
@@ -251,7 +247,9 @@ class MazeCoinflip(Maze):
         return StartStates(base.qpos, base.qvel, self.init_extra(base, gen))
 
     def init_extra(self, states: StartStates, gen: torch.Generator) -> Tensor:
-        draw = (torch.rand(states.n, generator=gen) < _P_COIN).to(states.qpos.device)
+        draw = (torch.rand(states.n, generator=gen, device=gen.device) < _P_COIN).to(
+            states.qpos.device
+        )
         started_in_block = self._in_block(states.qpos)
         return torch.stack([draw.float(), started_in_block.float()], dim=1)
 

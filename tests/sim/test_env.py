@@ -378,17 +378,20 @@ def test_rejects_generator_on_wrong_device(make_task: Callable[..., Task]) -> No
         )
 
 
-def test_task_control_hook_sets_the_ctrl_the_sim_receives(
+def test_task_applied_force_hook_acts_on_the_sim(
     make_task: Callable[..., Task],
 ) -> None:
     task = make_task()
-    task.control = lambda sim, extra, action: action + 0.25  # pyright: ignore[reportAttributeAccessIssue] # optional hook, set on the instance
-    env, _, _ = _env(task)
-    env.reset_all()
+    task.applied_force = lambda sim, extra: torch.full_like(sim.qvel, 3.0)  # pyright: ignore[reportAttributeAccessIssue] # optional hook, set on the instance
+    pushed, _, _ = _env(task)
+    plain, _, _ = _env(make_task())
+    pushed.reset_all()
+    plain.reset_all()
 
-    env.step(_zeros())
+    pushed.step(_zeros())
+    plain.step(_zeros())
 
-    assert env.sim.ctrl.tolist() == [[0.25]] * NUM_ENVS
+    assert not torch.allclose(pushed.sim.qvel, plain.sim.qvel)
 
 
 def test_task_init_extra_hook_overrides_extra_the_method_supplied(

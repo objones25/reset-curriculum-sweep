@@ -6,7 +6,8 @@ import torch
 from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
-from resetsweep.tasks.base import ControlsAction, InitsExtra, Task
+from resetsweep.sim.dynamics import step_task
+from resetsweep.tasks.base import InitsExtra, Task
 from resetsweep.types import (
     InvalidStartState,
     Outcomes,
@@ -121,11 +122,7 @@ class VecEnv:
                 f"action shape {tuple(action.shape)}, expected {tuple(self.sim.ctrl.shape)}"
             )
         self._counter.add_train(self.num_envs)
-        self.sim.step(
-            self.task.control(self.sim, self.extra, action)
-            if isinstance(self.task, ControlsAction)
-            else action
-        )
+        step_task(self.task, self.sim, self.extra, action)
         self._t += 1
         self.ep_step += 1
 

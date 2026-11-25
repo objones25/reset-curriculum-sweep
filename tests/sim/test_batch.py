@@ -140,3 +140,61 @@ def test_set_state_rejects_row_count_mismatch(pendulum_mjcf: str) -> None:
         sim.set_state(torch.tensor([1, 3]), torch.zeros((2, 1)), torch.zeros((3, 1)))
     with pytest.raises(ValueError, match="row count"):
         sim.set_state(torch.tensor([1, 3]), torch.zeros((1, 1)), torch.zeros((1, 1)))
+
+
+def test_applied_force_is_evaluated_every_substep(pendulum_mjcf: str) -> None:
+    sim = _make(pendulum_mjcf)
+    calls: list[float] = []
+
+    def force(s: BatchSim) -> torch.Tensor:
+        calls.append(float(s.qvel[0, 0]))
+        return torch.full((NWORLD, 1), 0.5)
+
+    sim.step(torch.zeros(NWORLD, 1), applied_force=force)
+
+    assert len(calls) == FRAME_SKIP
+    assert calls[0] == 0.0
+    assert calls[-1] > calls[0]  # later substeps see the velocity the force produced
+
+
+def test_applied_force_accelerates_like_the_same_actuator_torque(
+    pendulum_mjcf: str,
+) -> None:
+    pushed, driven = _make(pendulum_mjcf), _make(pendulum_mjcf)
+
+    for _ in range(10):
+        pushed.step(
+            torch.zeros(NWORLD, 1),
+            applied_force=lambda _s: torch.full((NWORLD, 1), 0.3),
+        )
+        driven.step(torch.full((NWORLD, 1), 0.3))  # the motor has gear 1
+
+    assert torch.allclose(pushed.qvel, driven.qvel, atol=1e-5)
+
+
+def test_applied_force_does_not_leak_into_a_later_step_without_one(
+    pendulum_mjcf: str,
+) -> None:
+    sim, ref = _make(pendulum_mjcf), _make(pendulum_mjcf)
+    sim.step(
+        torch.zeros(NWORLD, 1), applied_force=lambda _s: torch.full((NWORLD, 1), 1.0)
+    )
+    ref.step(
+        torch.zeros(NWORLD, 1), applied_force=lambda _s: torch.full((NWORLD, 1), 1.0)
+    )
+    v_before = sim.qvel.clone()
+
+    sim.step(torch.zeros(NWORLD, 1))
+    ref.step(torch.zeros(NWORLD, 1), applied_force=lambda _s: torch.zeros(NWORLD, 1))
+
+    assert torch.equal(sim.qvel, ref.qvel)
+    assert not torch.equal(sim.qvel, v_before)
+
+
+def test_applied_force_of_wrong_shape_is_rejected(pendulum_mjcf: str) -> None:
+    sim = _make(pendulum_mjcf)
+
+    with pytest.raises(ValueError, match="applied force"):
+        sim.step(
+            torch.zeros(NWORLD, 1), applied_force=lambda _s: torch.zeros(NWORLD, 3)
+        )

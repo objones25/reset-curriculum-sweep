@@ -1,5 +1,7 @@
 """Trap, twin, infeasible-mass and coin-flip maze variants (spec §5.3 T3-T5)."""
 
+from collections.abc import Callable
+
 import mujoco
 import pytest
 import torch
@@ -7,6 +9,7 @@ from controllers import MazePathFollower, _FixedStartMethod, run_first_episode
 from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
+from resetsweep.sim.dynamics import step_task
 from resetsweep.sim.env import VecEnv
 from resetsweep.tasks.base import TASKS, Task
 from resetsweep.tasks.maze import MazeGrid, build_maze
@@ -118,31 +121,170 @@ def test_twin_has_identical_geometry_to_the_trap() -> None:
     assert twin.pit_rect == trap.pit_rect  # pyright: ignore[reportAttributeAccessIssue] # trap tasks expose their pit
 
 
-def test_control_leaves_the_action_alone_outside_the_pit() -> None:
+def _sim_at(task: Task, xy: list[float], vel: list[float]) -> BatchSim:
+    sim = BatchSim(task.mjcf, nworld=1, device="cpu", frame_skip=task.frame_skip)
+    sim.set_state(torch.arange(1), torch.tensor([xy]), torch.tensor([vel]))
+    return sim
+
+
+def test_no_applied_force_outside_the_pit() -> None:
     task = _task("maze_trap")
     grid = _grid(task)
-    outside = grid.centre(grid.start_cell).tolist()
-    sim = BatchSim(task.mjcf, nworld=1, device="cpu", frame_skip=task.frame_skip)
-    sim.set_state(torch.arange(1), torch.tensor([outside]), torch.zeros(1, 2))
-    action = torch.tensor([[0.5, -1.0]])
+    sim = _sim_at(task, grid.centre(grid.start_cell).tolist(), [1.0, -1.0])
 
-    ctrl = task.control(sim, torch.zeros(1, 0), action)  # pyright: ignore[reportAttributeAccessIssue] # trap tasks control the action
+    force = task.applied_force(sim, torch.zeros(1, 0))  # pyright: ignore[reportAttributeAccessIssue] # trap tasks apply a force
 
-    assert ctrl.tolist() == [[0.5, -1.0]]
+    assert force.tolist() == [[0.0, 0.0]]
 
 
-def test_control_inside_the_pit_pulls_back_to_the_pit_centre() -> None:
+def test_applied_force_in_the_pit_is_pull_to_the_centre_plus_drag() -> None:
     task = _task("maze_trap")
-    grid = _grid(task)
-    centre = _rect_centre(grid, task.pit_rect)  # pyright: ignore[reportAttributeAccessIssue] # trap tasks expose their pit
-    above = [centre[0], centre[1] + 0.1]  # inside the pit cell, off its centre line
-    sim = BatchSim(task.mjcf, nworld=1, device="cpu", frame_skip=task.frame_skip)
-    sim.set_state(torch.arange(1), torch.tensor([above]), torch.zeros(1, 2))
+    centre = _rect_centre(_grid(task), task.pit_rect)  # pyright: ignore[reportAttributeAccessIssue] # trap tasks expose their pit
+    above = [centre[0], centre[1] + 0.1]  # inside the pit, off its centre
+    sim = _sim_at(task, above, [0.2, 0.0])
 
-    ctrl = task.control(sim, torch.zeros(1, 0), torch.zeros(1, 2))  # pyright: ignore[reportAttributeAccessIssue] # trap tasks control the action
+    force = task.applied_force(sim, torch.zeros(1, 0))  # pyright: ignore[reportAttributeAccessIssue]
 
-    assert float(ctrl[0, 0]) == pytest.approx(0.0)
-    assert float(ctrl[0, 1]) < -1.0  # pull is stronger than the motor's full force
+    assert force[0, 0].item() == pytest.approx(
+        -10.0 * 0.2
+    )  # drag only; no lateral pull
+    assert force[0, 1].item() == pytest.approx(-6.0)  # the pull, 6 N toward the centre
+
+
+def test_trap_mjcf_keeps_the_motors_clamped_to_unit_range() -> None:
+    model = mujoco.MjModel.from_xml_string(_task("maze_trap").mjcf)  # pyright: ignore[reportAttributeAccessIssue] # no stub for the C-extension class
+
+    assert model.actuator_ctrlrange.tolist() == [[-1.0, 1.0], [-1.0, 1.0]]
+
+
+def test_direct_step_task_matches_vecenv_in_pit() -> None:
+    task = _task("maze_trap")
+    centre = _rect_centre(_grid(task), task.pit_rect)  # pyright: ignore[reportAttributeAccessIssue] # trap tasks expose their pit
+    start = [centre[0] + 0.15, centre[1] - 0.1]
+    gen = torch.Generator().manual_seed(3)
+    actions = torch.sign(torch.randn(60, 1, 2, generator=gen))
+    env = VecEnv(
+        task,
+        num_envs=1,
+        device="cpu",
+        counter=StepCounter(budget=1000),
+        gen=torch.Generator().manual_seed(0),
+    )
+    env.bind(
+        _FixedStartMethod(
+            task, torch.Generator().manual_seed(0), _one_start(task, start)
+        )
+    )
+    env.reset_all()
+    env.ep_step.zero_()
+    bare = _sim_at(task, start, [0.0, 0.0])
+    extra = torch.zeros(1, 0)
+
+    for action in actions:
+        env.step(action)
+        step_task(task, bare, extra, action)
+
+    assert torch.equal(env.sim.qpos, bare.qpos)
+    assert torch.equal(env.sim.qvel, bare.qvel)
+
+
+# --- adversarial controllers: the trap must hold against energy pumping -----
+
+ADVERSARY_STEPS = 200  # 10 s
+RANDOM_WALK_ENVS = 256
+BANG_BANG_PERIODS = (4, 6, 8, 10, 12, 16, 20, 24)
+
+
+def _escaped_fraction(
+    task: Task, policy: Callable[[VecEnv, int, torch.Generator], Tensor], num_envs: int
+) -> float:
+    """Fraction of envs that leave the pit at any point, all starting at rest at its centre."""
+    gen = torch.Generator().manual_seed(1)
+    centre = _rect_centre(_grid(task), task.pit_rect)  # pyright: ignore[reportAttributeAccessIssue] # trap tasks expose their pit
+    env = VecEnv(
+        task,
+        num_envs=num_envs,
+        device="cpu",
+        counter=StepCounter(budget=10 * num_envs * ADVERSARY_STEPS),
+        gen=gen,
+    )
+    env.bind(_FixedStartMethod(task, gen, _one_start(task, centre)))
+    env.reset_all()
+    env.ep_step.zero_()
+    left = torch.zeros(num_envs, dtype=torch.bool)
+    for t in range(ADVERSARY_STEPS):
+        env.step(policy(env, t, gen))
+        left |= ~_region(task, env.sim.qpos)
+    return float(left.float().mean())
+
+
+def _orbit(centre: list[float], outward: float) -> Callable[..., Tensor]:
+    """Full force tangent to the circle around `centre` (plus `outward` along the radius): the
+    way to pump a conservative well."""
+    centre_t = torch.tensor(centre)
+
+    def policy(env: VecEnv, _t: int, _gen: torch.Generator) -> Tensor:
+        off = env.sim.qpos - centre_t
+        dist = off.norm(dim=1, keepdim=True)
+        radial = torch.where(
+            dist > 1e-3, off / dist.clamp(min=1e-3), torch.tensor([1.0, 0.0])
+        )
+        tangent = torch.stack([-radial[:, 1], radial[:, 0]], dim=1)
+        push = tangent + outward * radial
+        return push / push.abs().amax(dim=1, keepdim=True)
+
+    return policy
+
+
+def _bang_bang(env: VecEnv, t: int, _gen: torch.Generator) -> Tensor:
+    """Env i flips the sign of a full push every `BANG_BANG_PERIODS[i // 4]` steps, along one of
+    four directions: resonance with whatever oscillation the well supports."""
+    n = env.num_envs
+    period = torch.tensor(BANG_BANG_PERIODS).repeat_interleave(
+        n // len(BANG_BANG_PERIODS)
+    )
+    direction = torch.tensor(EXITS[4:] + EXITS[:4]).repeat(n // 8, 1)[:n]
+    sign = torch.where((t // period) % 2 == 0, 1.0, -1.0).unsqueeze(1)
+    return sign * direction
+
+
+def _random_sign_walk(env: VecEnv, t: int, gen: torch.Generator) -> Tensor:
+    """Random sign actions, each held for 4 steps."""
+    if t % 4 == 0:
+        env.held = torch.sign(torch.randn(env.num_envs, 2, generator=gen))  # pyright: ignore[reportAttributeAccessIssue] # scratch attribute on the test's env
+    return env.held  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _adversary_runs(task: Task) -> dict[str, float]:
+    centre = _rect_centre(_grid(task), task.pit_rect)  # pyright: ignore[reportAttributeAccessIssue] # trap tasks expose their pit
+    return {
+        "orbit": _escaped_fraction(task, _orbit(centre, 0.0), 1),
+        "orbit_spiralling_out": _escaped_fraction(task, _orbit(centre, 0.5), 1),
+        "bang_bang": _escaped_fraction(task, _bang_bang, 8 * len(BANG_BANG_PERIODS)),
+        "random_sign_walk": _escaped_fraction(
+            task, _random_sign_walk, RANDOM_WALK_ENVS
+        ),
+    }
+
+
+def test_trap_holds_against_energy_pumping_controllers() -> None:
+    escapes = _adversary_runs(_task("maze_trap"))
+
+    assert escapes == {
+        "orbit": 0.0,
+        "orbit_spiralling_out": 0.0,
+        "bang_bang": 0.0,
+        "random_sign_walk": 0.0,
+    }
+
+
+def test_twin_escapes_adversaries_that_push_outward() -> None:
+    # Pure orbiting and zero-mean bang-bang have no outward intent, and the twin's drag stops
+    # them too; what must differ from the trap is that any outward push gets out.
+    escapes = _adversary_runs(_task("maze_trap_twin"))
+
+    assert escapes["orbit_spiralling_out"] == 1.0
+    assert escapes["random_sign_walk"] > 0.02
 
 
 def test_trap_scale_grows_the_pit() -> None:
@@ -323,6 +465,19 @@ def test_init_extra_draws_a_fair_coin_for_block_starts_and_flags_them() -> None:
     assert float(drawn[:, 0].mean()) == pytest.approx(0.5, abs=0.02)
     assert bool((drawn[:, 1] == 1.0).all())
     assert bool((other[:, 1] == 0.0).all())
+
+
+@pytest.mark.gpu
+def test_init_extra_draws_on_a_cuda_generator() -> None:
+    task = _task("maze_coinflip")
+    states = _block_start(task, 64)
+    on_cuda = StartStates(states.qpos.cuda(), states.qvel.cuda(), states.extra.cuda())
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    drawn = task.init_extra(on_cuda, gen)  # pyright: ignore[reportAttributeAccessIssue] # coinflip task draws extra at reset
+
+    assert drawn.device.type == "cuda"
+    assert drawn.shape == (64, 2)
 
 
 def test_coinflip_rate_near_half() -> None:

@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
+from resetsweep.sim.dynamics import step_task
 from resetsweep.sim.env import VecEnv
 from resetsweep.tasks.base import Task
 from resetsweep.tasks.maze import MazeGrid
@@ -275,7 +276,7 @@ class SamplingPlanner:
         self._sim.set_state(torch.arange(self._n * self._k), q, v)
         total = torch.zeros(self._n * self._k)
         for t in range(self._h):
-            self._sim.step(flat[:, t])
+            step_task(self._task, self._sim, e, flat[:, t])
             total += self._task.reward(self._sim, e, flat[:, t])
         return total.reshape(self._n, self._k)
 

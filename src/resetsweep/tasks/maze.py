@@ -29,7 +29,7 @@ MAX_SPEED_M_S = FORCE_LIMIT_N / _DAMPING_N_S_M
 _CONTROL_DT_S = 0.05
 _FRAME_SKIP = 5
 _HOLD_STEPS = 10  # 0.5 s in the goal cell
-_LANE_CELLS = 8  # corridor length of each lane, in cells
+LANE_CELLS = 8  # corridor length of each lane, in cells
 _BALL_RADIUS_CELLS = (
     0.3  # of the passage width, so the ball is 60% as wide as the corridor
 )
@@ -172,16 +172,16 @@ def _horizontal_occupancy(
     """Serpentine with horizontal lanes `lane_rows` cells thick, one wall row between them, joined
     by a one-cell gap in that wall. Lane i starts at row `i * (lane_rows + 1) + 1`."""
     pitch = lane_rows + 1
-    rows, cols = lanes * pitch + 1, _LANE_CELLS + 2
+    rows, cols = lanes * pitch + 1, LANE_CELLS + 2
     occupied = [[True] * cols for _ in range(rows)]
     for lane in range(lanes):
         for row in range(lane * pitch + 1, lane * pitch + 1 + lane_rows):
-            for col in range(1, _LANE_CELLS + 1):
+            for col in range(1, LANE_CELLS + 1):
                 occupied[row][col] = False
     for lane in range(1, lanes):
-        gap_col = _LANE_CELLS if lane % 2 == 1 else 1
+        gap_col = LANE_CELLS if lane % 2 == 1 else 1
         occupied[lane * pitch][gap_col] = False
-    goal_col = _LANE_CELLS if (lanes - 1) % 2 == 0 else 1
+    goal_col = LANE_CELLS if (lanes - 1) % 2 == 0 else 1
     return occupied, (1, 1), ((lanes - 1) * pitch + 1, goal_col)
 
 
@@ -247,7 +247,6 @@ def build_maze(
     lane_rows: int = 1,
     pad_cells: int = 0,
     pockets: tuple[tuple[int, int], ...] = (),
-    ctrl_limit: float = 1.0,
 ) -> tuple[str, MazeGrid]:
     """MJCF and occupancy grid of a serpentine maze with `lanes` lanes.
 
@@ -256,7 +255,6 @@ def build_maze(
     `lane_rows` is the lane thickness in cells, `pad_cells` extra wall cells all around, and
     `pockets` are `(row, col)` wall cells of the final grid turned into free cells. Each must
     be sealed off from the maze: the grid then has islands with no path to the goal.
-    `ctrl_limit` is the motors' control range (1 unless a task adds force through `control`).
     """
     if lanes <= 0 or passage_width <= 0 or lane_rows <= 0 or pad_cells < 0:
         raise ValueError(
@@ -289,7 +287,7 @@ def build_maze(
     dist = _distances(occupied)
     _check_connectivity(occupied, dist, start, pockets)
     grid = MazeGrid(occupied, passage_width, start, goal, dist)
-    return _mjcf(grid, ctrl_limit), grid
+    return _mjcf(grid), grid
 
 
 def _check_connectivity(
@@ -310,7 +308,7 @@ def _check_connectivity(
         raise ValueError("maze has disconnected free cells")
 
 
-def _mjcf(grid: MazeGrid, ctrl_limit: float) -> str:
+def _mjcf(grid: MazeGrid) -> str:
     cell = grid.cell_m
     half_height = cell
     walls = []
@@ -333,8 +331,8 @@ def _mjcf(grid: MazeGrid, ctrl_limit: float) -> str:
     </body>
   </worldbody>
   <actuator>
-    <motor joint="x" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-{ctrl_limit} {ctrl_limit}"/>
-    <motor joint="y" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-{ctrl_limit} {ctrl_limit}"/>
+    <motor joint="x" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor joint="y" gear="{FORCE_LIMIT_N}" ctrllimited="true" ctrlrange="-1 1"/>
   </actuator>
 </mujoco>
 """
@@ -386,8 +384,7 @@ class _Maze:
             torch.tensor([self.grid.cols, self.grid.rows], dtype=torch.float32)
             * passage_width
         )
-        # Margin over the fastest reachable speed: terminal speed at the largest control.
-        speed = torch.full((2,), MAX_SPEED_M_S * build.get("ctrl_limit", 1.0) * 1.25)
+        speed = torch.full((2,), MAX_SPEED_M_S * 1.25)
         self.start_box = Box(
             torch.cat([torch.zeros(2), -speed]), torch.cat([extent, speed])
         )
