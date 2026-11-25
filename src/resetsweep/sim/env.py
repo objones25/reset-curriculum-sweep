@@ -100,11 +100,21 @@ class VecEnv:
     def bind(self, method: _ResetMethod) -> None:
         self._method = method
 
-    def reset_all(self) -> Tensor:
-        """Start every env from the method, with clocks staggered so episodes end at different times."""
+    @property
+    def ic_ids(self) -> Tensor:
+        """`(num_envs,)` ic id of each env's current episode (a copy)."""
+        return self._ic_ids.clone()
+
+    def reset_all(self, *, stagger: bool = True) -> Tensor:
+        """Start every env from the method. With `stagger` (training), clocks get random
+        offsets so episodes end at different times and these first episodes are not `full`.
+        Without it (evaluation), every clock starts at 0, so each env plays one full episode
+        from the state the method returned."""
         method = self._require_method()
         env_ids = torch.arange(self.num_envs, device=self.device)
-        self._start_episodes(method, env_ids, None, full=False)
+        self._start_episodes(method, env_ids, None, full=not stagger)
+        if not stagger:
+            return self.task.observe(self.sim, self.extra)
         offsets = torch.randint(
             0,
             self.task.max_steps,

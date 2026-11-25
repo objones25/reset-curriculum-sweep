@@ -474,3 +474,30 @@ def test_init_extra_hook_with_wrong_shape_is_rejected(
 
     with pytest.raises(ValueError, match="init_extra"):
         env.reset_all()
+
+
+def test_reset_all_without_stagger_plays_one_full_episode_per_env(
+    make_task: Callable[..., Task],
+) -> None:
+    max_steps = 6
+    env, _, _ = _env(make_task(max_steps=max_steps))
+
+    env.reset_all(stagger=False)
+
+    assert env.ep_step.tolist() == [0] * NUM_ENVS
+    first = _collect(env, max_steps)
+    assert [t for t, _ in first] == [max_steps]  # every env ends on the same step
+    outcomes = first[0][1]
+    assert outcomes.env_ids.tolist() == list(range(NUM_ENVS))
+    assert outcomes.full.tolist() == [True] * NUM_ENVS
+    assert outcomes.ep_len.tolist() == [max_steps] * NUM_ENVS
+
+
+def test_ic_ids_property_reports_current_episode_ids(
+    make_task: Callable[..., Task],
+) -> None:
+    env, _, _ = _env(make_task(max_steps=3))
+
+    env.reset_all()
+
+    assert env.ic_ids.tolist() == [100 + i for i in range(NUM_ENVS)]
