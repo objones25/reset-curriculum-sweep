@@ -159,7 +159,11 @@ class RolloutStats:
     """PPO rollout data handed to scores. `ic_ids`, `adv`, `returns` and `values` are `(T, N)`
     (`T` vector steps, `N` envs); `start_obs` holds the observation at each IC's start, and
     `critic` maps a batch of observations to values in one call. `adv` must be raw GAE, not
-    normalised per batch: the critic-loss scores read its sign and scale."""
+    normalised per batch: the critic-loss scores read its sign and scale.
+
+    `start_features` is `(capacity, f)`: row `i` holds the state features of IC `i`'s start
+    state, valid for every IC (not only those in this rollout). The side-model scores read
+    it; train.py must fill it from `state_features`, aligned by IC id like `start_obs`."""
 
     ic_ids: Tensor
     adv: Tensor
@@ -167,3 +171,4 @@ class RolloutStats:
     values: Tensor
     start_obs: Tensor
     critic: Callable[[Tensor], Tensor]
+    start_features: Tensor

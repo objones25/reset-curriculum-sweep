@@ -3,6 +3,7 @@
 from resetsweep.scores import (
     controls,
     critic,
+    side_models,
     slope,
     steps_to_reward,
     success_band,
@@ -18,6 +19,7 @@ __all__ = [
     "TableScore",
     "controls",
     "critic",
+    "side_models",
     "slope",
     "steps_to_reward",
     "success_band",
