@@ -25,6 +25,9 @@ class Score(Protocol):
 
     def forget(self, ic_ids: Tensor) -> None: ...
 
+    @property
+    def capacity(self) -> int: ...
+
 
 class ICTable:
     """Per-IC circular history of the last `history` outcomes, all in device tensors.
@@ -135,6 +138,12 @@ class BaseScore:
     """
 
     beta: float = 0.1
+    _capacity: int
+
+    @property
+    def capacity(self) -> int:
+        """Number of IC ids this score tracks: valid ids are `[0, capacity)`."""
+        return self._capacity
 
     def _set_beta(self, beta: float) -> None:
         if beta <= 0.0:
@@ -179,6 +188,7 @@ class TableScore(BaseScore):
                 f"min_count must be in [1, history={history}], got {min_count}"
             )
         self._set_beta(beta)
+        self._capacity = capacity
         self.table = ICTable(capacity, device, history=history)
         self._min_count = min_count
 

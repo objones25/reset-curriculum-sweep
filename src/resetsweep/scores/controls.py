@@ -56,6 +56,7 @@ class Inverted(BaseScore):
         beta: float = 0.1,
     ) -> None:
         self._set_beta(beta)
+        self._capacity = capacity
         built = SCORES.construct(
             inner, capacity=capacity, device=device, **(inner_kw or {})
         )

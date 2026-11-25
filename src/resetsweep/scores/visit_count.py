@@ -45,6 +45,7 @@ class VisitCount(BaseScore):
         if eps <= 0.0:
             raise ValueError(f"eps must be positive, got {eps}")
         self._set_beta(beta)
+        self._capacity = capacity
         self._band = SuccessBand(
             capacity=capacity,
             device=device,

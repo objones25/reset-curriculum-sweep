@@ -95,6 +95,10 @@ class Method(Protocol):
         states. train.py builds `RolloutStats.start_obs` and `start_features` from this table
         (via `task.observe` / `task.state_features`) so both stay aligned by IC id. The table
         is a copy; it changes whenever an IC is replaced, so rebuild it once per update.
+
+        Methods that return a table also expose `episode_versions() -> Tensor` `(num_envs,)`;
+        train.py stacks it once per step into `RolloutStats.ic_versions`, which their
+        `update` requires (ValueError if None) to drop cells of replaced ICs.
         """
         ...
 

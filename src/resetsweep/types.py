@@ -163,7 +163,12 @@ class RolloutStats:
 
     `start_features` is `(capacity, f)`: row `i` holds the state features of IC `i`'s start
     state, valid for every IC (not only those in this rollout). The side-model scores read
-    it; train.py must fill it from `state_features`, aligned by IC id like `start_obs`."""
+    it; train.py must fill it from `state_features`, aligned by IC id like `start_obs`.
+
+    `ic_versions` is `(T, N)` like `ic_ids`: the version of each cell's episode-start IC, from
+    the method's `episode_versions()` stacked once per step next to `ic_ids`. Methods whose ICs
+    get replaced (`visited_count`, `buffer_scored`) require it and drop cells whose IC was
+    replaced after the episode started; it stays None for methods without versioned ICs."""
 
     ic_ids: Tensor
     adv: Tensor
@@ -172,3 +177,4 @@ class RolloutStats:
     start_obs: Tensor
     critic: Callable[[Tensor], Tensor]
     start_features: Tensor
+    ic_versions: Tensor | None = None

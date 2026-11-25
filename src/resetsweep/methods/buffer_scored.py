@@ -1,5 +1,6 @@
-"""M5 `buffer_scored`: score-weighted draw over the visited buffer, with PLR staleness,
-discounted per-IC outcomes, a minimum count, a rehearsal share and lanes.
+"""M5 `buffer_scored`: score-weighted draw over a stable IC table promoted from the visited
+ring (see `SlotBuffer`), with PLR staleness, discounted per-IC outcomes, a minimum count, a
+rehearsal share and lanes.
 
 PLR (papers/text/2010.03934_prioritized-level-replay.txt):
 - Eq. 1, L174-175: P_replay = (1 - rho) * P_S + rho * P_C, rho in [0, 1] the staleness
@@ -8,14 +9,18 @@ PLR (papers/text/2010.03934_prioritized-level-replay.txt):
   episodes sampled so far and C_i is the episode count at which l_i was last sampled.
 - Algorithm 4, L1787/L1802/L1812/L1817: c <- c + 1 per sampled episode, C_i <- c when l_i is
   sampled, and a newly added level starts with C_i = 0.
-Here a level is a buffer slot: a newly written slot gets C_i = 0, every reset row (task start
-or buffer) adds 1 to c, and a drawn slot gets C_i = c.
+Here a level is an IC-table slot: a newly promoted slot gets C_i = 0, every reset row (task
+start or table) adds 1 to c, and a drawn slot gets C_i = c.
 """
 
 import torch
 from torch import Tensor
 
-from resetsweep.methods._slots import SlotBuffer
+from resetsweep.methods._slots import (
+    IC_CAPACITY_DEFAULT,
+    PROMOTE_FRAC_DEFAULT,
+    SlotBuffer,
+)
 from resetsweep.methods.base import METHODS, MethodContext
 from resetsweep.methods.visited import CAPACITY_DEFAULT
 from resetsweep.scores.base import median_fill
@@ -28,11 +33,12 @@ REHEARSAL_SUCCESS_MAX = 0.5  # "recent success below 0.5" (plan, Task 16)
 class BufferScored(SlotBuffer):
     """Draw distribution over filled slots, computed in this order:
 
-    1. P_S = `score.probs(slots)`, the score's own prioritisation (rank for most scores,
-       softmax for `sgs` and `critic_value`).
-    2. Trust: a slot is trusted when the score trusts it and the method has seen at least
-       `min_count` full outcomes for it since it was written. Untrusted slots get the median
-       P_S of the trusted ones; if none is trusted, P_S is uniform. Then renormalise.
+    1. Trust: a slot is trusted when the score trusts it and the method has seen at least
+       `min_count` full outcomes for it since it was promoted.
+    2. P_S = `score.probs(trusted slots)`, the score's own prioritisation (rank for most
+       scores, softmax for `sgs` and `critic_value`) over the trusted subset only, so
+       untrusted slots never take ranks. Untrusted slots get the median P_S of the trusted
+       ones; if none is trusted, P_S is uniform. Then renormalise.
     3. P = (1 - staleness_coef) * P_S + staleness_coef * P_C (PLR, module docstring).
     4. Rehearsal: slots that ever succeeded and whose discounted recent success is below 0.5
        get a `rehearsal` share, split uniformly: P = (1 - rehearsal) * P + rehearsal * U.
@@ -43,7 +49,8 @@ class BufferScored(SlotBuffer):
     `lanes` consecutive reset rows share each drawn slot, so `lanes` envs that reset together
     measure one IC in one iteration; envs that reset alone get their own draw.
 
-    Outcome bookkeeping (stale outcomes dropped, `score.forget` on overwrite) is in `SlotBuffer`.
+    Each reset ranks the trusted subset (a host sync and O(n log n) for n filled IC slots);
+    promotion, stale-outcome and stale-cell filtering are in `SlotBuffer`.
     """
 
     name = "buffer_scored"
@@ -71,6 +78,9 @@ class BufferScored(SlotBuffer):
         min_count: int = 3,
         rehearsal: float = 0.1,
         lanes: int = 1,
+        ic_capacity: int = IC_CAPACITY_DEFAULT,
+        promote_frac: float = PROMOTE_FRAC_DEFAULT,
+        update_every: int = 1,
     ) -> None:
         if not 0.0 <= staleness_coef <= 1.0:
             raise ValueError(f"staleness_coef must be in [0, 1], got {staleness_coef}")
@@ -82,14 +92,21 @@ class BufferScored(SlotBuffer):
             raise ValueError(f"rehearsal must be in [0, 1], got {rehearsal}")
         if lanes < 1:
             raise ValueError(f"lanes must be at least 1, got {lanes}")
-        super().__init__(ctx, capacity=capacity, min_fill=min_fill)
+        super().__init__(
+            ctx,
+            capacity=capacity,
+            min_fill=min_fill,
+            ic_capacity=ic_capacity,
+            promote_frac=promote_frac,
+            update_every=update_every,
+        )
         self._rho = staleness_coef
         self._discount = discount
         self._min_count = min_count
         self._rehearsal = rehearsal
         self._lanes = lanes
         d = ctx.device
-        rows = capacity + 1
+        rows = ic_capacity + 1  # the spare row absorbs outcomes scores ignore
         self._count = torch.zeros(rows, dtype=torch.long, device=d)
         self._disc_count = torch.zeros(rows, device=d)
         self._disc_success = torch.zeros(rows, device=d)
@@ -103,13 +120,13 @@ class BufferScored(SlotBuffer):
         return super().reset(env_ids, outcomes)
 
     def trusted(self) -> Tensor:
-        """`(buffer_size,)` bool: which filled slots count as trusted (step 2 above)."""
-        return self._trusted(torch.arange(int(self._size), device=self.ctx.device))
+        """`(buffer_size,)` bool: which filled IC slots count as trusted (step 1 above)."""
+        return self._trusted(torch.arange(self._ic_size, device=self.ctx.device))
 
     def diagnostics(self) -> dict[str, float]:
         """Adds `rehearsal_candidates`: filled slots currently eligible for rehearsal."""
         diag = super().diagnostics()
-        ids = torch.arange(int(self._size), device=self.ctx.device)
+        ids = torch.arange(self._ic_size, device=self.ctx.device)
         diag["rehearsal_candidates"] = float(self._forgotten(ids).sum())
         return diag
 
@@ -126,8 +143,12 @@ class BufferScored(SlotBuffer):
     def _probs(self, size: int) -> Tensor:
         ids = torch.arange(size, device=self.ctx.device)
         uniform = torch.full((size,), 1.0 / size, device=self.ctx.device)
-        p_s = median_fill(self._score.probs(ids), self._trusted(ids))
-        p_s = _normalise_or(p_s, uniform)
+        trusted = self._trusted(ids)
+        p_s = torch.zeros(size, device=self.ctx.device)
+        trusted_ids = ids[trusted]
+        if trusted_ids.numel() > 0:
+            p_s[trusted_ids] = self._score.probs(trusted_ids)
+        p_s = _normalise_or(median_fill(p_s, trusted), uniform)
         p_c = _normalise_or((self._episodes - self._stamp[ids]).float(), uniform)
         p = (1.0 - self._rho) * p_s + self._rho * p_c
         forgotten = self._forgotten(ids).float()
@@ -151,11 +172,12 @@ class BufferScored(SlotBuffer):
         self._disc_success = decay * self._disc_success + s_new
         self._count += n_new.long()
 
-    def _forget_slots(self, ids: Tensor) -> None:
-        self._count[ids] = 0
-        self._disc_count[ids] = 0.0
-        self._disc_success[ids] = 0.0
-        self._stamp[ids] = 0
+    def _on_promote(self, targets: Tensor, candidates: Tensor) -> None:
+        del candidates
+        self._count[targets] = 0
+        self._disc_count[targets] = 0.0
+        self._disc_success[targets] = 0.0
+        self._stamp[targets] = 0
 
 
 def _normalise_or(weights: Tensor, fallback: Tensor) -> Tensor:
