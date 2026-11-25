@@ -1,10 +1,16 @@
 import math
+from dataclasses import dataclass
 
 import pytest
 import torch
+from controllers import PendulumSwingup
+from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
+from resetsweep.sim.env import VecEnv
 from resetsweep.tasks.base import TASKS, Task
+from resetsweep.tasks.pendulum import TORQUE_LIMIT_NM
+from resetsweep.types import Outcomes, StartStates, StepCounter
 
 TASKS.load("resetsweep.tasks")
 
@@ -166,3 +172,61 @@ def test_pendulum_never_terminates_early() -> None:
     sim = _sim_at(task, [0.0, UPRIGHT_RAD])
 
     assert task.terminated(sim, torch.zeros(2, 0)).tolist() == [False, False]
+
+
+@dataclass
+class _TaskStartMethod:
+    """Reset rule that draws every start from the task's own distribution."""
+
+    task: Task
+    gen: torch.Generator
+    name: str = "task_start"
+
+    def reset(
+        self, env_ids: Tensor, outcomes: Outcomes | None
+    ) -> tuple[StartStates, Tensor]:
+        return self.task.sample_start(env_ids.numel(), self.gen), env_ids.clone()
+
+    def offer_visited(
+        self,
+        env_ids: Tensor,
+        qpos: Tensor,
+        qvel: Tensor,
+        extra: Tensor,
+        ep_step: Tensor,
+    ) -> None:
+        return None
+
+
+def test_scripted_swingup_reaches_sparse_success() -> None:
+    # Without this, a task that nothing can solve would pass every constraint test above.
+    n = 32
+    task = _task("pendulum_sparse")
+    gen = torch.Generator().manual_seed(0)
+    env = VecEnv(
+        task,
+        num_envs=n,
+        device="cpu",
+        counter=StepCounter(budget=10 * n * task.max_steps),
+        gen=gen,
+    )
+    env.bind(_TaskStartMethod(task, gen))
+    controller = PendulumSwingup(task.mjcf, TORQUE_LIMIT_NM)
+    obs = env.reset_all()
+    succeeded = torch.zeros(n, dtype=torch.bool)
+    seen_full = torch.zeros(n, dtype=torch.bool)
+
+    for _ in range(
+        2 * task.max_steps
+    ):  # the first full episode ends within 2 * max_steps
+        out = env.step(controller(obs))
+        obs = out.obs
+        o = out.outcomes
+        if o is not None:
+            first_full = o.full & ~seen_full[o.env_ids]
+            ids = o.env_ids[first_full]
+            succeeded[ids] = o.success[first_full]
+            seen_full[ids] = True
+
+    assert bool(seen_full.all())
+    assert float(succeeded.float().mean()) >= 0.9

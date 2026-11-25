@@ -37,6 +37,7 @@ _MJCF = f"""
 _FRAME_SKIP = 5
 _MAX_STEPS = 100
 _HOLD_STEPS = 10  # 0.5 s upright
+# Holding the band is feasible: gravity torque at 0.2 rad is 2.45 * sin(0.2) = 0.49 N*m < 1.0.
 _UPRIGHT_TOL_RAD = 0.2
 _ACTION_COST = 0.01
 _START_NOISE = 0.1
