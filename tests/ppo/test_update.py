@@ -81,6 +81,8 @@ def test_ppo_update_reduces_loss_on_fixed_batch() -> None:
         "entropy",
         "value_loss",
         "policy_loss",
+        "kl_stopped",
+        "n_minibatches",
     }
 
 
@@ -132,6 +134,75 @@ def test_target_kl_stops_update_early() -> None:
     assert 1 <= len(steps) < cfg.epochs * (8 * 16 // 32)
 
 
+def test_early_stop_reports_kl_stopped_and_minibatch_count() -> None:
+    model = ActorCritic(OBS_DIM, ACT_DIM, hidden=(32, 32))
+    batch = _fixed_batch(model, t=8, n=16, seed=4)
+    # Minibatch 1 sees the rollout policy (KL ~0) and steps with a huge lr; minibatch 2's KL is
+    # then far above 1.5 * 1e-6, so the update stops there without stepping on it.
+    cfg = _config(lr=0.5, epochs=4, minibatch_size=32, target_kl=1e-6)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
+
+    stats = ppo_update(model, opt, batch, cfg)
+
+    assert stats["kl_stopped"] == pytest.approx(1.0, abs=0)
+    assert stats["n_minibatches"] == pytest.approx(1.0, abs=0)
+    # Only the triggering minibatch has a large KL; without it the mean would be ~0.
+    assert stats["approx_kl"] > 1e-3
+
+
+def test_no_early_stop_reports_full_minibatch_count() -> None:
+    model = ActorCritic(OBS_DIM, ACT_DIM, hidden=(32, 32))
+    batch = _fixed_batch(model, t=8, n=16, seed=4)
+    cfg = _config(epochs=3, minibatch_size=32, target_kl=None)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
+
+    stats = ppo_update(model, opt, batch, cfg)
+
+    assert stats["kl_stopped"] == pytest.approx(0.0, abs=0)
+    assert stats["n_minibatches"] == pytest.approx(
+        12.0, abs=0
+    )  # 3 epochs x (128 // 32)
+
+
+def _minibatches_run(kl_stop_factor: float) -> float:
+    torch.manual_seed(0)
+    model = ActorCritic(OBS_DIM, ACT_DIM, hidden=(32, 32))
+    batch = _fixed_batch(model, t=8, n=16, seed=4)
+    cfg = _config(
+        lr=0.5,
+        epochs=2,
+        minibatch_size=32,
+        target_kl=1e-6,
+        kl_stop_factor=kl_stop_factor,
+    )
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
+    return ppo_update(model, opt, batch, cfg)["n_minibatches"]
+
+
+def test_kl_stop_threshold_scales_with_kl_stop_factor() -> None:
+    # Same seed, model and batch; only the factor differs. A factor large enough to lift the
+    # threshold above any reachable KL must let all 2 x (128 // 32) minibatches run.
+    default_run = _minibatches_run(1.5)
+    lifted_run = _minibatches_run(1e12)
+
+    assert default_run == pytest.approx(1.0, abs=0)
+    assert lifted_run == pytest.approx(8.0, abs=0)
+
+
+def test_value_loss_is_unscaled_mse() -> None:
+    # One epoch, one minibatch: the reported value loss is the MSE before the only step.
+    model = ActorCritic(OBS_DIM, ACT_DIM, hidden=(16,))
+    batch = _fixed_batch(model, t=4, n=8, seed=5)
+    cfg = _config(epochs=1, minibatch_size=32)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
+    with torch.no_grad():
+        mse = float((model.value(batch.obs) - batch.returns).square().mean())
+
+    stats = ppo_update(model, opt, batch, cfg)
+
+    assert stats["value_loss"] == pytest.approx(mse, rel=1e-5)
+
+
 def test_act_log_prob_is_of_the_unclipped_sample() -> None:
     model = ActorCritic(OBS_DIM, ACT_DIM, hidden=(16,))
     obs = torch.randn(64, OBS_DIM)
@@ -174,27 +245,30 @@ class _TaskStarts:
 
 NUM_ENVS = 256
 ROLLOUT_STEPS = 32
+TRAIN_ITERATIONS = 100
 WALL_CLOCK_S_MAX = 60.0
-TRAIN_WALL_CLOCK_S = 48.0  # leaves room for env build and the baseline rollouts
 BASELINE_ROLLOUTS = (
     6  # untrained policy; the first 2 are dropped (all envs start hanging)
 )
-# Threshold, measured 2026-11-24 on an Apple-silicon Mac CPU, seeds 0, 1, 2, with this exact
-# setup (256 envs x 32 steps, START_CONFIG with a 2048 minibatch). The metric is the mean
-# per-step dense reward of a rollout on pendulum_dense (height01 - 0.01 u^2: 0 hanging, 1 upright).
-# - Untrained policy, steady state (rollouts 3-16): 0.017-0.022, 0.024-0.035, 0.006-0.010.
-# - After 51 s of training (about 145 iterations), mean of the last 3 rollouts: 0.64, 0.63, 0.58.
-#   Halfway (about iteration 70) the three seeds were already near 0.35-0.45.
-# Requiring a gain over the measured baseline of more than 0.3 is about half of every seed's
-# measured gain (0.55-0.62), so a machine twice as slow (half the iterations) still passes,
-# while it is roughly 10x the untrained policy's rollout-to-rollout spread (about 0.03),
-# so a policy that did not learn cannot pass.
+# Threshold, measured 2026-11-24 on an Apple-silicon Mac CPU with this exact setup (256 envs x
+# 32 steps, START_CONFIG with a 2048 minibatch, kl_stop_factor 1.5, unscaled value MSE). The
+# metric is the mean per-step dense reward of a rollout on pendulum_dense (height01 - 0.01 u^2:
+# 0 hanging, 1 upright); "gain" is the mean of the last 3 rollouts minus the untrained baseline.
+# - Untrained steady state (rollouts 3-6): about 0.02 (spread about 0.01 rollout to rollout).
+# - This test exactly (seed 0, after the warm-up step): baseline 0.0174, final 0.5079, gain
+#   0.490 at 100 iterations, identical over two runs (CPU is deterministic here); about 40 s.
+# - Without the warm-up step (which advances the env generator), seeds 0, 1, 2 at 100
+#   iterations gained 0.582, 0.429, 0.277; at 70 iterations 0.443, 0.272, 0.393. So the margin
+#   belongs to this seed, not to every seed.
+# - No-learning control (lr 1e-9): gain 0.003.
+# Requiring a gain of more than 0.3 leaves 0.19 of margin (1.6x) on this run and is about 100x
+# the control's gain. Iterations, not wall clock, bound the training, so the
+# verdict does not depend on machine speed; the 60 s budget is a separate assertion.
 IMPROVEMENT_MIN = 0.3
 
 
 @pytest.mark.slow
 def test_ppo_learns_pendulum_dense_on_cpu() -> None:
-    start = time.monotonic()
     torch.manual_seed(0)
     task: Task = TASKS.construct("pendulum_dense")  # pyright: ignore[reportAssignmentType] # registry is untyped
     gen = torch.Generator().manual_seed(0)
@@ -206,46 +280,36 @@ def test_ppo_learns_pendulum_dense_on_cpu() -> None:
         gen=gen,
     )
     env.bind(_TaskStarts(task, gen))
+    # Warm the Warp kernels (compiled on first use) outside the timed section.
+    env.reset_all()
+    env.step(torch.zeros(NUM_ENVS, task.act_dim))
     model = ActorCritic(task.obs_dim, task.act_dim)
     norm = RunningNorm((task.obs_dim,))
     # START_CONFIG except the minibatch: 24,576 is larger than this CPU batch of 256 x 32 = 8192,
     # so the test holds 4 minibatches per epoch instead (2048 samples each).
     cfg = PPOConfig(**{**START_CONFIG.__dict__, "minibatch_size": 2048})
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=cfg.adam_eps)
+
+    start = time.monotonic()
     obs = env.reset_all()
     untrained: list[float] = []
     for _ in range(BASELINE_ROLLOUTS):
         _, obs, mean_reward = _rollout(env, model, norm, obs, cfg)
         untrained.append(mean_reward)
     baseline = sum(untrained[2:]) / len(untrained[2:])
-
-    curve = _train(env, model, norm, opt, obs, cfg, wall_clock_s=TRAIN_WALL_CLOCK_S)
-
-    final = sum(curve[-3:]) / 3
-    assert final - baseline > IMPROVEMENT_MIN, (baseline, final, curve)
-    assert time.monotonic() - start < WALL_CLOCK_S_MAX
-
-
-def _train(
-    env: VecEnv,
-    model: ActorCritic,
-    norm: RunningNorm,
-    opt: torch.optim.Optimizer,
-    obs: Tensor,
-    cfg: PPOConfig,
-    *,
-    wall_clock_s: float,
-) -> list[float]:
-    """PPO until the wall-clock budget is spent; mean per-step reward of each rollout."""
-    start = time.monotonic()
     curve: list[float] = []
-    for _ in range(10_000):  # bound; the wall clock ends the loop long before this
-        if time.monotonic() - start > wall_clock_s:
-            break
+    for _ in range(TRAIN_ITERATIONS):
         batch, obs, mean_reward = _rollout(env, model, norm, obs, cfg)
         curve.append(mean_reward)
         ppo_update(model, opt, batch, cfg)
-    return curve
+    elapsed_s = time.monotonic() - start
+
+    final = sum(curve[-3:]) / 3
+    assert final - baseline > IMPROVEMENT_MIN, (baseline, final, curve)
+    assert elapsed_s < WALL_CLOCK_S_MAX, (
+        f"learning passed, but {TRAIN_ITERATIONS} iterations took {elapsed_s:.1f} s, "
+        f"over the {WALL_CLOCK_S_MAX:.0f} s CPU budget"
+    )
 
 
 def _rollout(
