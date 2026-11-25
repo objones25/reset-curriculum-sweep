@@ -295,3 +295,93 @@ def test_failed_start_leaks_no_pipe_and_no_slot() -> None:
 
     assert (_open_fds(), pool.running(), pool.free_slots()) == (before, [], 1)
     pool.close()
+
+
+# --- hang guard (final-review I5) -----------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _beat(path: Path, n: int) -> None:
+    os.utime(path, ns=(n * 10**9, n * 10**9))  # strictly increasing mtimes, no sleep
+
+
+def test_job_with_progress_is_not_killed_past_hang_s(tmp_path: Path) -> None:
+    clock = _Clock()
+    beat = tmp_path / "job.heartbeat"
+    beat.touch()
+    with WorkerPool(n_workers=1, device="cpu", runner=hanging_runner, clock=clock) as pool:
+        pool.submit(_job(), _spec(), timeout_s=10_000.0, heartbeat=beat, hang_s=100.0)
+        for n, t in enumerate((50.0, 140.0, 230.0), start=1):
+            clock.t = t
+            _beat(beat, n)
+            assert pool.poll(timeout_s=0.0) == []
+        clock.t = 320.0  # 90 s since the last beat seen at 230
+        assert pool.poll(timeout_s=0.0) == []
+        assert pool.running() == [_job()]
+
+
+def test_job_without_progress_for_hang_s_is_killed_and_failed(tmp_path: Path) -> None:
+    clock = _Clock()
+    beat = tmp_path / "job.heartbeat"
+    with WorkerPool(n_workers=1, device="cpu", runner=hanging_runner, clock=clock) as pool:
+        pool.submit(_job(), _spec(), timeout_s=10_000.0, heartbeat=beat, hang_s=100.0)
+        clock.t = 60.0
+        beat.touch()  # first progress seen at 60
+        assert pool.poll(timeout_s=0.0) == []
+        clock.t = 161.0
+
+        (result,) = pool.poll(timeout_s=0.0)
+
+    assert result.status == "failed"
+    assert result.error is not None and "no progress for 100" in result.error
+
+
+def test_progress_does_not_lift_the_absolute_ceiling(tmp_path: Path) -> None:
+    clock = _Clock()
+    beat = tmp_path / "job.heartbeat"
+    with WorkerPool(n_workers=1, device="cpu", runner=hanging_runner, clock=clock) as pool:
+        pool.submit(_job(), _spec(), timeout_s=150.0, heartbeat=beat, hang_s=100.0)
+        clock.t = 80.0
+        beat.touch()
+        assert pool.poll(timeout_s=0.0) == []
+        clock.t = 151.0
+        _beat(beat, 2)
+
+        (result,) = pool.poll(timeout_s=0.0)
+
+    assert result.error is not None and "timed out after 150" in result.error
+
+
+def test_hang_s_needs_a_heartbeat_path() -> None:
+    with (
+        WorkerPool(n_workers=1, device="cpu", runner=ok_runner) as pool,
+        pytest.raises(ValueError, match="heartbeat"),
+    ):
+        pool.submit(_job(), _spec(), timeout_s=10.0, hang_s=5.0)
+
+
+def test_heartbeat_sink_touches_the_file_on_every_log(tmp_path: Path) -> None:
+    from resetsweep.metrics import JsonlSink
+    from resetsweep.sweep.pool import HeartbeatSink, heartbeat_path
+
+    spec = _spec()
+    path = heartbeat_path(tmp_path, spec)
+    sink = HeartbeatSink(path, JsonlSink(tmp_path / "m.jsonl"))
+    assert path.name == f"{spec.arm_id()}-s{spec.seed}.heartbeat"
+    assert not path.exists()
+
+    sink.log(0, {"x": 1.0})
+    first = path.stat().st_mtime_ns
+    _beat(path, 1)  # set an old mtime, then a log must move it forward again
+    sink.log(1, {"x": 2.0})
+    sink.close()
+
+    assert path.stat().st_mtime_ns > 10**9
+    assert first > 0

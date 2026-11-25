@@ -16,6 +16,7 @@ import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +39,9 @@ class Submission:
     spec: RunSpec
     n_workers: int
     session: int
+    timeout_s: float = 0.0
+    heartbeat: Path | None = None
+    hang_s: float | None = None
 
 
 @dataclass
@@ -113,7 +117,15 @@ class FakePool:
         self._running: dict[tuple[str, int], tuple[Job, RunSpec, float, bool]] = {}
         self.closed = False
 
-    def submit(self, job: Job, spec: RunSpec, *, timeout_s: float) -> None:
+    def submit(
+        self,
+        job: Job,
+        spec: RunSpec,
+        *,
+        timeout_s: float,
+        heartbeat: Path | None = None,
+        hang_s: float | None = None,
+    ) -> None:
         assert not self.closed
         assert len(self._running) < self._n, "no free worker"
         key = (spec.arm_id(), spec.seed)
@@ -121,7 +133,15 @@ class FakePool:
         assert timeout_s > 0
         assert spec.device == self._device
         self._world.submissions.append(
-            Submission(job=job, spec=spec, n_workers=self._n, session=self._world.session)
+            Submission(
+                job=job,
+                spec=spec,
+                n_workers=self._n,
+                session=self._world.session,
+                timeout_s=timeout_s,
+                heartbeat=heartbeat,
+                hang_s=hang_s,
+            )
         )
         now = self._world.clock.t
         finish = now + self._world.duration_s(spec, self._n)

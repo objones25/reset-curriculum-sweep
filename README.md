@@ -139,7 +139,9 @@ $0.0019/h or $1.40/month. The 2026-11-25 dry run quoted the default RTX 4090 at 
 Each of these limits is enforced in code:
 
 - **Launcher budget check.** Before creating anything, the launcher settles its ledger from the
-  RunPod billing API (every earlier launch's pod and volume spend). It exits 3 unless
+  RunPod billing API (every earlier launch's pod and volume spend), never below a floor of
+  price x min(hours since the launch, its `max_hours`) plus volume storage while billing lags or
+  reads 0 for a deleted pod. It exits 3 unless
   `cap - spent` is more than the $5 margin and the account balance is at least `cap - spent`.
 - **One pod at a time.** It exits 2 (dry run included) while any pod in its ledger still exists
   (any state except 404 or TERMINATED, so a stopped pod counts: it still bills its disk), and
@@ -153,7 +155,12 @@ Each of these limits is enforced in code:
 - **In-pod ledger.** `sweep-run` tracks spend as wall clock x price in a ledger that survives pod
   restarts. It stops starting jobs that would pass `cap - margin`, and at `cap - margin` it kills
   running jobs and writes the report. Killed jobs are kept as in flight, so a resumed sweep reruns
-  them. Calibration has its own $10 cap.
+  them. Calibration has its own $10 cap. It also stops 300 s before the bootstrap's deadline
+  (`SWEEP_DEADLINE_EPOCH`), killing running jobs and writing the report.
+- **Hang guard.** Each worker touches a heartbeat file on every metrics log. A job is killed
+  only if that file has not moved for `SWEEP_HANG_S` (default 900 s) or it runs past 4x its
+  estimate (a calibration probe's measured slowdown, or 3x uniform's time for an unprobed
+  method), so slow arms are not dropped for being slow.
 - **Self-delete trap.** The pod's command installs an EXIT trap that deletes the pod before it
   clones the repo, and the bootstrap installs its own. On any exit (success, failure, SIGTERM) the
   pod deletes itself through the RunPod API with retries, using `SWEEP_RUNPOD_API_KEY`, then

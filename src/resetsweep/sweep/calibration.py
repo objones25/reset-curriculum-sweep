@@ -34,6 +34,9 @@ batch may run); and the batch loop polls no further than the budget's end and cl
 (killing its jobs) once the budget is spent. A batch cut short that way is not stored, and
 calibration stops as capped. Jobs killed by their cut timeout are stored as failed.
 
+`Plan.job_factor(family, method)` scales a job's wall-clock estimate (final-review I5): a probed
+method's measured slowdown against uniform, else `UNPROBED_FACTOR` (3); uniform is 1.
+
 `choose_plan` picks one worker count for the sweep and, per family, the smallest num_envs whose
 aggregate steps/s is within 10% of that family's best at that worker count (smaller N means
 more PPO updates per env step); the worker count minimises the rung-0 pod time
@@ -480,11 +483,26 @@ class FamilyPlan:
             raise ValueError(f"overhead_s must be finite and >= 0, got {self.overhead_s}")
 
 
+UNPROBED_FACTOR: Final = 3.0  # final-review I5: a method with no probe may run 3x uniform's wall
+
+
 @dataclass(frozen=True, kw_only=True)
 class Plan:
     n_workers: int
     families: Mapping[str, FamilyPlan]
     fallback: FamilyPlan
+    # (family, method) -> measured job slowdown vs uniform (>= 1), from the probes
+    method_factors: Mapping[tuple[str, str], float] = field(
+        default_factory=dict[tuple[str, str], float]
+    )
+
+    def job_factor(self, family: str, method: str, *, unprobed: float = UNPROBED_FACTOR) -> float:
+        """How much longer than `uniform` a job of `method` in `family` is expected to take:
+        the probe's measured slowdown when there is one, 1 for uniform, else `unprobed` (3 for
+        timeouts; the sweep's budget estimate passes 1 and learns its own correction)."""
+        if method == "uniform":
+            return 1.0
+        return self.method_factors.get((family, method), unprobed)
 
     def for_family(self, family: str) -> FamilyPlan:
         plan = self.families.get(family)
@@ -568,4 +586,26 @@ def choose_plan(
     for f in arms_per_family:
         if f not in families:
             _log.warning("family %s has no calibration measurements; using the fallback plan", f)
-    return Plan(n_workers=n_workers, families=families, fallback=fallback)
+    return Plan(
+        n_workers=n_workers,
+        families=families,
+        fallback=fallback,
+        method_factors=method_factors(record, base_num_envs=base),
+    )
+
+
+def method_factors(record: CalibrationRecord, *, base_num_envs: int) -> dict[tuple[str, str], float]:
+    """(family, method) -> uniform's steps/s at (base N, 1 worker) / the probe's steps/s, at
+    least 1 (a probe runs one job at base N, so the two are comparable). Probes that failed or
+    lack a uniform reference are left out (they get `UNPROBED_FACTOR`)."""
+    out: dict[tuple[str, str], float] = {}
+    for fam, probes in PROBES.items():
+        reference = record.throughput(fam).get((base_num_envs, 1))
+        if reference is None:
+            continue
+        for task, method in probes:
+            ms = record.batches.get(f"probe/{fam}/{_probe_arm(task, method).label()}", [])
+            sps = [m.steps_per_s for m in ms if m.status == "ok" and m.steps_per_s]
+            if sps:
+                out[(fam, method)] = max(1.0, reference / min(sps))
+    return out

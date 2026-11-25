@@ -286,3 +286,35 @@ def test_plan_without_any_throughput_raises(tmp_path: Path, clock: Any, pool_fac
 
     with pytest.raises(CalibrationError, match="no usable steps/s measurement"):
         choose_plan(record, arms_per_family={"pendulum_dense": 10}, settings=_settings())
+
+
+# --- per-(family, method) job estimates (final-review I5) ----------------------------------------
+
+
+def test_plan_scales_probed_methods_by_their_measured_slowdown(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    import dataclasses
+
+    record = _calibrate(tmp_path, clock, pool_factory, ("arm_dense",))
+    # uniform at (base N 128, 1 worker) ran 12,800 steps/s; make the visited probe 4x slower.
+    key = "probe/arm_dense/arm_sparse/visited[p_task=0.5]/-"
+    (m,) = record.batches[key]
+    record.batches[key] = [dataclasses.replace(m, steps_per_s=3200.0)]
+
+    plan = choose_plan(record, arms_per_family={"arm_dense": 10}, settings=_settings())
+
+    assert plan.job_factor("arm_dense", "visited") == pytest.approx(4.0)
+    assert plan.job_factor("arm_dense", "buffer_scored") == pytest.approx(1.0)  # as fast
+
+
+def test_plan_uses_factor_3_for_unprobed_methods_and_1_for_uniform(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    record = _calibrate(tmp_path, clock, pool_factory, ("arm_dense",))
+
+    plan = choose_plan(record, arms_per_family={"arm_dense": 10}, settings=_settings())
+
+    assert plan.job_factor("arm_dense", "uniform") == 1.0
+    assert plan.job_factor("arm_dense", "walk") == 3.0
+    assert plan.job_factor("maze_dense", "visited") == 3.0

@@ -47,13 +47,19 @@ table (mean, CI, LCB/UCB, rung, status) and the final ranking to the same run.
 (p_task 0.5) on `pendulum_sparse` for one rung of r0, and rank that rung in the report.
 
 Budget handling (spec section 8):
-- A job's wall-clock estimate is ``step_budget / (family steps/s / n_workers) + overhead``,
+- A job's wall-clock estimate is
+  ``job_factor(family, method) * step_budget / (family steps/s / n_workers) + overhead``
+  (`Plan.job_factor`, final-review I5: the calibration probe's measured slowdown against
+  uniform; for the timeout ceiling an unprobed method counts 3x uniform, for the budget 1x),
   scaled by a correction learned from finished jobs (median of actual / estimated over the last
   50, clipped to [0.5, 4]). The pod bills at full rate until its last job ends, however many
   workers are busy, so starting a job and then stopping costs ``max(remaining wall of the jobs
   in flight, the new job's wall)`` more pod-seconds. `can_start` gets exactly that: in_flight_s
   = the longest remaining in-flight wall, est_job_s = how far the new job reaches past it.
   (Rung sizing uses 1/n_workers of the pod per job instead: there the pool is full.)
+- Timeouts are a hang guard, not a duration limit (final-review I5): a job is killed only if
+  its heartbeat file (touched by the worker on every metrics log) has not moved for
+  `SWEEP_HANG_S` (default 900 s), or past ``max(JOB_TIMEOUT_FLOOR_S, 4 x estimate)``.
 - Hard stop: once spend reaches cap - margin, every running job is killed without a result
   (the scheduler keeps it as in flight, so a resumed sweep reruns it) and the report is
   written. The margin pays for the report and the pod's self-termination (Task 24).
@@ -105,6 +111,7 @@ from resetsweep.sweep.calibration import (
     NUM_ENVS_GRID,
     ROLLOUT_LEN,
     THROUGHPUT_ITERS,
+    UNPROBED_FACTOR,
     WORKERS_GRID,
     CalibrationError,
     CalibrationRecord,
@@ -122,6 +129,7 @@ from resetsweep.sweep.pool import (
     RunnerConfig,
     default_pool_factory,
     failed_result,
+    heartbeat_path,
 )
 from resetsweep.sweep.report import (
     GuardedSweepSink,
@@ -157,7 +165,8 @@ ETA: Final = 3
 EVALS_PER_RUN: Final = 20  # eval points per run: the AUC's resolution
 POLL_S: Final = 5.0
 STATUS_EVERY_S: Final = 300.0
-JOB_TIMEOUT_FACTOR: Final = 3.0
+JOB_TIMEOUT_FACTOR: Final = 4.0  # absolute ceiling: 4 x the job's estimate (final-review I5)
+HANG_S_DEFAULT: Final = 900.0  # kill a job whose heartbeat has not moved for this long
 JOB_TIMEOUT_FLOOR_S: Final = 900.0
 CALIBRATION_JOB_TIMEOUT_S: Final = 1800.0
 CORRECTION_WINDOW: Final = 50
@@ -252,6 +261,7 @@ class Settings:
     min_r0_steps: int
     deadline_epoch: float | None
     report_reserve_s: float
+    hang_s: float
 
 
 def _positive_float(env: Mapping[str, str], name: str) -> float:
@@ -323,6 +333,11 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
             _positive_float(environ, "SWEEP_DEADLINE_EPOCH")
             if environ.get("SWEEP_DEADLINE_EPOCH")
             else None
+        ),
+        hang_s=(
+            _positive_float(environ, "SWEEP_HANG_S")
+            if environ.get("SWEEP_HANG_S")
+            else HANG_S_DEFAULT
         ),
         report_reserve_s=(
             _positive_float(environ, "SWEEP_REPORT_RESERVE_S")
@@ -482,7 +497,11 @@ class SweepLoop:
         smoke: bool,
         sink: ReportSink,
         poll_s: float = POLL_S,
+        heartbeat_of: Callable[[RunSpec], Path] | None = None,
+        hang_s: float = HANG_S_DEFAULT,
     ) -> None:
+        self._heartbeat_of = heartbeat_of
+        self._hang_s = hang_s
         self.guard = guard
         self._sink = sink
         self._last_live = -math.inf
@@ -502,9 +521,13 @@ class SweepLoop:
 
     # --- estimates ---
 
-    def _raw_wall_s(self, job: Job) -> float:
+    def _raw_wall_s(self, job: Job, *, unprobed: float = 1.0) -> float:
+        """Uncorrected wall-clock estimate. Budget: measured probe slowdowns only (unprobed
+        methods count as uniform; the learned correction covers the rest). Timeouts pass
+        `UNPROBED_FACTOR` for methods without a probe."""
         fp = self._plan.for_task(job.arm.task)
-        return job.step_budget / (fp.steps_per_s / self._plan.n_workers) + fp.overhead_s
+        factor = self._plan.job_factor(fp.family, job.arm.method, unprobed=unprobed)
+        return factor * job.step_budget / (fp.steps_per_s / self._plan.n_workers) + fp.overhead_s
 
     def _correction(self) -> float:
         if not self._ratios:
@@ -604,8 +627,18 @@ class SweepLoop:
                     len(self._inflight),
                 )
                 return True
-            timeout_s = max(JOB_TIMEOUT_FLOOR_S, JOB_TIMEOUT_FACTOR * est)
-            self._pool.submit(job, spec, timeout_s=timeout_s)
+            ceiling_est = self._raw_wall_s(job, unprobed=UNPROBED_FACTOR) * self._correction()
+            timeout_s = max(JOB_TIMEOUT_FLOOR_S, JOB_TIMEOUT_FACTOR * max(est, ceiling_est))
+            if self._heartbeat_of is None:
+                self._pool.submit(job, spec, timeout_s=timeout_s)
+            else:
+                self._pool.submit(
+                    job,
+                    spec,
+                    timeout_s=timeout_s,
+                    heartbeat=self._heartbeat_of(spec),
+                    hang_s=self._hang_s,
+                )
             self._inflight[(spec.arm_id(), spec.seed)] = _InFlight(job, spec, self._clock(), raw)
         return False
 
@@ -1023,6 +1056,8 @@ def _run_sweep(
             clock=clock,
             smoke=settings.smoke,
             sink=sink,
+            heartbeat_of=lambda spec: heartbeat_path(runner_cfg.runs_dir, spec),
+            hang_s=settings.hang_s,
         ).run()
     except SweepTerminated as e:
         # Workers die in pool.close below; their jobs stay in flight in the saved state, so a

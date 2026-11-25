@@ -866,3 +866,29 @@ def test_sigterm_kills_workers_saves_state_and_writes_the_report(tmp_path: Path)
     assert report["extra"]["stop_reason"] == "terminated by SIGTERM"
     assert (state / "report.md").exists()
     assert json.loads((state / "scheduler.json").read_text())["running"]
+
+
+# --- per-method estimates and the hang guard (final-review I5) -----------------------------------
+
+
+def test_sweep_jobs_get_per_method_ceilings_and_the_hang_guard(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    # Smoke plan: pendulum_dense at N=256 on 4 workers = 51,200 steps/s, overhead 2 s.
+    # Raw estimate for r0 = 1e7: 1e7 / (51,200 / 4) + 2 = 783.25 s. uniform factor 1;
+    # visited has no probe on pendulum -> its step term counts 3x for the ceiling:
+    # 3 * 781.25 + 2 = 2345.75 s. Ceiling = 4 x estimate.
+    _run(_env(tmp_path, SWEEP_SMOKE="1", SWEEP_R0_STEPS="10000000"), clock, pool_factory)
+
+    sweep = {s.job.arm.method: s for s in _sweep_jobs(world)}
+    runs = tmp_path / "sweep" / "runs"
+    assert sweep["uniform"].timeout_s == pytest.approx(4 * 783.25)
+    assert sweep["visited"].timeout_s == pytest.approx(4 * (3 * 781.25 + 2))
+    for s in sweep.values():
+        assert s.hang_s == 900.0
+        assert s.heartbeat == runs / f"{s.spec.arm_id()}-s{s.spec.seed}.heartbeat"
+
+
+def test_settings_hang_s_override(tmp_path: Path) -> None:
+    assert load_settings(_env(tmp_path)).hang_s == 900.0
+    assert load_settings(_env(tmp_path, SWEEP_HANG_S="60")).hang_s == 60.0

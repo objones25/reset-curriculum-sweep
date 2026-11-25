@@ -11,7 +11,13 @@ Outcomes, all of which end as exactly one `RunResult` from `poll` (except `kill`
 - the runner raises: ``RunResult(status="failed", error=repr(exc))``;
 - the process dies without a result (signal, OOM kill, segfault, `os._exit`): failed, with the
   exit code and signal name;
-- the job passes its `timeout_s`: the process is killed, failed "timed out ...";
+- the job passes its `timeout_s` (the absolute ceiling): the process is killed, failed
+  "timed out ...";
+- hang guard (final-review I5): with `heartbeat` and `hang_s`, the job is also killed, failed
+  "no progress for ...", once the heartbeat file's mtime has not changed for `hang_s` of the
+  pool's clock (the pool notes the time it sees each new mtime, so file and pool clocks are
+  never compared; a missing file counts as no progress since submit). `train_job` touches
+  the file on every metrics log (`HeartbeatSink`), once per PPO iteration and at each eval;
 - `kill(job)`: the process is killed and no result is produced; the caller decides what to
   report (the sweep loop reports a failed result for a job whose arm is no longer live, and
   nothing for jobs it stops at the budget, so they are resubmitted on resume).
@@ -46,7 +52,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Final, Protocol, Self
 
-from resetsweep.metrics import JsonlSink, MultiSink, WandbMode, WandbSink
+from resetsweep.metrics import JsonlSink, MetricsSink, MultiSink, WandbMode, WandbSink
 from resetsweep.sweep.scheduler import Job
 from resetsweep.train import RunResult, RunSpec, run
 
@@ -60,7 +66,15 @@ _ERROR_MAX_CHARS: Final = 2000
 class Pool(Protocol):
     """What the sweep loop and calibration need from a pool (the fake in tests implements it)."""
 
-    def submit(self, job: Job, spec: RunSpec, *, timeout_s: float) -> None: ...
+    def submit(
+        self,
+        job: Job,
+        spec: RunSpec,
+        *,
+        timeout_s: float,
+        heartbeat: Path | None = None,
+        hang_s: float | None = None,
+    ) -> None: ...
 
     def poll(self, timeout_s: float) -> list[RunResult]: ...
 
@@ -89,6 +103,30 @@ PoolFactory = Callable[[int, str, RunnerConfig], Pool]
 def run_log_path(runs_dir: Path, spec: RunSpec) -> Path:
     """Where a run's JSONL metrics go: ``runs_dir/<arm_id>-s<seed>.jsonl``."""
     return runs_dir / f"{spec.arm_id()}-s{spec.seed}.jsonl"
+
+
+def heartbeat_path(runs_dir: Path, spec: RunSpec) -> Path:
+    """The progress file `train_job` touches: ``runs_dir/<arm_id>-s<seed>.heartbeat``."""
+    return runs_dir / f"{spec.arm_id()}-s{spec.seed}.heartbeat"
+
+
+class HeartbeatSink:
+    """Forwards to `inner` and touches `path` after every `log`: the job's progress signal."""
+
+    def __init__(self, path: Path, inner: MetricsSink) -> None:
+        self._path = path
+        self._inner = inner
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, step: int, data: dict[str, float]) -> None:
+        self._inner.log(step, data)
+        self._path.touch()  # sets mtime to now (pathlib.Path.touch, exist_ok=True)
+
+    def summary(self, data: dict[str, float | str]) -> None:
+        self._inner.summary(data)
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 def failed_result(spec: RunSpec, error: str, *, wall_s: float) -> RunResult:
@@ -125,7 +163,7 @@ def train_job(cfg: RunnerConfig, spec: RunSpec) -> RunResult:
     except BaseException:
         jsonl.close()
         raise
-    sink = MultiSink(jsonl, wb)
+    sink = HeartbeatSink(heartbeat_path(cfg.runs_dir, spec), MultiSink(jsonl, wb))
     try:
         return run(spec, sink)
     finally:
@@ -180,6 +218,10 @@ class _Running:
     conn: Connection
     start_s: float
     timeout_s: float
+    heartbeat: Path | None = None
+    hang_s: float | None = None
+    last_mtime_ns: int | None = None
+    progress_s: float = 0.0  # pool-clock time of the last heartbeat change (submit to start)
 
 
 class WorkerPool:
@@ -219,8 +261,17 @@ class WorkerPool:
 
     # --- public interface ----------------------------------------------------------------------
 
-    def submit(self, job: Job, spec: RunSpec, *, timeout_s: float) -> None:
-        """Start `job` in a new process. Raises if no worker is free or `spec` does not match."""
+    def submit(
+        self,
+        job: Job,
+        spec: RunSpec,
+        *,
+        timeout_s: float,
+        heartbeat: Path | None = None,
+        hang_s: float | None = None,
+    ) -> None:
+        """Start `job` in a new process. Raises if no worker is free or `spec` does not match.
+        `timeout_s` is the absolute ceiling; `hang_s` (needs `heartbeat`) the hang guard."""
         if self._closed:
             raise RuntimeError("pool is closed")
         if spec.device != self._device:
@@ -233,6 +284,8 @@ class WorkerPool:
             )
         if not (math.isfinite(timeout_s) and timeout_s > 0):
             raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s}")
+        if hang_s is not None and (heartbeat is None or not (math.isfinite(hang_s) and hang_s > 0)):
+            raise ValueError(f"hang_s needs a heartbeat path and must be finite and > 0, got {hang_s}")
         key = (spec.arm_id(), spec.seed)
         if key in self._running:
             raise ValueError(f"run {key} is already running")
@@ -257,6 +310,10 @@ class WorkerPool:
             conn=recv,
             start_s=self._clock(),
             timeout_s=timeout_s,
+            heartbeat=heartbeat,
+            hang_s=hang_s,
+            last_mtime_ns=_mtime_ns(heartbeat),
+            progress_s=self._clock(),
         )
 
     def poll(self, timeout_s: float) -> list[RunResult]:
@@ -266,7 +323,7 @@ class WorkerPool:
         if not self._running:
             return []
         now = self._clock()
-        until_deadline = min(r.start_s + r.timeout_s - now for r in self._running.values())
+        until_deadline = min(self._deadline_s(r) - now for r in self._running.values())
         wait_s = max(0.0, min(timeout_s, until_deadline))
         # Sentinels too: a grandchild (e.g. a service the job started) can hold the pipe's
         # write end open after the worker died, so EOF alone would not show the death.
@@ -304,6 +361,19 @@ class WorkerPool:
 
     # --- internals -----------------------------------------------------------------------------
 
+    def _deadline_s(self, r: _Running) -> float:
+        """The earliest pool-clock time `r` may be killed, as known now."""
+        ceiling = r.start_s + r.timeout_s
+        if r.hang_s is None:
+            return ceiling
+        return min(ceiling, r.progress_s + r.hang_s)
+
+    def _note_progress(self, r: _Running) -> None:
+        mtime = _mtime_ns(r.heartbeat)
+        if mtime is not None and mtime != r.last_mtime_ns:
+            r.last_mtime_ns = mtime
+            r.progress_s = self._clock()
+
     def _collect(self, r: _Running) -> RunResult | None:
         """The result of `r` if it finished, timed out or died; None while it still runs."""
         elapsed = self._clock() - r.start_s
@@ -332,6 +402,23 @@ class WorkerPool:
             return failed_result(
                 r.spec, f"timed out after {r.timeout_s} s; worker killed", wall_s=elapsed
             )
+        if r.hang_s is not None:
+            self._note_progress(r)
+            stalled = self._clock() - r.progress_s
+            if stalled >= r.hang_s:
+                self._stop(r, expect_exit=False)
+                _log.warning(
+                    "job %s seed %d: no progress for %.0f s (hang guard %s s); killed",
+                    r.arm_id,
+                    r.spec.seed,
+                    stalled,
+                    r.hang_s,
+                )
+                return failed_result(
+                    r.spec,
+                    f"no progress for {r.hang_s:g} s (heartbeat {r.heartbeat}); worker killed",
+                    wall_s=elapsed,
+                )
         return None
 
     def _checked(self, r: _Running, kind: object, payload: object, elapsed: float) -> RunResult:
@@ -364,12 +451,22 @@ class WorkerPool:
             r.process.close()
 
 
+def _mtime_ns(path: Path | None) -> int | None:
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None  # obs: allow LOG007 (no heartbeat yet: the job has not logged)
+
+
 def default_pool_factory(n_workers: int, device: str, cfg: RunnerConfig) -> Pool:
     """A real `WorkerPool` running `train_job` with `cfg`."""
     return WorkerPool(n_workers=n_workers, device=device, runner=functools.partial(train_job, cfg))
 
 
 __all__ = [
+    "HeartbeatSink",
     "Pool",
     "PoolFactory",
     "Runner",
@@ -377,6 +474,7 @@ __all__ = [
     "WorkerPool",
     "default_pool_factory",
     "failed_result",
+    "heartbeat_path",
     "run_log_path",
     "train_job",
 ]
