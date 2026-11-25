@@ -216,6 +216,21 @@ def test_outcomes_report_env_ids_ic_ids_returns(make_task: Callable[..., Task]) 
     assert sorted(told.tolist()) == sorted([0, 1] * 2)
 
 
+def test_outcomes_report_first_reward_step_or_minus_one(
+    make_task: Callable[..., Task],
+) -> None:
+    # env 0 starts upright (rewarded from its first step), env 1 hangs down (never)
+    method = StubMethod(_states([pi, 0.0]))
+    env, _, _ = _env(make_task(max_steps=3, hold_steps=2), method, num_envs=2)
+    env.reset_all()
+    _collect(env, 3)  # first (staggered) wave
+
+    oc = Outcomes.cat([o for _, o in _collect(env, 3, t0=3)])
+
+    order = oc.env_ids.argsort()
+    assert oc.first_reward_step[order].tolist() == [1, -1]
+
+
 def test_reset_all_gives_method_no_outcomes(make_task: Callable[..., Task]) -> None:
     env, method, _ = _env(make_task())
 

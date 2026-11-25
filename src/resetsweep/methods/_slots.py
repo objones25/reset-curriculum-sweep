@@ -1,5 +1,5 @@
 """Shared base for visited-buffer methods with a stable IC table (`visited_count`,
-`buffer_scored`).
+`buffer_scored`), and the IC versioning those and `own_success` share (`ICVersions`).
 
 Not a method itself (the leading underscore keeps `METHODS.load` from importing it as one).
 """
@@ -22,6 +22,74 @@ from resetsweep.types import Outcomes, RolloutStats, StartStates
 
 IC_CAPACITY_DEFAULT = 1024
 PROMOTE_FRAC_DEFAULT = 0.1
+
+
+class ICVersions:
+    """Version of each IC slot and of each env's episode-start IC, on device.
+
+    A slot's version bumps whenever its IC is replaced (`bump`). `start` stamps each
+    resetting env with the version of the IC it starts from (-1 for a task start). Outcomes
+    and rollout cells whose stamp no longer matches the slot's version came from a replaced
+    IC; `drop_stale` and `current_cells` turn their ic id into -1 so scores ignore them.
+    """
+
+    def __init__(self, capacity: int, num_envs: int, device: str, *, owner: str) -> None:
+        self.capacity = capacity
+        self._owner = owner
+        self.slot = torch.zeros(capacity, dtype=torch.long, device=device)
+        self._env = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+        self._ic_outcomes = torch.zeros((), dtype=torch.long, device=device)
+        self._stale_outcomes = torch.zeros((), dtype=torch.long, device=device)
+
+    def start(self, env_ids: Tensor, ids: Tensor) -> None:
+        started = self.slot[ids.clamp(min=0)]
+        self._env[env_ids] = torch.where(ids >= 0, started, torch.full_like(started, -1))
+
+    def bump(self, targets: Tensor) -> None:
+        self.slot[targets] += 1
+
+    def episode_versions(self) -> Tensor:
+        """`(num_envs,)` version of each env's current episode-start IC (-1: task start)."""
+        return self._env.clone()
+
+    def started_from_table(self, env_ids: Tensor) -> Tensor:
+        """`(k,)` bool: the env's current episode started from an IC slot."""
+        return self._env[env_ids] >= 0
+
+    def drop_stale(self, outcomes: Outcomes) -> Outcomes:
+        ic = outcomes.ic_ids
+        same = self.slot[ic.clamp(min=0)] == self._env[outcomes.env_ids]
+        current = (ic >= 0) & same
+        self._ic_outcomes += (ic >= 0).sum()
+        self._stale_outcomes += ((ic >= 0) & ~same).sum()
+        return dataclasses.replace(
+            outcomes, ic_ids=torch.where(current, ic, torch.full_like(ic, -1))
+        )
+
+    def current_cells(self, stats: RolloutStats) -> RolloutStats:
+        if stats.ic_versions is None:
+            raise ValueError(
+                f"{self._owner} needs RolloutStats.ic_versions (stack episode_versions() per "
+                "step next to ic_ids); without it replaced ICs would get stale rollout cells"
+            )
+        if stats.ic_versions.shape != stats.ic_ids.shape:
+            raise ValueError(
+                f"ic_versions shape {tuple(stats.ic_versions.shape)} must match ic_ids "
+                f"{tuple(stats.ic_ids.shape)}"
+            )
+        ic = stats.ic_ids
+        lookup = ic.clamp(0, self.capacity - 1)
+        current = (ic >= 0) & (stats.ic_versions == self.slot[lookup])
+        # Out-of-range ids pass through unchanged, so the score still rejects them loudly.
+        keep = current | (ic >= self.capacity)
+        return dataclasses.replace(
+            stats, ic_ids=torch.where(keep, ic, torch.full_like(ic, -1))
+        )
+
+    def stale_share(self) -> float:
+        """Cumulative share of IC-started outcomes dropped as stale (NaN before any)."""
+        total = int(self._ic_outcomes)
+        return int(self._stale_outcomes) / total if total > 0 else float("nan")
 
 
 class SlotBuffer(Visited):
@@ -92,11 +160,8 @@ class SlotBuffer(Visited):
         self._ic_qpos = torch.zeros(ic_capacity, self._qpos.shape[1], device=d)
         self._ic_qvel = torch.zeros(ic_capacity, self._qvel.shape[1], device=d)
         self._ic_extra = torch.zeros(ic_capacity, self._extra.shape[1], device=d)
-        self._ic_version = torch.zeros(ic_capacity, dtype=torch.long, device=d)
+        self._versions = ICVersions(ic_capacity, ctx.num_envs, d, owner=self.name)
         self._ever = torch.zeros(ic_capacity + 1, dtype=torch.bool, device=d)
-        self._env_version = torch.full((ctx.num_envs,), -1, dtype=torch.long, device=d)
-        self._buffer_outcomes = torch.zeros((), dtype=torch.long, device=d)
-        self._stale_outcomes = torch.zeros((), dtype=torch.long, device=d)
 
     def offer_visited(
         self,
@@ -114,7 +179,7 @@ class SlotBuffer(Visited):
         self, env_ids: Tensor, outcomes: Outcomes | None
     ) -> tuple[StartStates, Tensor]:
         if outcomes is not None:
-            fresh = self._drop_stale(outcomes)
+            fresh = self._versions.drop_stale(outcomes)
             self._score.record(fresh)
             self._track(fresh)
             self._on_outcomes(fresh)
@@ -128,26 +193,23 @@ class SlotBuffer(Visited):
             )
         else:
             states, ids = mix_task_start(self.ctx, env_ids, self._draw_ics)
-        started = self._ic_version[ids.clamp(min=0)]
-        self._env_version[env_ids] = torch.where(
-            ids >= 0, started, torch.full_like(started, -1)
-        )
+        self._versions.start(env_ids, ids)
         self._on_reset(env_ids, ids)
         return states, ids
 
     def update(self, it: int, stats: RolloutStats) -> dict[str, float]:
-        self._score.observe_rollout(self._current_cells(stats))
+        self._score.observe_rollout(self._versions.current_cells(stats))
         if it % self._update_every == 0:
             self._promote()
         return {}
 
     def episode_versions(self) -> Tensor:
         """`(num_envs,)` version of each env's current episode-start IC (-1: task start)."""
-        return self._env_version.clone()
+        return self._versions.episode_versions()
 
     def ic_versions(self) -> Tensor:
         """`(ic_capacity,)` current version of each IC slot; it bumps on every replacement."""
-        return self._ic_version.clone()
+        return self._versions.slot.clone()
 
     def ic_states(self) -> StartStates:
         return StartStates(
@@ -172,8 +234,7 @@ class SlotBuffer(Visited):
             entropy = -float(torch.special.xlogy(p, p).sum())
             entropy -= p_task * math.log(p_task) if p_task > 0 else 0.0
         never = float((~self._ever[:size]).float().mean()) if size > 0 else float("nan")
-        total = int(self._buffer_outcomes)
-        stale = int(self._stale_outcomes) / total if total > 0 else float("nan")
+        stale = self._versions.stale_share()
         return {
             "sampling_entropy": entropy,
             "buffer_size": float(size),
@@ -195,36 +256,6 @@ class SlotBuffer(Visited):
     def _ic_rows(self, idx: Tensor) -> StartStates:
         return StartStates(self._ic_qpos[idx], self._ic_qvel[idx], self._ic_extra[idx])
 
-    def _drop_stale(self, outcomes: Outcomes) -> Outcomes:
-        ic = outcomes.ic_ids
-        same = self._ic_version[ic.clamp(min=0)] == self._env_version[outcomes.env_ids]
-        current = (ic >= 0) & same
-        self._buffer_outcomes += (ic >= 0).sum()
-        self._stale_outcomes += ((ic >= 0) & ~same).sum()
-        return dataclasses.replace(
-            outcomes, ic_ids=torch.where(current, ic, torch.full_like(ic, -1))
-        )
-
-    def _current_cells(self, stats: RolloutStats) -> RolloutStats:
-        if stats.ic_versions is None:
-            raise ValueError(
-                f"{self.name} needs RolloutStats.ic_versions (stack episode_versions() per "
-                "step next to ic_ids); without it replaced ICs would get stale rollout cells"
-            )
-        if stats.ic_versions.shape != stats.ic_ids.shape:
-            raise ValueError(
-                f"ic_versions shape {tuple(stats.ic_versions.shape)} must match ic_ids "
-                f"{tuple(stats.ic_ids.shape)}"
-            )
-        ic = stats.ic_ids
-        lookup = ic.clamp(0, self._ic_capacity - 1)
-        current = (ic >= 0) & (stats.ic_versions == self._ic_version[lookup])
-        # Out-of-range ids pass through unchanged, so the score still rejects them loudly.
-        keep = current | (ic >= self._ic_capacity)
-        return dataclasses.replace(
-            stats, ic_ids=torch.where(keep, ic, torch.full_like(ic, -1))
-        )
-
     def _promote(self) -> None:
         ring = int(self._size)
         if ring < self._min_fill:
@@ -244,7 +275,7 @@ class SlotBuffer(Visited):
         self._ic_qpos[targets] = self._qpos[candidates]
         self._ic_qvel[targets] = self._qvel[candidates]
         self._ic_extra[targets] = self._extra[candidates]
-        self._ic_version[targets] += 1
+        self._versions.bump(targets)
         self._ever[targets] = False
         self._score.forget(targets)
         self._on_promote(targets, candidates)

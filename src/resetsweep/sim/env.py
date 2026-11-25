@@ -90,6 +90,7 @@ class VecEnv:
         self._hold = torch.zeros(num_envs, dtype=torch.long, device=device)
         self._success = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._reached = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self._first_reward = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         self._full = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._start_step = torch.zeros(num_envs, dtype=torch.long, device=device)
         self._ic_ids = torch.zeros(num_envs, dtype=torch.long, device=device)
@@ -128,6 +129,9 @@ class VecEnv:
 
         reward = self.task.reward(self.sim, self.extra, action)
         self._ret += reward
+        self._first_reward = torch.where(
+            (reward > 0) & ~self._reached, self.ep_step, self._first_reward
+        )
         self._reached |= reward > 0
         terminated = self.task.terminated(self.sim, self.extra)
         success_now = self.task.success_now(self.sim, self.extra)
@@ -177,6 +181,7 @@ class VecEnv:
             success=self._success[env_ids],
             ep_len=self.ep_step[env_ids],
             reached_reward=self._reached[env_ids],
+            first_reward_step=self._first_reward[env_ids],
             full=self._full[env_ids],
             start_step=self._start_step[env_ids],
         )
@@ -212,6 +217,7 @@ class VecEnv:
         self._hold[env_ids] = 0
         self._success[env_ids] = False
         self._reached[env_ids] = False
+        self._first_reward[env_ids] = -1
         self._full[env_ids] = full
         self._start_step[env_ids] = self._t
 

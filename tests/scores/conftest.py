@@ -24,6 +24,7 @@ def make_outcomes() -> MakeOutcomes:
             success=torch.tensor([r[1] for r in rows], dtype=torch.bool),
             ep_len=torch.full((n,), 10),
             reached_reward=torch.zeros(n, dtype=torch.bool),
+            first_reward_step=torch.full((n,), -1),
             full=torch.tensor(full_flags, dtype=torch.bool),
             start_step=torch.zeros(n, dtype=torch.int64),
         )

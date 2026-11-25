@@ -297,6 +297,7 @@ def _outcome(env_id: int, *, reached: bool) -> Outcomes:
         success=torch.tensor([reached]),
         ep_len=torch.tensor([10]),
         reached_reward=torch.tensor([reached]),
+        first_reward_step=torch.tensor([5 if reached else -1]),
         full=torch.tensor([True]),
         start_step=torch.tensor([0]),
     )

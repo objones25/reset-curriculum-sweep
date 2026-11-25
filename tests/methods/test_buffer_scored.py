@@ -36,6 +36,7 @@ def _outcomes(
         success=torch.tensor(success, dtype=torch.bool),
         ep_len=torch.full((n,), 10),
         reached_reward=torch.tensor(success, dtype=torch.bool),
+        first_reward_step=torch.where(torch.tensor(success), 5, -1),
         full=torch.ones(n, dtype=torch.bool),
         start_step=torch.zeros(n, dtype=torch.long),
     )

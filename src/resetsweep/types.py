@@ -117,7 +117,9 @@ class StepCounter:
 class Outcomes:
     """Finished episodes, one row each. `ep_len` counts the env clock, so it includes the
     staggered offset for first episodes; `full` is False for those. `start_step` is the
-    number of vector steps completed before the episode began (negative for first episodes)."""
+    number of vector steps completed before the episode began (negative for first episodes).
+    `first_reward_step` is the episode clock (`ep_step`, same clock as `ep_len`) on the step
+    the reward was first > 0, or -1 when `reached_reward` is False."""
 
     env_ids: Tensor
     ic_ids: Tensor
@@ -125,6 +127,7 @@ class Outcomes:
     success: Tensor
     ep_len: Tensor
     reached_reward: Tensor
+    first_reward_step: Tensor
     full: Tensor
     start_step: Tensor
 
