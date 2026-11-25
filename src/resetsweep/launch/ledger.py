@@ -7,7 +7,13 @@ and before each new launch `settle` replaces every entry's `spent_usd` with what
 billing API reports for that pod and that volume since the hour it was created.
 
 File format: `{"version": 1, "launches": [{pod_id, volume_id, gpu_id, gpu_usd_per_h,
-created_at (ISO 8601 with offset), spent_usd, smoke}, ...]}`. A file that does not parse raises
+created_at (ISO 8601 with offset), spent_usd, smoke, name, unresolved}, ...]}`. `name` and
+`unresolved` default to null/false so older files still load.
+
+An `unresolved` launch is one whose pod create failed ambiguously (5xx or a lost connection):
+a pod with that `name` may exist and bill. `settle` looks it up by name each time; until it is
+found, the launcher refuses new launches (a pod that already ran and deleted itself can no
+longer be found by name, so that case needs a hand edit after checking the console). A file that does not parse raises
 `LedgerError`: the launcher then refuses to launch rather than guess the spend.
 """
 
@@ -39,6 +45,8 @@ class Launch:
     created_at: str  # ISO 8601 with a UTC offset
     spent_usd: float
     smoke: bool
+    name: str | None = None
+    unresolved: bool = False
 
     def created(self) -> datetime:
         return datetime.fromisoformat(self.created_at)
@@ -88,6 +96,8 @@ def settle(client: RunPodClient, launches: list[Launch]) -> list[Launch]:
             first_use[launch.volume_id] = i
     settled = []
     for i, launch in enumerate(launches):
+        if launch.unresolved:
+            launch = _resolve(client, launch)
         since = _billing_start(launch.created())
         spent = 0.0
         if first_use[launch.volume_id] == i:
@@ -98,6 +108,19 @@ def settle(client: RunPodClient, launches: list[Launch]) -> list[Launch]:
     if len(settled) != len(launches):
         raise AssertionError("settle must keep every launch")
     return settled
+
+
+def _resolve(client: RunPodClient, launch: Launch) -> Launch:
+    if launch.name is None:
+        raise AssertionError("an unresolved launch always has a name (checked on load)")
+    pod = client.find_pod_by_name(launch.name)
+    if pod is None:
+        return launch
+    return replace(launch, pod_id=str(pod["id"]), unresolved=False)
+
+
+def unresolved(launches: list[Launch]) -> list[Launch]:
+    return [x for x in launches if x.unresolved]
 
 
 def total_spent_usd(launches: list[Launch]) -> float:
@@ -142,4 +165,12 @@ def _parse(path: Path, index: int, item: Any) -> Launch:
         raise LedgerError(f"{where}: created_at is not ISO 8601 ({e})") from e
     if created.utcoffset() is None:
         raise LedgerError(f"{where}: created_at has no UTC offset")
+    if launch.name is not None and (
+        not isinstance(launch.name, str) or not launch.name
+    ):
+        raise LedgerError(f"{where}: name must be null or a non-empty string")
+    if not isinstance(launch.unresolved, bool):
+        raise LedgerError(f"{where}: unresolved must be true or false")
+    if launch.unresolved and (launch.name is None or launch.pod_id is not None):
+        raise LedgerError(f"{where}: an unresolved launch needs a name and no pod_id")
     return launch

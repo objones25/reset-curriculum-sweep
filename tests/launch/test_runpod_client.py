@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 import httpx
 import pytest
-from runpod_fakes import DC, FAKE_RUNPOD_KEY, PRICES, FakeRunPod
+from runpod_fakes import DC, FAKE_RUNPOD_KEY, FAKE_WANDB_KEY, PRICES, FakeRunPod
 
 from resetsweep.launch.runpod_client import (
     DataCenter,
@@ -136,7 +136,7 @@ def test_post_is_retried_on_429() -> None:
     assert len(seen) == 2
 
 
-def test_create_volume_sends_name_size_and_datacenter() -> None:
+def test_create_volume_sends_name_size_datacenter_and_standard_type() -> None:
     seen: list[httpx.Request] = []
     responses = [httpx.Response(201, json={"id": "vol-9"})]
     client = _client(_scripted(responses, seen), RecordingSleep())
@@ -145,7 +145,8 @@ def test_create_volume_sends_name_size_and_datacenter() -> None:
 
     assert seen[0].url == "https://api.runpod.io/v2/network-volumes"
     assert (
-        seen[0].read() == b'{"name":"resetsweep-vol","size":20,"dataCenter":"EU-RO-1"}'
+        seen[0].read()
+        == b'{"name":"resetsweep-vol","size":20,"dataCenter":"EU-RO-1","type":"STANDARD"}'
     )
 
 
@@ -333,3 +334,88 @@ def test_get_volume_reads_datacenter_size_and_type(fake_runpod: FakeRunPod) -> N
         id="vol-7", datacenter=DC, size_gb=20, type="STANDARD"
     )
     assert fake_runpod.requests[0].url.path == "/v2/network-volumes/vol-7"
+
+
+def test_redact_values_are_stripped_from_error_details() -> None:
+    seen: list[httpx.Request] = []
+
+    def echo(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            422, json={"detail": f"bad body: {request.content.decode()}"}
+        )
+
+    client = RunPodClient(
+        FAKE_RUNPOD_KEY,
+        transport=httpx.MockTransport(echo),
+        redact=(FAKE_WANDB_KEY,),
+        sleep=RecordingSleep(),
+    )
+
+    with pytest.raises(RunPodError, match="422") as info:
+        client.create_pod(
+            {"env": {"WANDB_API_KEY": FAKE_WANDB_KEY, "K": FAKE_RUNPOD_KEY}}
+        )
+
+    assert FAKE_WANDB_KEY in seen[0].content.decode()
+    assert FAKE_WANDB_KEY not in str(info.value)
+    assert FAKE_RUNPOD_KEY not in str(info.value)
+    assert info.value.detail.count("***") == 2
+
+
+def test_blank_redact_value_is_rejected() -> None:
+    with pytest.raises(ValueError, match="redact"):
+        RunPodClient(
+            FAKE_RUNPOD_KEY,
+            transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+            redact=("",),
+        )
+
+
+def test_find_pod_by_name_follows_pages_and_matches_exactly() -> None:
+    seen: list[httpx.Request] = []
+    page1 = {
+        "pods": [{"id": "p1", "name": "resetsweep-sweep-1-x"}],
+        "pagination": {"nextCursor": "c2", "hasNextPage": True},
+    }
+    page2 = {
+        "pods": [{"id": "p2", "name": "resetsweep-sweep-1", "cost": 0.89}],
+        "pagination": {"nextCursor": None, "hasNextPage": False},
+    }
+    responses = [httpx.Response(200, json=page1), httpx.Response(200, json=page2)]
+    client = _client(_scripted(responses, seen), RecordingSleep())
+
+    pod = client.find_pod_by_name("resetsweep-sweep-1")
+
+    assert pod is not None
+    assert (pod["id"], pod["name"]) == ("p2", "resetsweep-sweep-1")
+    assert seen[0].url.path == "/v2/pods"
+    assert "cursor" not in seen[0].url.params
+    assert seen[1].url.params["cursor"] == "c2"
+
+
+def test_find_pod_by_name_returns_none_when_absent() -> None:
+    seen: list[httpx.Request] = []
+    page = {
+        "pods": [{"id": "p1", "name": "other"}],
+        "pagination": {"nextCursor": None, "hasNextPage": False},
+    }
+    client = _client(
+        _scripted([httpx.Response(200, json=page)], seen), RecordingSleep()
+    )
+
+    assert client.find_pod_by_name("resetsweep-sweep-1") is None
+
+
+def test_find_pod_by_name_with_two_matches_raises() -> None:
+    seen: list[httpx.Request] = []
+    page = {
+        "pods": [{"id": "p1", "name": "dup"}, {"id": "p2", "name": "dup"}],
+        "pagination": {"nextCursor": None, "hasNextPage": False},
+    }
+    client = _client(
+        _scripted([httpx.Response(200, json=page)], seen), RecordingSleep()
+    )
+
+    with pytest.raises(RunPodError, match="2 pods named"):
+        client.find_pod_by_name("dup")

@@ -17,12 +17,19 @@ Steps:
    and the command that picks each.
 5. `max_hours = (remaining - margin) / (gpu_usd_per_h + volume_usd_per_h)`, printed.
 6. `--dry-run`: print the request bodies with secrets as "***" and stop (GETs only).
-   Otherwise create one 20 GB volume (or reuse `--volume-id`), then the pod. A pod-create 400
-   (no capacity) moves to the next candidate; any other failure, or 400 on every candidate,
-   exits 2. A volume created by this launch is then reported as orphaned with its delete
-   command and recorded in the ledger (Review Focus 3). A second volume is never created.
+   Otherwise create one 20 GB STANDARD volume (or reuse `--volume-id`), then the pod. A
+   pod-create 400 (no capacity) moves to the next candidate; another 4xx, or 400 on every
+   candidate, exits 2, and a volume created by this launch is reported as orphaned with its
+   delete command and recorded in the ledger (Review Focus 3). A 5xx or a lost connection may
+   have created the pod: it is looked up by its unique name; if found the launch goes on, if
+   not it is recorded as `unresolved`, "a pod may exist" is printed, and later launches are
+   refused until a settle finds it. A second volume or pod is never created.
 7. Record the launch in the ledger; print the pod id, the hourly cost, the W&B project and
    how to resume.
+
+Pod cap: `SWEEP_CAP_USD` is `cap - spent` for a new volume. For a reused volume it is
+`cap - (spend on other volumes) - SETUP_ALLOWANCE_USD x (earlier launches on it)`, because the
+in-pod guard already subtracts that volume's own ledger (see `_pod_cap_usd`).
 
 Resume: the pod deletes itself on any exit, SIGTERM included (budget safety over in-place
 resume). The sweep state lives on the network volume, so `sweep-launch --volume-id <id>`
@@ -52,10 +59,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 import httpx
 
@@ -104,17 +111,25 @@ REDACTED: Final = "***"
 SECRET_ENV: Final = (POD_KEY_ENV, "WANDB_API_KEY")
 API_V2: Final = "https://api.runpod.io/v2"
 GIT_TIMEOUT_S: Final = 30
+SETUP_ALLOWANCE_USD: Final = (
+    2.0  # per earlier launch on a reused volume; see _pod_cap_usd
+)
 _SELF_DELETE: Final = (
     'self_delete() { if [ -n "${RUNPOD_POD_ID:-}" ] && [ -n "${SWEEP_RUNPOD_API_KEY:-}" ]; '
     "then printf 'Authorization: Bearer %s\\n' \"$SWEEP_RUNPOD_API_KEY\" | curl -fsS -X DELETE "
     "--max-time 30 --retry 5 --retry-all-errors -H @- "
     '"https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" || true; fi; }; trap self_delete EXIT; '
 )
+# The bootstrap's EXIT trap leaves DONE-<pod id> on the volume; a restarted container of the
+# same pod sees it and deletes the pod instead of redoing paid work. A new pod (resume) has a new
+# id, so it is not blocked.
+_DONE_CHECK: Final = 'if [ -e "${SWEEP_STATE_DIR:-/workspace/sweep}/DONE-${RUNPOD_POD_ID:-}" ]; then exit 0; fi; '
 # Fetch and checkout are separate commands (not `&&`) so `set -e` stops on a failed fetch, and
 # `test -f` runs before `exec` because a failed `exec` exits without running the EXIT trap.
 CLONE_ONE_LINER: Final = (
     "set -euo pipefail; "
     + _SELF_DELETE
+    + _DONE_CHECK
     + "cd /workspace; if [ -d repo ]; then git -C repo fetch --depth 1 origin "
     '"$REPO_REF"; git -C repo checkout FETCH_HEAD; else git clone --depth 1 --branch '
     '"$REPO_REF" "$REPO_URL" repo; fi; test -f repo/scripts/pod_bootstrap.sh; '
@@ -168,7 +183,12 @@ def main(
     except (MissingSecret, FileNotFoundError, ledger.LedgerError, GitError) as e:
         _err(f"sweep-launch: {e}")
         return 1
-    client = RunPodClient(secrets.runpod_api_key, transport=transport, sleep=sleep)
+    client = RunPodClient(
+        secrets.runpod_api_key,
+        transport=transport,
+        sleep=sleep,
+        redact=(secrets.wandb_api_key,),
+    )
     try:
         return _launch(
             client,
@@ -204,6 +224,14 @@ def _launch(
     created: datetime,
 ) -> int:
     launches = ledger.settle(client, launches)
+    pending = ledger.unresolved(launches)
+    if pending:
+        names = ", ".join(str(x.name) for x in pending)
+        raise LaunchRefused(
+            f"an earlier pod create failed ambiguously and no pod named {names} was found; a pod "
+            "may exist and bill: check the RunPod console, then set its ledger entry's pod_id "
+            f"(or unresolved: false if none exists) in {ledger_path}"
+        )
     spent = ledger.total_spent_usd(launches)
     remaining = args.cap - spent
     print(
@@ -220,8 +248,18 @@ def _launch(
             f"account balance {balance:.2f} USD is below the {remaining:.2f} USD this launch may spend"
         )
     volume = _volume(client, args.volume_id)
+    pod_cap = _pod_cap_usd(args.cap, launches, volume.id)
+    if pod_cap - MARGIN_USD <= 0:
+        raise LaunchRefused(
+            f"the pod's cap would be {pod_cap:.2f} USD, not above the margin"
+        )
     gpu_id = args.gpu or GPU_DEFAULT
     gpus, datacenters = client.gpu_types(), client.datacenters()
+    if args.gpu is not None and args.gpu not in {g.id for g in gpus}:
+        _err(
+            f"sweep-launch: --gpu {args.gpu!r} is not a GPU type id in the RunPod catalog"
+        )
+        return 2
     plan = _plan(
         gpu_id,
         gpus,
@@ -257,6 +295,7 @@ def _launch(
         repo_url=repo_url,
         ref=ref,
         remaining=remaining,
+        pod_cap_usd=pod_cap,
         smoke=args.smoke,
         volume_gb=volume.size_gb,
     )
@@ -264,7 +303,9 @@ def _launch(
     print(
         f"data center {plan.datacenter}; GPUs to try: {', '.join(g.id for g in plan.candidates)}"
     )
-    print(f"remaining={remaining:.2f} USD balance={balance:.2f} USD")
+    print(
+        f"remaining={remaining:.2f} USD pod_cap={pod_cap:.2f} USD balance={balance:.2f} USD"
+    )
     _print_cost(first, volume.size_gb)
     _print_max_hours(remaining, first, volume.size_gb)
     if args.dry_run:
@@ -275,6 +316,7 @@ def _launch(
                 "name": name,
                 "size": volume.size_gb,
                 "dataCenter": plan.datacenter,
+                "type": VOLUME_TYPE,
             }
             print("dry run: POST /v2/network-volumes")
             print(json.dumps(volume_body, indent=2))
@@ -300,33 +342,45 @@ def _launch(
     else:
         volume_id = volume.id
         print(f"reusing network volume {volume_id} in {plan.datacenter}")
-    pod: dict[str, object] | None = None
-    gpu = first
-    for gpu in plan.candidates:
-        try:
-            pod = client.create_pod(
-                _pod_body(gpu, plan.datacenter, volume_id, pod_args)
-            )
-            break
-        except RunPodError as e:
-            _err(f"sweep-launch: pod create on {gpu.id} failed: {e}")
-            if e.status != 400:
-                break
+    record = ledger.Launch(
+        pod_id=None,
+        volume_id=volume_id,
+        gpu_id=None,
+        gpu_usd_per_h=None,
+        created_at=created.isoformat(),
+        spent_usd=0.0,
+        smoke=args.smoke,
+        name=name,
+    )
+    outcome, pod, gpu = _create_pod(client, plan, volume_id, pod_args)
+    if outcome == "ambiguous":
+        pending_launch = replace(
+            record, gpu_id=gpu.id, gpu_usd_per_h=gpu.secure_usd_per_h, unresolved=True
+        )
+        saved = _save_ledger(
+            ledger_path,
+            [*launches, pending_launch],
+            note=f"pod name {name}, volume {volume_id}, unresolved",
+        )
+        _err(
+            f"sweep-launch: a pod may exist — check the console for a pod named {name} "
+            f"(volume {volume_id}); later launches are refused until it is resolved"
+        )
+        return 2 if saved else 1
     if pod is None:
         if volume.reused:
             _err(
                 f"sweep-launch: no pod was created; your volume {volume_id} is unchanged"
             )
             return 2
-        orphan = ledger.Launch(
-            None, volume_id, None, None, created.isoformat(), 0.0, args.smoke
+        saved = _save_ledger(
+            ledger_path, [*launches, record], note=f"orphaned volume {volume_id}"
         )
-        ledger.save(ledger_path, [*launches, orphan])
         _err(
             f"sweep-launch: no pod was created; network volume {volume_id} is orphaned and bills until deleted:"
         )
         _err(f"  {_delete_volume_command(volume_id)}")
-        return 2
+        return 2 if saved else 1
 
     pod_id = str(pod["id"])
     cost = pod.get("cost")
@@ -339,10 +393,13 @@ def _launch(
         _err(
             f"sweep-launch: warning: pod cost {usd_per_h} USD/h differs from the catalog's {gpu.secure_usd_per_h}"
         )
-    launch = ledger.Launch(
-        pod_id, volume_id, gpu.id, usd_per_h, created.isoformat(), 0.0, args.smoke
-    )
-    ledger.save(ledger_path, [*launches, launch])
+    launch = replace(record, pod_id=pod_id, gpu_id=gpu.id, gpu_usd_per_h=usd_per_h)
+    if not _save_ledger(
+        ledger_path,
+        [*launches, launch],
+        note=f"pod {pod_id} ({name}) on volume {volume_id}, {usd_per_h} USD/h, created {created.isoformat()}",
+    ):
+        return 1
     print(f"launched pod {pod_id} on {gpu.id} in {plan.datacenter}")
     _print_cost(gpu, volume.size_gb)
     _print_max_hours(remaining, gpu, volume.size_gb)
@@ -360,6 +417,79 @@ def _launch(
     )
     print(f"  {_delete_volume_command(volume_id)}")
     return 0
+
+
+CreateOutcome = Literal["created", "failed", "ambiguous"]
+
+
+def _create_pod(
+    client: RunPodClient, plan: Plan, volume_id: str, pod_args: "_PodArgs"
+) -> tuple[CreateOutcome, dict[str, object] | None, GpuType]:
+    """Try the candidates in order. 400 moves on; another 4xx stops. A 5xx or a transport
+    failure may have created the pod, so it is looked up by its unique name and never retried
+    on another GPU (that could make a second pod)."""
+    gpu = plan.candidates[0]
+    for gpu in plan.candidates:
+        try:
+            return (
+                "created",
+                client.create_pod(_pod_body(gpu, plan.datacenter, volume_id, pod_args)),
+                gpu,
+            )
+        except RunPodError as e:
+            _err(f"sweep-launch: pod create on {gpu.id} failed: {e}")
+            if e.status == 0 or e.status >= 500:
+                return _lookup_after_ambiguous_create(client, pod_args.name, gpu)
+            if e.status != 400:
+                break
+    return "failed", None, gpu
+
+
+def _lookup_after_ambiguous_create(
+    client: RunPodClient, name: str, gpu: GpuType
+) -> tuple[CreateOutcome, dict[str, object] | None, GpuType]:
+    try:
+        found = client.find_pod_by_name(name)
+    except RunPodError as e:
+        _err(f"sweep-launch: could not look the pod up by name: {e}")
+        return "ambiguous", None, gpu
+    if found is None:
+        return "ambiguous", None, gpu
+    print(f"pod create reported an error, but pod {found['id']} named {name} exists")
+    return "created", found, gpu
+
+
+def _save_ledger(path: Path, launches: list[ledger.Launch], *, note: str) -> bool:
+    """Write the ledger; on a disk error say exactly what to record by hand."""
+    try:
+        ledger.save(path, launches)
+    except OSError as e:
+        _err(f"sweep-launch: could not write the ledger {path} ({e})")
+        _err(
+            f"  record this launch by hand, or the next launch will undercount spend: {note}"
+        )
+        return False
+    return True
+
+
+def _pod_cap_usd(
+    cap: float, launches: list[ledger.Launch], volume_id: str | None
+) -> float:
+    """`SWEEP_CAP_USD` for the pod.
+
+    A new volume: `cap - spent` (all billed spend). A reused volume (`--volume-id`): the
+    in-pod guard reloads that volume's own ledger and subtracts its sweep-run spend itself,
+    so subtracting this volume's billed spend here too would count it twice. Instead:
+    `cap - (billed spend of launches on other volumes) - SETUP_ALLOWANCE_USD x (earlier
+    launches on this volume)`. The allowance stands in for pod time on those launches outside
+    `sweep-run` (uv sync, GPU tests, the report), which the in-pod ledger never saw. Reading the
+    in-pod ledger total directly would need the network-volume S3 API, which takes separate S3
+    API keys (docs.runpod.io/storage/s3-api), so a fixed allowance it is."""
+    if volume_id is None:
+        return cap - ledger.total_spent_usd(launches)
+    other = ledger.total_spent_usd([x for x in launches if x.volume_id != volume_id])
+    same = sum(1 for x in launches if x.volume_id == volume_id)
+    return cap - other - SETUP_ALLOWANCE_USD * same
 
 
 def _volume(client: RunPodClient, volume_id: str | None) -> _Volume:
@@ -383,7 +513,8 @@ class _PodArgs:
     secrets: Secrets
     repo_url: str
     ref: str
-    remaining: float
+    remaining: float  # new money this launch may spend: sets max_hours
+    pod_cap_usd: float  # SWEEP_CAP_USD: see _pod_cap_usd
     smoke: bool
     volume_gb: int
 
@@ -399,7 +530,7 @@ def _pod_body(
         "WANDB_API_KEY": a.secrets.wandb_api_key,
         "REPO_URL": a.repo_url,
         "REPO_REF": a.ref,
-        "SWEEP_CAP_USD": _floor2(a.remaining),
+        "SWEEP_CAP_USD": _floor2(a.pod_cap_usd),
         "SWEEP_GPU_USD_PER_H": repr(gpu.secure_usd_per_h),
         "SWEEP_MAX_HOURS": _floor2(_max_hours(a.remaining, gpu, a.volume_gb)),
         "SWEEP_STATE_DIR": STATE_DIR_SMOKE if a.smoke else STATE_DIR_FULL,
@@ -420,7 +551,10 @@ def _pod_body(
         "mounts": {"network": [{"volumeId": volume_id, "path": VOLUME_MOUNT}]},
         "dataCenterIds": [datacenter],
         "env": env,
-        "cmd": ["bash", "-c", CLONE_ONE_LINER],
+        # entrypoint overrides the image's own ENTRYPOINT; cmd is its argument list
+        # (docs.runpod.io/api-reference-v2/pods/create-a-pod), so the image cannot wrap it.
+        "entrypoint": ["bash", "-c"],
+        "cmd": [CLONE_ONE_LINER],
     }
 
 

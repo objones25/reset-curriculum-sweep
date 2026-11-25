@@ -72,6 +72,13 @@ class FakeRunPod:
     pod_create_statuses: list[int] = field(default_factory=list)
     volume_create_status: int = 201
     volumes: dict[str, dict[str, object]] = field(default_factory=dict)
+    listed_pods: list[dict[str, object]] = field(default_factory=list)  # GET /v2/pods
+    created_despite_error: bool = (
+        False  # a failed create still made the pod (shows in list)
+    )
+    echo_body_on_error: bool = (
+        False  # error detail repeats the request body, as some APIs do
+    )
     requests: list[httpx.Request] = field(default_factory=list)
     _pods_created: int = 0
 
@@ -96,6 +103,13 @@ class FakeRunPod:
             ),
             ("POST", "/v2/network-volumes"): self._create_volume,
             ("POST", "/v2/pods"): self._create_pod,
+            ("GET", "/v2/pods"): lambda _: httpx.Response(
+                200,
+                json={
+                    "pods": self.listed_pods,
+                    "pagination": {"nextCursor": None, "hasNextPage": False},
+                },
+            ),
         }
         if request.method == "GET" and request.url.path.startswith(
             "/v2/network-volumes/"
@@ -129,10 +143,22 @@ class FakeRunPod:
 
     def _create_pod(self, request: httpx.Request) -> httpx.Response:
         status = self.pod_create_statuses.pop(0) if self.pod_create_statuses else 201
-        if status != 201:
-            return httpx.Response(status, json={"detail": f"fake {status}"})
-        self._pods_created += 1
         body = json.loads(request.content)
+        if status != 201:
+            if self.created_despite_error:
+                self._pods_created += 1
+                self.listed_pods.append(
+                    {
+                        "id": f"pod-{self._pods_created}",
+                        "name": body["name"],
+                        "cost": 0.69,
+                    }
+                )
+            detail = f"fake {status}" + (
+                f": {request.content.decode()}" if self.echo_body_on_error else ""
+            )
+            return httpx.Response(status, json={"detail": detail})
+        self._pods_created += 1
         [price] = [
             g["price"]["secure"] for g in self.gpus if g["id"] == body["gpu"]["id"]
         ]  # type: ignore[index]

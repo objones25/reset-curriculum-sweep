@@ -10,6 +10,9 @@
 #      environment-variables), SWEEP_RUNPOD_API_KEY and WANDB_API_KEY (from the launcher),
 #      SWEEP_STATE_DIR (default /workspace/sweep). RunPod injects its own pod-scoped
 #      RUNPOD_API_KEY; this script never uses that name, only SWEEP_RUNPOD_API_KEY.
+# On exit (any exit) the EXIT trap writes $SWEEP_STATE_DIR/DONE-$RUNPOD_POD_ID, then deletes the
+# pod: our key, then RunPod's injected key, then runpodctl, retried with backoff until
+# SWEEP_MAX_HOURS after start.
 # Exit codes: 0 the sweep finished; 1 RUNPOD_POD_ID or SWEEP_RUNPOD_API_KEY is empty (nothing run);
 #             otherwise the exit code of the step that failed.
 set -Eeuo pipefail
@@ -42,23 +45,79 @@ flush_log() {
   fi
 }
 
+# Sends one DELETE for this pod with the key in $1. The header goes in on stdin (`-H @-`,
+# curl >= 7.55) from the printf builtin, so no key ever appears in argv / ps.
+delete_with_key() {
+  set +x # never trace a line that carries a key
+  printf 'Authorization: Bearer %s\n' "$1" \
+    | curl -fsS -X DELETE --max-time 30 --retry 5 --retry-all-errors \
+      -H @- "${PODS_URL}/${RUNPOD_POD_ID}"
+}
+
+# One round of self-delete attempts: our key, then RunPod's injected pod-scoped key (if set and
+# different), then `runpodctl pod delete` (docs.runpod.io/runpodctl/reference/runpodctl-pod)
+# if installed. Returns 0 as soon as one works.
+try_delete_once() {
+  # shellcheck disable=SC2310 # predicate call: its failure is handled right here
+  if delete_with_key "$SWEEP_RUNPOD_API_KEY"; then return 0; fi
+  log "self-delete with SWEEP_RUNPOD_API_KEY failed"
+  if [[ -n ${RUNPOD_API_KEY:-} && $RUNPOD_API_KEY != "$SWEEP_RUNPOD_API_KEY" ]]; then
+    # shellcheck disable=SC2310 # predicate call: its failure is handled right here
+    if delete_with_key "$RUNPOD_API_KEY"; then return 0; fi
+    log "self-delete with the pod's injected RUNPOD_API_KEY failed"
+  fi
+  if command -v runpodctl >/dev/null 2>&1; then
+    if runpodctl pod delete "$RUNPOD_POD_ID"; then return 0; fi
+    log "runpodctl pod delete failed"
+  fi
+  return 1
+}
+
+# Seconds after script start (bash's SECONDS) at which a failing self-delete gives up:
+# SWEEP_MAX_HOURS, the budget's own bound on this pod's life (default 1 h).
+deadline_s() {
+  local hours=${SWEEP_MAX_HOURS:-1}
+  if [[ ! $hours =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    log "SWEEP_MAX_HOURS is not a number; giving self-delete 1 h"
+    hours=1
+  fi
+  awk -v h="$hours" 'BEGIN { printf "%d", h * 3600 }'
+}
+
 terminate_pod() {
   local status=$?
   trap - EXIT
   if [[ -z ${RUNPOD_POD_ID:-} ]]; then
     log "RUNPOD_POD_ID is empty: cannot self-terminate; delete this pod in the console"
-  elif [[ -z ${SWEEP_RUNPOD_API_KEY:-} ]]; then
-    log "SWEEP_RUNPOD_API_KEY is empty: cannot self-terminate pod ${RUNPOD_POD_ID}"
-  else
-    log "exit status ${status}: terminating pod ${RUNPOD_POD_ID}"
-    set +x # never trace the line that carries the key
-    # The header goes in on stdin (`-H @-`, curl >= 7.55), so the key is never in argv / ps.
-    if ! printf 'Authorization: Bearer %s\n' "$SWEEP_RUNPOD_API_KEY" \
-      | curl -fsS -X DELETE --max-time 30 --retry 5 --retry-all-errors \
-        -H @- "${PODS_URL}/${RUNPOD_POD_ID}"; then
-      log "self-terminate failed: delete pod ${RUNPOD_POD_ID} by hand"
-    fi
+    flush_log
+    exit "$status"
   fi
+  # Any exit is terminal for this pod: if RunPod restarts the container, the pod command sees
+  # this marker and deletes the pod instead of redoing paid work.
+  if ! : >"${STATE_DIR}/DONE-${RUNPOD_POD_ID}"; then
+    log "could not write the DONE marker in ${STATE_DIR}"
+  fi
+  if [[ -z ${SWEEP_RUNPOD_API_KEY:-} ]]; then
+    log "SWEEP_RUNPOD_API_KEY is empty: cannot self-terminate pod ${RUNPOD_POD_ID}"
+    flush_log
+    exit "$status"
+  fi
+  log "exit status ${status}: terminating pod ${RUNPOD_POD_ID}"
+  local deadline delay=30 wait_s
+  # shellcheck disable=SC2310 # predicate call: its failure is handled right here
+  deadline=$(deadline_s) || deadline=3600
+  # Keep trying rather than exit: an exited container may be restarted. Bounded by the deadline.
+  # shellcheck disable=SC2310 # predicate call: its failure is handled right here
+  until try_delete_once; do
+    if ((SECONDS >= deadline)); then
+      log "self-delete failed and the SWEEP_MAX_HOURS deadline passed: giving up; delete pod ${RUNPOD_POD_ID} by hand"
+      break
+    fi
+    wait_s=$((deadline - SECONDS < delay ? deadline - SECONDS : delay))
+    log "self-delete failed; retrying in ${wait_s} s"
+    sleep "$wait_s"
+    delay=$((delay * 2 > 600 ? 600 : delay * 2))
+  done
   flush_log
   exit "$status"
 }

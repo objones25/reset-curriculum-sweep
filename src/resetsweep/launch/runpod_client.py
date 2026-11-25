@@ -6,11 +6,16 @@ Endpoints, from docs.runpod.io/api-reference-v2 (read 2026-11-25 via the RunPod 
   NONE|LOW|MEDIUM|HIGH}.
 - `GET  /catalog/datacenters?include=GPU_AVAILABILITY`: `dataCenters[]` with `id`,
   `networkVolumeTypes` (STANDARD|HIGH_PERFORMANCE) and `gpuAvailability[]`.
-- `POST /network-volumes` {name, size, dataCenter} -> 201 with `id`.
+- `POST /network-volumes` {name, size, dataCenter, type: STANDARD} -> 201 with `id`. `type` is
+  sent because an omitted one gets the data center's default tier, which can be
+  HIGH_PERFORMANCE (priced differently, and refused by `--volume-id`).
 - `GET  /network-volumes/{id}` -> `id`, `size` (GB), `dataCenter`, `type`.
 - `POST /pods` -> 201 with `id` and `cost` (USD/h). 400 = no capacity or a rule violation,
   422 = validation failed.
 - `DELETE /pods/{id}` -> 204.
+- `GET  /pods` (cursor-paginated, `pagination.{nextCursor,hasNextPage}`) -> `pods[]` with
+  `id`, `name`; `find_pod_by_name` walks it and matches the name client-side (the `filters`
+  parameter's JSON schema is not documented).
 - `GET  /billing/balance` -> `balanceAmount` (USD), `billingMode`.
 - `GET  /billing/pods?podId=&startTime=&bucketSize=hour` and
   `GET  /billing/network-volumes?networkVolumeId=&startTime=&bucketSize=hour` ->
@@ -21,7 +26,8 @@ capped at 60 s; a `Retry-After` header wins (also capped at 60 s). GET and DELET
 408/425/429/5xx and on any transport error. POST is not idempotent here (a replayed create can
 make a second volume or pod), so it retries only on 408/425/429, which mean the request was not
 acted on, and on connect failures, where nothing reached the server. Every failure raises
-`RunPodError`; the API key is replaced by `***` in any detail before it is stored.
+`RunPodError`; the API key and every value in `redact` (the W&B key) are replaced by `***` in
+any detail before it is stored, since some errors echo the request body.
 
 httpx 0.28.1 (installed source): `httpx.Client(base_url=, transport=, timeout=, headers=)`,
 `httpx.MockTransport(handler)` for tests, `httpx.TransportError` as the base of connect, read
@@ -32,7 +38,7 @@ import email.utils
 import math
 import random
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -44,6 +50,9 @@ BACKOFF_BASE_S: Final = 1.0
 BACKOFF_MAX_S: Final = 60.0
 MAX_RETRIES_LIMIT: Final = 10
 DETAIL_MAX_CHARS: Final = 500
+POD_LIST_PAGES_MAX: Final = (
+    20  # x 1000 pods per page (the API default); far above real use
+)
 IDEMPOTENT_RETRY_STATUSES: Final = frozenset({408, 425, 429, 500, 502, 503, 504})
 POST_RETRY_STATUSES: Final = frozenset({408, 425, 429})
 
@@ -92,9 +101,14 @@ class RunPodClient:
         max_retries: int = 4,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        redact: Sequence[str] = (),
     ) -> None:
         if not api_key.strip():
             raise ValueError("api_key is blank")
+        if any(not v.strip() for v in redact):
+            raise ValueError(
+                "a redact value is blank; it would mask nothing or everything"
+            )
         if not 0 <= max_retries <= MAX_RETRIES_LIMIT:
             raise ValueError(
                 f"max_retries must be in [0, {MAX_RETRIES_LIMIT}], got {max_retries}"
@@ -102,6 +116,7 @@ class RunPodClient:
         if not timeout_s > 0:
             raise ValueError(f"timeout_s must be > 0, got {timeout_s}")
         self._api_key = api_key
+        self._secrets = (api_key, *redact)
         self._max_retries = max_retries
         self._sleep = sleep
         self._rng = rng or random.Random()
@@ -135,7 +150,12 @@ class RunPodClient:
     # -- resources -----------------------------------------------------------------------
 
     def create_volume(self, name: str, size_gb: int, datacenter: str) -> str:
-        body = {"name": name, "size": size_gb, "dataCenter": datacenter}
+        body = {
+            "name": name,
+            "size": size_gb,
+            "dataCenter": datacenter,
+            "type": "STANDARD",
+        }
         return _str(self._json("POST", "/network-volumes", body=body), "id")
 
     def get_volume(self, volume_id: str) -> NetworkVolume:
@@ -159,6 +179,33 @@ class RunPodClient:
         pod = self._json("POST", "/pods", body=body)
         _str(pod, "id")
         return pod
+
+    def find_pod_by_name(self, name: str) -> dict[str, Any] | None:
+        """The one pod named `name`, or None. Two pods with the name raise RunPodError."""
+        matches: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(POD_LIST_PAGES_MAX):
+            params = {} if cursor is None else {"cursor": cursor}
+            data = self._json("GET", "/pods", params=params)
+            matches += [p for p in _list(data, "pods") if p.get("name") == name]
+            pagination = data.get("pagination")
+            if not isinstance(pagination, dict) or not pagination.get("hasNextPage"):
+                break
+            cursor = pagination.get("nextCursor")
+            if not isinstance(cursor, str) or not cursor:
+                raise RunPodError(
+                    200, "malformed response: hasNextPage without nextCursor"
+                )
+        else:
+            raise RunPodError(200, f"GET /pods: more than {POD_LIST_PAGES_MAX} pages")
+        if len(matches) > 1:
+            raise RunPodError(
+                200, f"{len(matches)} pods named {name!r}; resolve by hand"
+            )
+        if matches:
+            _str(matches[0], "id")
+            return matches[0]
+        return None
 
     def delete_pod(self, pod_id: str) -> None:
         response = self._request("DELETE", f"/pods/{pod_id}")
@@ -266,7 +313,9 @@ class RunPodClient:
         return self._redact(text)[:DETAIL_MAX_CHARS] or "(empty body)"
 
     def _redact(self, text: str) -> str:
-        return text.replace(self._api_key, "***")
+        for secret in self._secrets:
+            text = text.replace(secret, "***")
+        return text
 
 
 def _parse_retry_after(value: str | None) -> float | None:

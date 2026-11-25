@@ -25,7 +25,13 @@ INJECTED_KEY = (
 STUB = """#!/usr/bin/env bash
 name=$(basename "$0")
 printf '%s %s\\n' "$name" "$*" >> "$CALLS_LOG"
-if [[ $name == curl ]]; then cat > "$CALLS_LOG.curl-stdin"; fi
+if [[ $name == curl ]]; then
+  header=$(cat)
+  printf '%s\n' "$header" >> "$CALLS_LOG.curl-stdin"
+  if [[ -n ${CURL_FAIL_MATCH:-} && $header == *"$CURL_FAIL_MATCH"* ]]; then exit 22; fi
+fi
+if [[ $name == runpodctl ]]; then exit "${RUNPODCTL_RC:-0}"; fi
+if [[ $name == sleep ]]; then /bin/sleep 0.05; exit 0; fi
 if [[ $name != curl && -n ${FAIL_STEP:-} && "$name $*" == *"$FAIL_STEP"* ]]; then exit 7; fi
 if [[ $name == git && $1 == clone ]]; then
   for last; do :; done
@@ -81,10 +87,13 @@ def test_bootstrap_script_passes_bash_n_and_shellcheck() -> None:
     assert one_liner.returncode == 0, one_liner.stdout
 
 
-def _stub_bin(tmp_path: Path) -> Path:
+def _stub_bin(tmp_path: Path, *, runpodctl: bool = False) -> Path:
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for name in ("python3", "uv", "curl", "git"):
+    bin_dir.mkdir(exist_ok=True)
+    names = ["python3", "uv", "curl", "git", "sleep"] + (
+        ["runpodctl"] if runpodctl else []
+    )
+    for name in names:
         stub = bin_dir / name
         stub.write_text(STUB, encoding="utf-8")
         stub.chmod(0o755)
@@ -92,9 +101,14 @@ def _stub_bin(tmp_path: Path) -> Path:
 
 
 def _run(
-    tmp_path: Path, *, pod_id: str = "pod-xyz", fail_step: str = ""
+    tmp_path: Path,
+    *,
+    pod_id: str = "pod-xyz",
+    fail_step: str = "",
+    runpodctl: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, list[str], str]:
-    bin_dir = _stub_bin(tmp_path)
+    bin_dir = _stub_bin(tmp_path, runpodctl=runpodctl)
     calls = tmp_path / "calls.log"
     state = tmp_path / "state"
     env = {
@@ -106,6 +120,7 @@ def _run(
         "SWEEP_RUNPOD_API_KEY": FAKE_RUNPOD_KEY,
         "RUNPOD_API_KEY": INJECTED_KEY,
         "SWEEP_STATE_DIR": str(state),
+        **(extra_env or {}),
     }
     result = subprocess.run(
         [BASH, str(SCRIPT)],
@@ -216,10 +231,16 @@ def _run_one_liner(
     pod_id: str = "pod-xyz",
     fail_step: str = "",
     repo_exists: bool = False,
+    done_marker_for: str | None = None,
 ) -> tuple[int, list[str]]:
     """The launcher's pod command, with `/workspace` swapped for a temp dir (once, checked)."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    if done_marker_for is not None:
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / f"DONE-{done_marker_for}").write_text(
+            "", encoding="utf-8"
+        )
     if repo_exists:
         (workspace / "repo" / "scripts").mkdir(parents=True)
     assert CLONE_ONE_LINER.count("cd /workspace;") == 1
@@ -235,6 +256,7 @@ def _run_one_liner(
         "RUNPOD_API_KEY": INJECTED_KEY,
         "REPO_URL": "https://example.invalid/repo.git",
         "REPO_REF": "feat/sweep",
+        "SWEEP_STATE_DIR": str(tmp_path / "state"),
     }
     result = subprocess.run(
         [BASH, "-c", command],
@@ -297,3 +319,98 @@ def test_one_liner_never_puts_a_key_on_a_command_line(tmp_path: Path) -> None:
     assert all(FAKE_RUNPOD_KEY not in c and INJECTED_KEY not in c for c in calls)
     assert "$SWEEP_RUNPOD_API_KEY" in CLONE_ONE_LINER
     assert 'RUNPOD_API_KEY"' not in CLONE_ONE_LINER.replace("SWEEP_RUNPOD_API_KEY", "")
+
+
+def _curl_headers(tmp_path: Path) -> list[str]:
+    return (tmp_path / "calls.log.curl-stdin").read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.parametrize(
+    "fail_step", ["", "pytest", "sweep-run"], ids=["success", "gpu-tests", "sweep"]
+)
+def test_done_marker_for_this_pod_is_written_on_any_exit(
+    tmp_path: Path, fail_step: str
+) -> None:
+    _run(tmp_path, fail_step=fail_step)
+
+    assert (tmp_path / "state" / "DONE-pod-xyz").exists()
+
+
+def test_delete_falls_back_to_runpods_injected_key(tmp_path: Path) -> None:
+    code, calls, _ = _run(tmp_path, extra_env={"CURL_FAIL_MATCH": FAKE_RUNPOD_KEY})
+
+    curl_calls = [c for c in calls if c.startswith("curl")]
+    assert code == 0
+    assert _curl_headers(tmp_path) == [
+        f"Authorization: Bearer {FAKE_RUNPOD_KEY}",
+        f"Authorization: Bearer {INJECTED_KEY}",
+    ]
+    assert len(curl_calls) == 2
+    assert all(FAKE_RUNPOD_KEY not in c and INJECTED_KEY not in c for c in calls)
+
+
+def test_injected_key_fallback_is_skipped_when_it_equals_ours(tmp_path: Path) -> None:
+    _run(
+        tmp_path,
+        runpodctl=True,
+        extra_env={"CURL_FAIL_MATCH": "Bearer", "RUNPOD_API_KEY": FAKE_RUNPOD_KEY},
+    )
+
+    assert _curl_headers(tmp_path) == [f"Authorization: Bearer {FAKE_RUNPOD_KEY}"]
+
+
+def test_delete_falls_back_to_runpodctl_when_both_keys_fail(tmp_path: Path) -> None:
+    code, calls, _ = _run(
+        tmp_path, runpodctl=True, extra_env={"CURL_FAIL_MATCH": "Bearer"}
+    )
+
+    assert code == 0
+    assert calls[-1] == "runpodctl pod delete pod-xyz"
+    assert len(_curl_headers(tmp_path)) == 2
+
+
+def test_all_deletes_failing_retries_with_backoff_until_the_deadline_then_exits(
+    tmp_path: Path,
+) -> None:
+    code, calls, output = _run(
+        tmp_path,
+        fail_step="sweep-run",
+        extra_env={"CURL_FAIL_MATCH": "Bearer", "SWEEP_MAX_HOURS": "0.001"},
+    )
+
+    sleeps = [c for c in calls if c.startswith("sleep ")]
+    assert code == 7
+    assert len(sleeps) >= 1
+    # waits never run past the 3 s deadline
+    assert all(int(c.split()[1]) <= 3 for c in sleeps)
+    assert len(_curl_headers(tmp_path)) > 2
+    assert "giving up" in output
+    assert FAKE_RUNPOD_KEY not in output
+
+
+def test_zero_deadline_means_a_single_round_of_attempts(tmp_path: Path) -> None:
+    _, calls, output = _run(
+        tmp_path, extra_env={"CURL_FAIL_MATCH": "Bearer", "SWEEP_MAX_HOURS": "0"}
+    )
+
+    assert [c for c in calls if c.startswith("sleep ")] == []
+    assert len(_curl_headers(tmp_path)) == 2
+    assert "giving up" in output
+
+
+def test_one_liner_with_this_pods_done_marker_self_deletes_without_cloning(
+    tmp_path: Path,
+) -> None:
+    code, calls = _run_one_liner(tmp_path, done_marker_for="pod-xyz")
+
+    assert code == 0
+    assert not any(c.startswith("git") for c in calls)
+    assert calls[-1].endswith(DELETE_URL)
+
+
+def test_one_liner_ignores_another_pods_done_marker(tmp_path: Path) -> None:
+    code, calls = _run_one_liner(tmp_path, done_marker_for="pod-older")
+
+    assert code == 0
+    assert calls[0].startswith("git clone")
+    assert calls[-1] == "bootstrap ran"

@@ -8,6 +8,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 from runpod_fakes import (
     DC,
@@ -117,6 +118,7 @@ def test_create_pod_body_has_network_mount_secure_cloud_min_cuda_and_env(
         "name": "resetsweep-sweep-20261125-103000",
         "size": 20,
         "dataCenter": DC,
+        "type": "STANDARD",
     }
     [pod] = fake_runpod.bodies("POST", "/v2/pods")
     assert pod["cloud"] == "SECURE"
@@ -129,7 +131,8 @@ def test_create_pod_body_has_network_mount_secure_cloud_min_cuda_and_env(
     assert pod["disk"] == 40
     assert pod["mounts"] == {"network": [{"volumeId": "vol-1", "path": "/workspace"}]}
     assert pod["dataCenterIds"] == [DC]
-    assert pod["cmd"] == ["bash", "-c", CLONE_ONE_LINER]
+    assert pod["entrypoint"] == ["bash", "-c"]
+    assert pod["cmd"] == [CLONE_ONE_LINER]
     env = pod["env"]
     assert isinstance(env, dict)
     assert env["SWEEP_RUNPOD_API_KEY"] == FAKE_RUNPOD_KEY
@@ -156,6 +159,7 @@ def test_clone_one_liner_installs_self_delete_trap_before_the_specified_clone() 
         '"$SWEEP_RUNPOD_API_KEY" | curl -fsS -X DELETE --max-time 30 --retry 5 '
         '--retry-all-errors -H @- "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" || true; fi; }; '
         "trap self_delete EXIT; "
+        'if [ -e "${SWEEP_STATE_DIR:-/workspace/sweep}/DONE-${RUNPOD_POD_ID:-}" ]; then exit 0; fi; '
     )
     clone = (
         "cd /workspace; if [ -d repo ]; then git -C repo fetch --depth 1 origin "
@@ -336,6 +340,8 @@ def test_launch_recorded_in_ledger_with_pod_id_price_and_time(
                 "created_at": "2026-11-25T10:30:00+00:00",
                 "spent_usd": 0.0,
                 "smoke": True,
+                "name": "resetsweep-smoke-20261125-103000",
+                "unresolved": False,
             }
         ],
     }
@@ -791,3 +797,223 @@ def test_price_ceiling_must_be_positive_and_finite(
 
     assert info.value.code == 2
     assert fake_runpod.requests == []
+
+
+# -- fix round 1 ------------------------------------------------------------------------
+
+
+def _pod_env(fake: FakeRunPod) -> dict[str, str]:
+    [pod] = fake.bodies("POST", "/v2/pods")
+    env = pod["env"]
+    assert isinstance(env, dict)
+    return env  # type: ignore[return-value]
+
+
+def test_resume_cap_does_not_double_count_this_volumes_spend(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    # $40 billed on the earlier launch of vol-old. The in-pod guard reloads vol-old's own
+    # ledger (about $38 of sweep-run time) and subtracts it again, so the pod's cap must not
+    # already exclude it: cap 100 - 0 (other volumes) - 2 (setup allowance, 1 earlier launch).
+    # The pod may then spend about 98 - 38 - 5 margin = 55 new, 95 in total.
+    _existing_volume(fake_runpod)
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch(volume_id="vol-old")])
+    fake_runpod.pod_spend_usd["pod-old"] = 39.0
+    fake_runpod.volume_spend_usd["vol-old"] = 1.0
+
+    code = _run(
+        fake_runpod, env_file, tmp_path, "--volume-id", "vol-old", ledger=ledger
+    )
+
+    env = _pod_env(fake_runpod)
+    assert code == 0
+    assert env["SWEEP_CAP_USD"] == "98.00"
+    max_hours = (60.0 - 5.0) / (0.69 + VOLUME_USD_PER_H)  # new money: 100 - 40 spent
+    assert float(env["SWEEP_MAX_HOURS"]) == pytest.approx(max_hours, abs=0.01)
+
+
+def test_resume_cap_subtracts_other_volumes_spend_and_a_setup_allowance_per_launch(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    _existing_volume(fake_runpod)
+    ledger = tmp_path / "ledger.json"
+    second = _old_launch(pod_id="pod-2") | {"created_at": "2026-11-24T20:00:00+00:00"}
+    other = _old_launch(pod_id="pod-x", volume_id="vol-other")
+    _write_ledger(ledger, [_old_launch(), second, other])
+    fake_runpod.pod_spend_usd.update({"pod-old": 20.0, "pod-2": 5.0, "pod-x": 10.0})
+    fake_runpod.volume_spend_usd["vol-other"] = 0.5
+
+    _run(fake_runpod, env_file, tmp_path, "--volume-id", "vol-old", ledger=ledger)
+
+    assert _pod_env(fake_runpod)["SWEEP_CAP_USD"] == "85.50"  # 100 - 10.5 - 2 * 2
+
+
+def test_pod_create_5xx_then_found_by_name_proceeds_as_created(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_runpod.pod_create_statuses = [503]
+    fake_runpod.created_despite_error = True
+    ledger = tmp_path / "ledger.json"
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    out = capsys.readouterr().out
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert code == 0
+    assert len(fake_runpod.sent("POST", "/v2/pods")) == 1
+    assert "launched pod pod-1" in out
+    assert [(x["pod_id"], x["unresolved"]) for x in saved["launches"]] == [
+        ("pod-1", False)
+    ]
+
+
+def test_pod_create_5xx_then_unresolved_records_and_warns(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_runpod.pod_create_statuses = [503]
+    ledger = tmp_path / "ledger.json"
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    err = capsys.readouterr().err
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    [launch] = saved["launches"]
+    assert code == 2
+    assert len(fake_runpod.sent("POST", "/v2/pods")) == 1  # never a second pod
+    assert "a pod may exist" in err
+    assert "orphaned" not in err
+    assert launch["pod_id"] is None
+    assert launch["unresolved"] is True
+    assert launch["name"] == "resetsweep-sweep-20261125-103000"
+
+
+def test_transport_failure_on_pod_create_is_treated_as_ambiguous(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        is_create = (request.method, request.url.path) == ("POST", "/v2/pods")
+        if is_create:  # audit: ignore[BRANCHING] fake transport routing
+            fake_runpod.requests.append(request)
+            raise httpx.ReadTimeout("timed out", request=request)
+        return fake_runpod.handler(request)
+
+    code = main(
+        ["--repo-url", REPO, "--ref", "feat/sweep"],
+        transport=httpx.MockTransport(handler),
+        env_path=env_file,
+        ledger_path=tmp_path / "ledger.json",
+        sleep=_no_sleep,
+        now=lambda: NOW,
+    )
+
+    assert code == 2
+    assert "a pod may exist" in capsys.readouterr().err
+
+
+def _unresolved(name: str = "resetsweep-sweep-old") -> dict[str, object]:
+    return _old_launch(pod_id=None) | {"name": name, "unresolved": True}
+
+
+def test_unresolved_launch_blocks_later_launches_until_resolved(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_unresolved()])
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    err = capsys.readouterr().err
+    assert code == 3
+    assert [r.method for r in fake_runpod.requests if r.method != "GET"] == []
+    assert "resetsweep-sweep-old" in err
+    assert "console" in err
+
+
+def test_unresolved_launch_found_by_name_is_resolved_and_settled(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_unresolved()])
+    fake_runpod.listed_pods = [{"id": "pod-found", "name": "resetsweep-sweep-old"}]
+    fake_runpod.pod_spend_usd["pod-found"] = 7.0
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert code == 0
+    assert saved["launches"][0]["pod_id"] == "pod-found"
+    assert saved["launches"][0]["unresolved"] is False
+    assert _pod_env(fake_runpod)["SWEEP_CAP_USD"] == "93.00"
+
+
+def test_old_ledger_entries_without_name_still_load(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch()])
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    assert code == 0
+
+
+def test_wandb_key_not_in_error_output_when_api_echoes_body(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_runpod.pod_create_statuses = [422]
+    fake_runpod.echo_body_on_error = True
+
+    code = _run(fake_runpod, env_file, tmp_path)
+
+    out = capsys.readouterr()
+    assert code == 2
+    assert "fake 422" in out.err
+    assert FAKE_WANDB_KEY not in out.out + out.err
+    assert FAKE_RUNPOD_KEY not in out.out + out.err
+
+
+def test_explicit_gpu_not_in_catalog_is_a_usage_error(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = _run(fake_runpod, env_file, tmp_path, "--gpu", "NVIDIA RTX 9999")
+
+    assert code == 2
+    assert [r.method for r in fake_runpod.requests if r.method != "GET"] == []
+    assert "NVIDIA RTX 9999" in capsys.readouterr().err
+
+
+def test_ledger_save_failure_after_pod_create_prints_pod_id_and_exits_1(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=blocker / "ledger.json")
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "pod-1" in err
+    assert "vol-1" in err
+    assert "ledger" in err
