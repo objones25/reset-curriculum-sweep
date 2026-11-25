@@ -1,0 +1,38 @@
+[project]
+name = "resetsweep"
+version = "0.1.0"
+description = "Sweep of reset-curriculum methods for GPU MuJoCo PPO"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "httpx==0.28.1",
+    "mujoco==4.0.1",
+    "mujoco-warp==4.0.1",
+    "numpy==2.5.5",
+    "python-dotenv==1.2.4",
+    "torch==2.15.0",
+    "wandb==0.31.2",
+    "warp-lang==1.19.0",
+]
+
+[project.scripts]
+sweep-launch = "resetsweep.launch.launcher:main"
+sweep-run = "resetsweep.sweep.main:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+xfail_strict = true
+filterwarnings = ["error"]
+markers = ["gpu: needs CUDA", "slow: > 10 s"]
+
+[dependency-groups]
+dev = [
+    "hypothesis==6.170.17",
+    "pyright==1.1.414",
+    "pytest==9.2.0",
+    "ruff==0.17.6",
+]
