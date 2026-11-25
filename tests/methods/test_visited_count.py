@@ -114,12 +114,12 @@ def test_lineage_depth_increments_along_chain(make_ctx: MakeCtx) -> None:
     _offer(method, torch.tensor([[0.1]]), torch.zeros(1, 1))  # episode from task start
     method.reset(torch.tensor([0]), None)  # only slot 0 exists: restart from depth 0
     _offer(method, torch.tensor([[0.2]]), torch.zeros(1, 1))
-    after_one = method.counts().tolist()
+    after_one = method.depths().tolist()
 
     _, ids = method.reset(torch.tensor([0]), None)
     _offer(method, torch.tensor([[0.3]]), torch.zeros(1, 1))
 
-    depth = method.counts()
+    depth = method.depths()
     assert after_one == [0, 1]
     assert int(depth[2]) == int(depth[int(ids[0])]) + 1
 
@@ -138,7 +138,38 @@ def test_lineage_depth_is_zero_after_task_start_reset(make_ctx: MakeCtx) -> None
     _offer(method, torch.tensor([[0.3]]), torch.zeros(1, 1))
 
     assert ids.tolist() == [-1]
-    assert method.counts().tolist() == [0, 1, 0]
+    assert method.depths().tolist() == [0, 1, 0]
+
+
+def test_lineage_depth_prefers_deeper_states(make_ctx: MakeCtx) -> None:
+    # The first version fed depth itself as the visit count, so deeper states were drawn
+    # less: a misreading. Depth stands in for "further from the start / rarer" (shortlist
+    # section 3, method 3), so the draw weight must grow with depth.
+    torch.manual_seed(0)
+    method, score = _build(
+        make_ctx, capacity=8, num_envs=1, min_fill=1, count="lineage_depth"
+    )
+    _offer(method, torch.tensor([[0.1]]), torch.zeros(1, 1))  # depth 0
+    method.reset(torch.tensor([0]), None)
+    _offer(method, torch.tensor([[0.2]]), torch.zeros(1, 1))  # depth 1
+    method.update(0, _stats())
+    method.reset(torch.tensor([0]), None)
+    _offer(method, torch.tensor([[0.3]]), torch.zeros(1, 1))  # depth 1 or 2
+
+    method.update(1, _stats())
+
+    depth = method.depths()
+    probs = method.slot_probs()
+    lp, _ = score.values(torch.arange(3))
+    deeper = depth.unsqueeze(1) > depth.unsqueeze(
+        0
+    )  # deeper[i, j]: slot i deeper than j
+    assert int(depth[0]) == 0
+    assert int(depth.max()) >= 1
+    assert bool((probs.unsqueeze(1) > probs.unsqueeze(0))[deeper].all())
+    # Pseudo-count max_depth - depth: the deepest slot has count 0, so lp = 1.
+    assert method.counts().tolist() == (depth.max() - depth).tolist()
+    assert lp[depth.argmax()].item() == pytest.approx(1.0)
 
 
 def test_count_weighted_draw_prefers_rare_states(make_ctx: MakeCtx) -> None:

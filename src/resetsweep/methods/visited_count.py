@@ -6,7 +6,12 @@ count comes from one of three rules (shortlist section 3, method 3):
   running mean and std (2609.08642 L257-260 counts this way for goals).
 - `lineage_depth`: the number of restarts along the chain from the task start to the episode
   the state was visited in (a state visited in an episode that began at the task start has
-  depth 0; one visited after restarting from a depth-d slot has depth d + 1).
+  depth 0; one visited after restarting from a depth-d slot has depth d + 1). Deeper states
+  are preferred: depth is a metric-free stand-in for "further from the start / rarer"
+  (reset_curriculum_shortlist.md L100, section 3 method 3). Each recompute feeds the score
+  the pseudo-count `max_depth - depth` (max over the filled slots), so lp = 1 / sqrt(max_depth
+  - depth + 1) rises monotonically with depth and the deepest slots get lp = 1. The known
+  weakness is the shortlist's: chains that wander in place also grow deep.
 - `embedding`: neighbours within `radius` in the embedding of an internal `step_distance`
   model (2407.08464), trained on consecutive visited states of one episode.
 
@@ -118,12 +123,14 @@ class VisitedCount(SlotBuffer):
             self._pair_ptr = torch.zeros((), dtype=torch.long, device=d)
             self._pair_size = torch.zeros((), dtype=torch.long, device=d)
 
+    def depths(self) -> Tensor:
+        """`(buffer_size,)` lineage depth per filled slot (tracked under every count rule)."""
+        return self._depth[: int(self._size)].clone()
+
     def counts(self) -> Tensor:
-        """`(buffer_size,)` count per filled slot: the lineage depth, or the neighbour count
-        from the last recompute (0 for slots written since)."""
-        size = int(self._size)
-        source = self._depth if self._rule == "lineage_depth" else self._counts
-        return source[:size].clone()
+        """`(buffer_size,)` count fed to the score at the last recompute (0 for slots written
+        since): the neighbour count, or the lineage pseudo-count `max_depth - depth`."""
+        return self._counts[: int(self._size)].clone()
 
     def update(self, it: int, stats: RolloutStats) -> dict[str, float]:
         super().update(it, stats)
@@ -135,7 +142,10 @@ class VisitedCount(SlotBuffer):
             return {}
         ids = torch.arange(size, device=self.ctx.device)
         if self._rule == "lineage_depth":
-            self._visit_score.set_counts(ids, self._depth[:size])
+            depth = self._depth[:size]
+            pseudo = depth.max() - depth  # deepest slot: count 0, the largest lp
+            self._counts[:size] = pseudo
+            self._visit_score.set_counts(ids, pseudo)
             self._cdf = self._draw_table(size)
             return {}
         z = self._standardise(self._buffer_features(size))
