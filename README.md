@@ -56,11 +56,15 @@ uv run pyright src
 ## Usage
 
 `sweep-launch` (`resetsweep.launch.launcher:main`) creates a network volume and a pod on RunPod.
-The pod clones this repo at `--ref`, runs `scripts/pod_bootstrap.sh`, and that runs `sweep-run`
+The pod fetches this repo at one pinned commit, runs `scripts/pod_bootstrap.sh`, and that runs `sweep-run`
 (`resetsweep.sweep.main:main`).
 
-The repo must be reachable by the pod: `--repo-url` defaults to `git remote get-url origin`, and
-`--ref` to the current branch, so push the branch first (or pass both flags).
+The repo must be reachable by the pod: `--repo-url` (an `https://` URL) defaults to
+`git remote get-url origin`. The pod checks out a commit SHA, never a moving branch: `--ref`
+(a branch, tag or SHA) is resolved on the remote with `git ls-remote`, and without it the launcher
+uses `git rev-parse HEAD`, or with `--volume-id` the SHA recorded for that volume in the ledger.
+If the remote does not serve that commit, the launcher exits 2 with "push your branch first". The
+SHA is recorded in the ledger.
 
 1. **Dry run.** Reads from RunPod only (GETs), prints the request bodies, creates nothing. Secrets
    are printed as `***`.
@@ -110,7 +114,7 @@ and the volume delete command.
 | `--max-usd-per-h X` | Price ceiling for automatic picks (the default GPU and the fallbacks). Default 1.20. If nothing at or under it has stock, the launcher exits 2 and lists the in-stock GPUs above it with the command that picks each. |
 | `--cap X` | Account-wide cap in USD, at most 100 (default 100). |
 | `--volume-id ID` | Reuse this network volume (and its data center) to resume a sweep. |
-| `--ref REF` | Git ref the pod checks out. Default: current branch. |
+| `--ref REF` | Branch, tag or SHA the pod checks out, resolved to a commit the remote serves. Default: the SHA recorded for `--volume-id`, else `git rev-parse HEAD`. A resume with a different SHA prints a warning: `sweep-run` refuses the state dir (exit 4) if the arm set changed. |
 | `--repo-url URL` | Repo the pod clones. Default: `git remote get-url origin`. |
 | `--dry-run` | Print the request bodies, create nothing. |
 | `--smoke` | Short GPU smoke run (`SWEEP_SMOKE=1`). Uses state dir `/workspace/sweep-smoke`. |
@@ -204,7 +208,7 @@ launcher as orphaned, with the same command.
 |---|---|
 | 0 | Launched, or dry run done |
 | 1 | Bad config (missing `.env` or key, corrupt ledger, git default unreadable), volume problem, or RunPod API error |
-| 2 | No pod could be created, no data center fits, an earlier pod still exists, or a usage error |
+| 2 | No pod could be created, no data center fits, an earlier pod still exists, a usage error, a non-https repo URL, or a commit the remote does not serve ("push your branch first") |
 | 3 | Refused by the budget check |
 
 `sweep-run` (on the pod): 0 finished (also when it stopped at the budget or 300 s before the

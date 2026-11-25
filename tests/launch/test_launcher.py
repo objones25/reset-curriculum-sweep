@@ -23,11 +23,36 @@ from resetsweep.launch.launcher import (
     CLONE_ONE_LINER,
     STATE_DIR_FULL,
     STATE_DIR_SMOKE,
+    GitError,
     main,
 )
 
 REPO = "https://github.com/example/reset-curriculum-sweep"
 NOW = datetime(2026, 11, 25, 10, 30, tzinfo=UTC)
+SHA = "0123456789abcdef0123456789abcdef01234567"  # what feat/sweep points at on the remote
+HEAD_SHA = "89abcdef0123456789abcdef0123456789abcdef"  # local HEAD (also pushed, on main)
+
+
+class FakeGit:
+    """Stands in for `git` (I7): `rev-parse HEAD` and `ls-remote <url>`. Records every call."""
+
+    def __init__(self, refs: dict[str, str] | None = None, *, head: str = HEAD_SHA) -> None:
+        self.refs = (
+            {"refs/heads/feat/sweep": SHA, "refs/heads/main": HEAD_SHA} if refs is None else refs
+        )
+        self.head = head
+        self.calls: list[tuple[str, ...]] = []
+        self.fail_ls_remote = False
+
+    def __call__(self, *args: str) -> str:
+        self.calls.append(args)
+        if args == ("rev-parse", "HEAD"):
+            return self.head
+        if args[0] == "ls-remote":
+            if self.fail_ls_remote:
+                raise GitError("git ls-remote failed (repository not found)")
+            return "\n".join(f"{sha}\t{ref}" for ref, sha in self.refs.items())
+        raise AssertionError(f"unexpected git call {args}")
 VOLUME_USD_PER_H = 20 * 0.07 / 730
 
 
@@ -43,14 +68,18 @@ def _run(
     tmp_path: Path,
     *args: str,
     ledger: Path | None = None,
+    git: FakeGit | None = None,
+    ref: str | None = "feat/sweep",
 ) -> int:
+    ref_args = ["--ref", ref] if ref is not None else []
     return main(
-        ["--repo-url", REPO, "--ref", "feat/sweep", *args],
+        ["--repo-url", REPO, *ref_args, *args],
         transport=fake.transport(),
         env_path=env_path,
         ledger_path=ledger or tmp_path / "ledger.json",
         sleep=_no_sleep,
         now=lambda: NOW,
+        git=git or FakeGit(),
     )
 
 
@@ -141,7 +170,7 @@ def test_create_pod_body_has_network_mount_secure_cloud_min_cuda_and_env(
     )  # RunPod may inject its own pod-scoped key under that name
     assert env["WANDB_API_KEY"] == FAKE_WANDB_KEY
     assert env["REPO_URL"] == REPO
-    assert env["REPO_REF"] == "feat/sweep"
+    assert env["REPO_REF"] == SHA  # I7: the branch resolved to the commit it points at
     assert env["SWEEP_CAP_USD"] == "100.00"
     assert env["SWEEP_GPU_USD_PER_H"] == "0.69"
     max_hours = (100.0 - 5.0) / (0.69 + VOLUME_USD_PER_H)
@@ -162,10 +191,10 @@ def test_clone_one_liner_installs_self_delete_trap_before_the_specified_clone() 
         'if [ -e "${SWEEP_STATE_DIR:-/workspace/sweep}/DONE-${RUNPOD_POD_ID:-}" ]; then exit 0; fi; '
     )
     clone = (
-        "cd /workspace; if [ -d repo ]; then git -C repo fetch --depth 1 origin "
-        '"$REPO_REF"; git -C repo checkout FETCH_HEAD; else git clone --depth 1 --branch '
-        '"$REPO_REF" "$REPO_URL" repo; fi; test -f repo/scripts/pod_bootstrap.sh; '
-        "exec bash repo/scripts/pod_bootstrap.sh"
+        "cd /workspace; if [ -d repo ]; then git -C repo remote set-url origin "
+        '"$REPO_URL"; else git init -q repo; git -C repo remote add origin "$REPO_URL"; fi; '
+        'git -C repo fetch --depth 1 origin "$REPO_REF"; git -C repo checkout -q -f FETCH_HEAD; '
+        "test -f repo/scripts/pod_bootstrap.sh; exec bash repo/scripts/pod_bootstrap.sh"
     )
 
     assert CLONE_ONE_LINER == trap + clone
@@ -345,7 +374,7 @@ def test_launch_recorded_in_ledger_with_pod_id_price_and_time(
                 # I3: the SWEEP_MAX_HOURS sent, rounded down; a smoke launch keeps the 0.50
                 # smoke margin (I6): (100 - 0.5) / (0.69 + 20 * 0.07 / 730)
                 "max_hours": 143.8,
-                "repo_sha": None,
+                "repo_sha": SHA,  # I7: the commit the pod checks out
             }
         ],
     }
@@ -918,6 +947,7 @@ def test_transport_failure_on_pod_create_is_treated_as_ambiguous(
         ledger_path=tmp_path / "ledger.json",
         sleep=_no_sleep,
         now=lambda: NOW,
+        git=FakeGit(),
     )
 
     assert code == 2
@@ -1045,6 +1075,7 @@ def test_connect_failure_on_pod_create_is_not_created_not_unresolved(
         ledger_path=ledger,
         sleep=lambda _: None,
         now=lambda: NOW,
+        git=FakeGit(),
     )
 
     err = capsys.readouterr().err
@@ -1178,3 +1209,128 @@ def test_full_run_keeps_the_5_usd_margin(
     fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
 ) -> None:
     assert _run(fake_runpod, env_file, tmp_path, "--cap", "5", "--dry-run") == 3
+
+
+# --- the pod's code is pinned to a commit (final-review I7) ---------------------------------------
+
+
+def test_default_ref_is_head_sha_checked_on_the_remote_and_recorded(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    git = FakeGit()
+    ledger = tmp_path / "ledger.json"
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger, git=git, ref=None)
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    env = pod["env"]
+    assert isinstance(env, dict)
+    assert code == 0
+    assert env["REPO_REF"] == HEAD_SHA
+    assert git.calls == [("rev-parse", "HEAD"), ("ls-remote", REPO)]
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    assert saved["launches"][0]["repo_sha"] == HEAD_SHA
+
+
+def test_unpushed_sha_is_refused_with_exit_2_before_any_http(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git = FakeGit(head="f" * 40)  # local commit the remote does not serve
+
+    code = _run(fake_runpod, env_file, tmp_path, "--dry-run", git=git, ref=None)
+
+    assert code == 2
+    assert "push your branch first" in capsys.readouterr().err
+    assert fake_runpod.requests == []
+
+
+def test_missing_remote_repo_is_refused_with_exit_2(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git = FakeGit()
+    git.fail_ls_remote = True
+
+    code = _run(fake_runpod, env_file, tmp_path, "--dry-run", git=git)
+
+    assert code == 2
+    assert "push your branch first" in capsys.readouterr().err
+    assert fake_runpod.requests == []
+
+
+def test_unknown_branch_is_refused_with_exit_2(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = _run(fake_runpod, env_file, tmp_path, "--dry-run", ref="feat/not-pushed")
+
+    assert code == 2
+    assert "push your branch first" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "url", ["git@github.com:example/repo.git", "http://github.com/example/repo"]
+)
+def test_non_https_repo_url_is_refused_with_exit_2(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path, url: str
+) -> None:
+    code = main(
+        ["--repo-url", url, "--dry-run"],
+        transport=fake_runpod.transport(),
+        env_path=env_file,
+        ledger_path=tmp_path / "ledger.json",
+        sleep=_no_sleep,
+        now=lambda: NOW,
+        git=FakeGit(),
+    )
+
+    assert code == 2
+    assert fake_runpod.requests == []
+
+
+def test_volume_resume_defaults_to_the_sha_recorded_for_that_volume(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    _existing_volume(fake_runpod)
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch() | {"repo_sha": SHA}])
+    git = FakeGit()
+
+    code = _run(
+        fake_runpod, env_file, tmp_path, "--volume-id", "vol-old", ledger=ledger, git=git, ref=None
+    )
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    env = pod["env"]
+    assert isinstance(env, dict)
+    assert code == 0
+    assert env["REPO_REF"] == SHA
+    assert ("rev-parse", "HEAD") not in git.calls
+
+
+def test_volume_resume_with_another_ref_warns_about_exit_4(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _existing_volume(fake_runpod)
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch() | {"repo_sha": SHA}])
+
+    code = _run(
+        fake_runpod, env_file, tmp_path, "--volume-id", "vol-old", "--dry-run",
+        ledger=ledger, ref="main",
+    )
+
+    err = capsys.readouterr().err
+    assert code == 0
+    assert SHA in err and HEAD_SHA in err
+    assert "exit 4" in err

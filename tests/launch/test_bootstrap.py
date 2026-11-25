@@ -40,10 +40,13 @@ if [[ $name == runpodctl ]]; then exit "${RUNPODCTL_RC:-0}"; fi
 if [[ $name == sleep ]]; then /bin/sleep 0.05; exit 0; fi
 if [[ $name != curl && -n ${FAIL_STEP:-} && "$name $*" == *"$FAIL_STEP"* ]]; then exit 7; fi
 if [[ -n ${SLOW_STEP:-} && "$name $*" == *"$SLOW_STEP"* ]]; then exec /bin/sleep 30; fi
-if [[ $name == git && $1 == clone ]]; then
+if [[ $name == git && $1 == init ]]; then
   for last; do :; done
-  mkdir -p "$last/scripts"
-  printf '%s\n' 'printf "bootstrap ran\\n" >> "$CALLS_LOG"' > "$last/scripts/pod_bootstrap.sh"
+  mkdir -p "$last"
+fi
+if [[ $name == git && $1 == -C && $3 == checkout && -z ${NO_BOOTSTRAP:-} ]]; then
+  mkdir -p "$2/scripts"
+  printf '%s\n' 'printf "bootstrap ran\\n" >> "$CALLS_LOG"' > "$2/scripts/pod_bootstrap.sh"
 fi
 exit 0
 """
@@ -258,6 +261,7 @@ def _run_one_liner(
     fail_step: str = "",
     repo_exists: bool = False,
     done_marker_for: str | None = None,
+    no_bootstrap: bool = False,
 ) -> tuple[int, list[str]]:
     """The launcher's pod command, with `/workspace` swapped for a temp dir (once, checked)."""
     workspace = tmp_path / "workspace"
@@ -281,8 +285,9 @@ def _run_one_liner(
         "SWEEP_RUNPOD_API_KEY": FAKE_RUNPOD_KEY,
         "RUNPOD_API_KEY": INJECTED_KEY,
         "REPO_URL": "https://example.invalid/repo.git",
-        "REPO_REF": "feat/sweep",
+        "REPO_REF": PINNED_SHA,
         "SWEEP_STATE_DIR": str(tmp_path / "state"),
+        "NO_BOOTSTRAP": "1" if no_bootstrap else "",
     }
     result = subprocess.run(
         [BASH, "-c", command],
@@ -296,12 +301,44 @@ def _run_one_liner(
     return result.returncode, lines
 
 
+PINNED_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_one_liner_fetches_and_checks_out_the_pinned_sha(tmp_path: Path) -> None:
+    """Final-review I7: init + fetch of the one commit + checkout FETCH_HEAD."""
+    code, calls = _run_one_liner(tmp_path)
+
+    repo = tmp_path / "workspace" / "repo"
+    assert code == 0
+    assert calls[:4] == [
+        "git init -q repo",
+        "git -C repo remote add origin https://example.invalid/repo.git",
+        f"git -C repo fetch --depth 1 origin {PINNED_SHA}",
+        "git -C repo checkout -q -f FETCH_HEAD",
+    ]
+    assert (repo / "scripts" / "pod_bootstrap.sh").exists()
+
+
+def test_one_liner_on_an_existing_clone_resets_the_url_then_fetches_the_sha(
+    tmp_path: Path,
+) -> None:
+    code, calls = _run_one_liner(tmp_path, repo_exists=True)
+
+    assert code == 0
+    assert calls[:3] == [
+        "git -C repo remote set-url origin https://example.invalid/repo.git",
+        f"git -C repo fetch --depth 1 origin {PINNED_SHA}",
+        "git -C repo checkout -q -f FETCH_HEAD",
+    ]
+
+
 def test_one_liner_failed_clone_still_terminates_pod(tmp_path: Path) -> None:
-    code, calls = _run_one_liner(tmp_path, fail_step="git clone")
+    code, calls = _run_one_liner(tmp_path, fail_step="fetch")
 
     header = (tmp_path / "calls.log.curl-stdin").read_text(encoding="utf-8")
     assert code == 7
-    assert calls[0].startswith("git clone --depth 1 --branch feat/sweep")
+    assert calls[0] == "git init -q repo"
+    assert "bootstrap ran" not in calls
     assert calls[-1].startswith("curl -fsS -X DELETE")
     assert calls[-1].endswith(DELETE_URL)
     assert header == f"Authorization: Bearer {FAKE_RUNPOD_KEY}\n"
@@ -318,7 +355,7 @@ def test_one_liner_failed_fetch_still_terminates_pod(tmp_path: Path) -> None:
 def test_one_liner_missing_bootstrap_script_still_terminates_pod(
     tmp_path: Path,
 ) -> None:
-    code, calls = _run_one_liner(tmp_path, repo_exists=True)
+    code, calls = _run_one_liner(tmp_path, repo_exists=True, no_bootstrap=True)
 
     assert code != 0
     assert calls[-1].endswith(DELETE_URL)
@@ -333,14 +370,14 @@ def test_one_liner_hands_over_to_bootstrap_without_deleting(tmp_path: Path) -> N
 
 
 def test_one_liner_without_pod_id_attempts_no_delete(tmp_path: Path) -> None:
-    code, calls = _run_one_liner(tmp_path, pod_id="", fail_step="git clone")
+    code, calls = _run_one_liner(tmp_path, pod_id="", fail_step="fetch")
 
     assert code == 7
     assert not any(c.startswith("curl") for c in calls)
 
 
 def test_one_liner_never_puts_a_key_on_a_command_line(tmp_path: Path) -> None:
-    _, calls = _run_one_liner(tmp_path, fail_step="git clone")
+    _, calls = _run_one_liner(tmp_path, fail_step="fetch")
 
     assert all(FAKE_RUNPOD_KEY not in c and INJECTED_KEY not in c for c in calls)
     assert "$SWEEP_RUNPOD_API_KEY" in CLONE_ONE_LINER
@@ -443,7 +480,7 @@ def test_one_liner_ignores_another_pods_done_marker(tmp_path: Path) -> None:
     code, calls = _run_one_liner(tmp_path, done_marker_for="pod-older")
 
     assert code == 0
-    assert calls[0].startswith("git clone")
+    assert calls[0] == "git init -q repo"
     assert calls[-1] == "bootstrap ran"
 
 

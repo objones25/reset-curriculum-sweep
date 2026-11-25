@@ -3,6 +3,11 @@
 Steps:
 1. Load `.env` secrets (`load_secrets`); a missing or blank key exits 1 naming it, before any
    HTTP call (Review Focus 4). Then load the local ledger (a corrupt ledger exits 1, no HTTP).
+   Pin the code (final-review I7): the repo URL must be https:// (else exit 2); the commit is
+   `--ref` (branch, tag or SHA), else the SHA the ledger recorded for `--volume-id`, else
+   `git rev-parse HEAD`, and `git ls-remote <url>` (argument list, 30 s timeout) must show the
+   remote serves it, else exit 2 "push your branch first". The pod gets that SHA as REPO_REF
+   and the ledger records it.
 2. Settle the ledger from the billing API: every earlier launch's pod and volume spend. Then
    refuse (exit 2, dry run included) while any earlier ledger pod still exists
    (`GET /v2/pods/{id}` answers anything but 404 or TERMINATED, EXITED included since a
@@ -58,7 +63,8 @@ Smoke and full runs get different `SWEEP_STATE_DIR`s, because `sweep-run` refuse
 state dir made by the other mode.
 
 Exit codes: 0 launched (or dry run done), 1 bad config, ledger, volume or RunPod API error,
-2 no pod could be created (or no data center fits), 3 refused by the budget check; argparse
+2 no pod could be created (or no data center fits), a non-https repo URL, or a commit the
+remote does not serve, 3 refused by the budget check; argparse
 usage errors also exit 2.
 """
 
@@ -66,6 +72,7 @@ import argparse
 import copy
 import json
 import math
+import re
 import shlex
 import subprocess
 import sys
@@ -138,19 +145,32 @@ _SELF_DELETE: Final = (
 _DONE_CHECK: Final = 'if [ -e "${SWEEP_STATE_DIR:-/workspace/sweep}/DONE-${RUNPOD_POD_ID:-}" ]; then exit 0; fi; '
 # Fetch and checkout are separate commands (not `&&`) so `set -e` stops on a failed fetch, and
 # `test -f` runs before `exec` because a failed `exec` exits without running the EXIT trap.
+# REPO_REF is a commit SHA (final-review I7), and `git clone --branch` takes only branch and tag
+# names, so the clone is init + fetch of that one commit + checkout. Sources: git-fetch(1)
+# <refspec> "<src> ... can also be a fully spelled hex object name"; gitprotocol-v2(5) fetch
+# "want <oid> ... Wants can be anything and are not limited to advertised objects" (git 2.50.1
+# man pages). A reused volume's clone gets the URL reset, then the same fetch and checkout.
 CLONE_ONE_LINER: Final = (
     "set -euo pipefail; "
     + _SELF_DELETE
     + _DONE_CHECK
-    + "cd /workspace; if [ -d repo ]; then git -C repo fetch --depth 1 origin "
-    '"$REPO_REF"; git -C repo checkout FETCH_HEAD; else git clone --depth 1 --branch '
-    '"$REPO_REF" "$REPO_URL" repo; fi; test -f repo/scripts/pod_bootstrap.sh; '
-    "exec bash repo/scripts/pod_bootstrap.sh"
+    + "cd /workspace; if [ -d repo ]; then git -C repo remote set-url origin "
+    '"$REPO_URL"; else git init -q repo; git -C repo remote add origin "$REPO_URL"; fi; '
+    'git -C repo fetch --depth 1 origin "$REPO_REF"; git -C repo checkout -q -f FETCH_HEAD; '
+    "test -f repo/scripts/pod_bootstrap.sh; exec bash repo/scripts/pod_bootstrap.sh"
 )
+_SHA_RE: Final = re.compile(r"[0-9a-f]{40}")
 
 
 class GitError(Exception):
     """A git default (`--ref`, `--repo-url`) could not be read."""
+
+
+class RefNotPushed(Exception):
+    """The repo URL does not serve the commit the pod would check out."""
+
+
+GitRunner = Callable[..., str]
 
 
 class LaunchRefused(Exception):
@@ -183,18 +203,33 @@ def main(
     ledger_path: Path | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] | None = None,
+    git: GitRunner | None = None,
 ) -> int:
     """`sweep-launch`. See the module docstring for the steps and exit codes."""
     args = _parser().parse_args(argv)
     clock = now or (lambda: datetime.now(UTC))
+    run_git = git or _git
     try:
         secrets = load_secrets(env_path)
         launches = ledger.load(ledger_path or ledger.LEDGER_PATH_DEFAULT)
-        repo_url = args.repo_url or _git("remote", "get-url", "origin")
-        ref = args.ref or _git("rev-parse", "--abbrev-ref", "HEAD")
+        repo_url = args.repo_url or run_git("remote", "get-url", "origin")
     except (MissingSecret, FileNotFoundError, ledger.LedgerError, GitError) as e:
         _err(f"sweep-launch: {e}")
         return 1
+    if not repo_url.startswith("https://"):
+        _err(
+            f"sweep-launch: the repo URL must be https:// (the pod clones it without "
+            f"credentials), got {repo_url!r}; pass --repo-url https://..."
+        )
+        return 2
+    try:
+        ref = _pinned_sha(run_git, repo_url, args.ref, launches, args.volume_id)
+    except GitError as e:
+        _err(f"sweep-launch: {e}")
+        return 1
+    except RefNotPushed as e:
+        _err(f"sweep-launch: refused: {e}; push your branch first")
+        return 2
     client = RunPodClient(
         secrets.runpod_api_key,
         transport=transport,
@@ -369,6 +404,7 @@ def _launch(
         spent_usd=0.0,
         smoke=args.smoke,
         name=name,
+        repo_sha=ref,
     )
     outcome, pod, gpu = _create_pod(client, plan, volume_id, pod_args)
     if outcome == "ambiguous":
@@ -790,6 +826,60 @@ def _delete_volume_command(volume_id: str) -> str:
     )
 
 
+def _recorded_sha(launches: list[ledger.Launch], volume_id: str | None) -> str | None:
+    """The commit the latest launch on `volume_id` checked out, if the ledger has one."""
+    if volume_id is None:
+        return None
+    shas = [x for x in launches if x.volume_id == volume_id and x.repo_sha is not None]
+    return max(shas, key=lambda x: x.created()).repo_sha if shas else None
+
+
+def _served_sha(run_git: GitRunner, repo_url: str, ref: str) -> str:
+    """The commit `repo_url` serves for `ref` (a SHA served by some ref, or a branch or tag
+    name), from `git ls-remote <url>`. Raises RefNotPushed if it serves none."""
+    try:
+        out = run_git("ls-remote", repo_url)
+    except GitError as e:
+        raise RefNotPushed(f"could not list {repo_url} ({e})") from e
+    refs: dict[str, str] = {}
+    for line in out.splitlines():
+        sha, _, name = line.partition("\t")
+        if _SHA_RE.fullmatch(sha) and name:
+            refs[name] = sha
+    if _SHA_RE.fullmatch(ref):
+        if ref in refs.values():
+            return ref
+        raise RefNotPushed(f"{repo_url} has no branch or tag at commit {ref}")
+    for name in (f"refs/heads/{ref}", f"refs/tags/{ref}"):
+        if name in refs:
+            return refs[name]
+    raise RefNotPushed(f"{repo_url} has no branch or tag named {ref!r}")
+
+
+def _pinned_sha(
+    run_git: GitRunner,
+    repo_url: str,
+    ref: str | None,
+    launches: list[ledger.Launch],
+    volume_id: str | None,
+) -> str:
+    """The commit the pod checks out (final-review I7): `--ref` resolved on the remote, else
+    the SHA recorded for `--volume-id`, else `git rev-parse HEAD`; always checked with
+    `git ls-remote` to be served by `repo_url`."""
+    recorded = _recorded_sha(launches, volume_id)
+    if ref is None:
+        ref = recorded or run_git("rev-parse", "HEAD")
+    sha = _served_sha(run_git, repo_url, ref)
+    if recorded is not None and sha != recorded:
+        _err(
+            f"sweep-launch: warning: volume {volume_id} last ran commit {recorded}; this launch "
+            f"checks out {sha}. If that changes the arm set or the run defaults, sweep-run "
+            "refuses the volume's state dir (exit 4)"
+        )
+    print(f"repo {repo_url} at commit {sha}")
+    return sha
+
+
 def _git(*args: str) -> str:
     try:
         out = subprocess.run(
@@ -858,7 +948,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ref",
         default=None,
-        help="git ref the pod checks out (default: current branch)",
+        help="branch, tag or commit SHA the pod checks out, resolved to a commit the repo URL "
+        "serves (default: the SHA recorded for --volume-id, else git rev-parse HEAD)",
     )
     p.add_argument(
         "--repo-url",
