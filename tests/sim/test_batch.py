@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import pytest
 import torch
 import warp as wp
@@ -15,6 +17,8 @@ def _make(mjcf: str, device: str = "cpu") -> BatchSim:
 
 def test_set_then_get_state_round_trips(pendulum_mjcf: str) -> None:
     sim = _make(pendulum_mjcf)
+    others = torch.tensor([0, 2])
+    sim.set_state(others, torch.tensor([[0.1], [0.2]]), torch.tensor([[0.3], [0.4]]))
     before_q, before_v = sim.get_state(torch.arange(NWORLD))
     idx = torch.tensor([1, 3])
     q = torch.tensor([[0.5], [-0.25]])
@@ -51,7 +55,9 @@ def test_restored_state_gives_same_trajectory_in_two_worlds(pendulum_mjcf: str) 
 
 
 @pytest.mark.gpu
-def test_restored_state_agrees_across_worlds_on_gpu(pendulum_mjcf: str) -> None:
+def test_restored_state_agrees_across_worlds_on_gpu(
+    pendulum_mjcf: str, record_property: Callable[[str, object], None]
+) -> None:
     sim = _make(pendulum_mjcf, device="cuda:0")
     idx = torch.tensor([1, 2], device=sim.qpos.device)
     device = sim.qpos.device
@@ -66,7 +72,7 @@ def test_restored_state_agrees_across_worlds_on_gpu(pendulum_mjcf: str) -> None:
         sim.step(ctrl)
 
     deviation_max = (sim.qpos[1] - sim.qpos[2]).abs().max().item()
-    print(f"max restore deviation on GPU: {deviation_max:.3e}")
+    record_property("max_deviation", deviation_max)
     assert torch.allclose(sim.qpos[1], sim.qpos[2], atol=1e-3)
 
 
@@ -117,3 +123,20 @@ def test_step_counter_splits_train_and_extra() -> None:
     assert counter.train == 30
     assert counter.extra == {"walk": 7, "screen": 7, "scout": 0}
     assert counter.total == 44
+
+
+@pytest.mark.parametrize("shape", [(1,), (1, 1), (NWORLD,), (NWORLD, 2)])
+def test_step_rejects_broadcastable_ctrl_shape(
+    pendulum_mjcf: str, shape: tuple[int, ...]
+) -> None:
+    sim = _make(pendulum_mjcf)
+    with pytest.raises(ValueError, match=r"ctrl shape .* expected"):
+        sim.step(torch.zeros(shape))
+
+
+def test_set_state_rejects_row_count_mismatch(pendulum_mjcf: str) -> None:
+    sim = _make(pendulum_mjcf)
+    with pytest.raises(ValueError, match="row count"):
+        sim.set_state(torch.tensor([1, 3]), torch.zeros((2, 1)), torch.zeros((3, 1)))
+    with pytest.raises(ValueError, match="row count"):
+        sim.set_state(torch.tensor([1, 3]), torch.zeros((1, 1)), torch.zeros((1, 1)))

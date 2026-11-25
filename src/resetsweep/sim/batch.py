@@ -5,9 +5,6 @@ import mujoco_warp as mjw
 import warp as wp
 from torch import Tensor
 
-# Warp 1.19 has no `config.quiet`; log_level hides the per-module "load ... (cached)" lines.
-wp.config.log_level = wp.LOG_WARNING
-
 
 class BatchSim:
     """`nworld` copies of one MJCF model stepped in lockstep on `device`."""
@@ -17,6 +14,8 @@ class BatchSim:
             raise ValueError(
                 f"nworld and frame_skip must be positive, got {nworld}, {frame_skip}"
             )
+        # Warp 1.19 has no `config.quiet`; log_level hides the per-module "load ... (cached)" lines.
+        wp.config.log_level = wp.LOG_WARNING
         self._frame_skip = frame_skip
         self._device = device
         self._graph: wp.Graph | None = None
@@ -38,9 +37,9 @@ class BatchSim:
                 with wp.ScopedCapture() as capture:
                     self._run_steps()
                 self._graph = capture.graph
-                self.reset_to_initial()
+                self._reset_to_initial()
 
-    def reset_to_initial(self) -> None:
+    def _reset_to_initial(self) -> None:
         """Restore the freshly-made-data state (also undoes the CUDA warm-up steps)."""
         with wp.ScopedDevice(self._device):
             mjw.reset_data(self.model, self.data)
@@ -50,6 +49,14 @@ class BatchSim:
         return self.qpos[idx].clone(), self.qvel[idx].clone()
 
     def set_state(self, idx: Tensor, qpos: Tensor, qvel: Tensor) -> None:
+        if not (qpos.shape[0] == qvel.shape[0] == idx.numel()):
+            raise ValueError(
+                f"row count mismatch: idx {idx.numel()}, qpos {qpos.shape[0]}, qvel {qvel.shape[0]}"
+            )
+        if qpos.device != self.qpos.device or qvel.device != self.qpos.device:
+            raise ValueError(
+                f"qpos/qvel on {qpos.device}/{qvel.device}, sim is on {self.qpos.device}"
+            )
         self.qpos[idx] = qpos
         self.qvel[idx] = qvel
         self._warmstart[idx] = 0.0
@@ -57,6 +64,10 @@ class BatchSim:
             mjw.forward(self.model, self.data)
 
     def step(self, ctrl: Tensor) -> None:
+        if ctrl.shape != self.ctrl.shape:
+            raise ValueError(
+                f"ctrl shape {tuple(ctrl.shape)}, expected {tuple(self.ctrl.shape)}"
+            )
         self.ctrl.copy_(ctrl)
         with wp.ScopedDevice(self._device):
             if self._graph is not None:
