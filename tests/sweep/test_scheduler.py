@@ -1118,3 +1118,25 @@ def test_simulated_sweep_terminates_without_duplicates_and_with_full_final_seeds
     groups = {group_of(st.arm) for st in s.states() if st.status == "final"}
     assert len(groups) == 7
     assert ("maze", (("lanes", 5),)) in groups
+
+
+def test_rung_results_returns_only_that_rungs_results(tmp_path: Path) -> None:
+    s = _finish_rung0_small(tmp_path)
+    jobs = [j for j in s.next_jobs(1000) if j.arm == V00_A]
+    for job in jobs:
+        s.report(_result(job, 0.7))
+
+    rung0 = s.rung_results(V00_A, 0)
+    rung1 = s.rung_results(V00_A, 1)
+
+    assert [(r.auc, r.seed) for r in rung0] == [(0.9, 0)]
+    assert sorted((r.auc, r.seed) for r in rung1) == [(0.7, 0), (0.7, 1), (0.7, 2)]
+    assert s.rung_results(V00_A, 2) == []
+    assert s.rung_budgets == BUDGETS
+
+
+def test_rung_results_rejects_unknown_rung(tmp_path: Path) -> None:
+    s = _new(tmp_path, SMALL_A)
+
+    with pytest.raises(ValueError, match="rung 3 out of range"):
+        s.rung_results(UNIFORM_A, 3)

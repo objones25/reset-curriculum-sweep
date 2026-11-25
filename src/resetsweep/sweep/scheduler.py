@@ -447,6 +447,16 @@ class Scheduler:
     def states(self) -> tuple[ArmState, ...]:
         return tuple(replace(st, results=list(st.results)) for st in self._states)
 
+    @property
+    def rung_budgets(self) -> tuple[int, ...]:
+        return self._budgets
+
+    def rung_results(self, arm: Arm, rung: int) -> list[RunResult]:
+        """Results `arm` got at `rung` (ok and failed); empty if it never reached it."""
+        if not 0 <= rung <= self._last_rung:
+            raise ValueError(f"rung {rung} out of range 0..{self._last_rung}")
+        return list(self._rung_results(self._index[arm], rung))
+
     # --- arms, ids, slots ----------------------------------------------------------------------
 
     def _add_arm(self, arm: Arm, *, rung: int, status: Status) -> None:
