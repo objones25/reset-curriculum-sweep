@@ -5,6 +5,7 @@ import torch
 
 from resetsweep.methods.base import MethodContext
 from resetsweep.methods.visited import Visited
+from resetsweep.tasks.base import TASKS
 
 MakeCtx = Callable[..., MethodContext]
 # chi-square 0.99 quantile, 9 degrees of freedom (standard table value)
@@ -101,19 +102,27 @@ def test_visited_p_task_mixes_task_starts(make_ctx: MakeCtx) -> None:
     assert from_task.float().mean().item() == pytest.approx(0.5, abs=0.03)
 
 
-def test_visited_keeps_extra_with_state(make_ctx: MakeCtx) -> None:
-    method = Visited(make_ctx(num_envs=1), capacity=2, min_fill=1)
+def test_visited_round_trips_task_extra_with_its_state(make_ctx: MakeCtx) -> None:
+    task = TASKS.construct("maze_coinflip")
+    method = Visited(make_ctx(task=task, num_envs=3, p_task=0.0), capacity=3)
+    base = task.canonical_start()
+    shifts = torch.tensor([[0.0, 0.0], [0.01, 0.0], [0.02, 0.0]])
+    extra = torch.tensor([[0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
     method.offer_visited(
-        torch.arange(1),
-        torch.zeros(1, 1),
-        torch.zeros(1, 1),
-        torch.zeros(1, 0),
-        torch.zeros(1, dtype=torch.long),
+        torch.arange(3),
+        base.qpos + shifts,
+        base.qvel.expand(3, -1).clone(),
+        extra,
+        torch.zeros(3, dtype=torch.long),
     )
 
-    states, _ = method.reset(torch.arange(2), None)
+    states, _ = method.reset(torch.arange(300), None)
 
-    assert states.extra.shape == (2, 0)
+    expected = extra[
+        torch.round(states.qpos[:, 0:1].sub(base.qpos[0, 0]) * 100).long()[:, 0]
+    ]
+    assert torch.equal(states.extra, expected)
+    assert torch.unique(states.extra, dim=0).shape[0] == 3
 
 
 def test_visited_entropy_is_log_buffer_size_when_p_task_zero(make_ctx: MakeCtx) -> None:

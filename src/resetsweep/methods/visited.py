@@ -27,9 +27,12 @@ CAPACITY_DEFAULT = 65536
 class Visited(MethodBase):
     """Ring buffer of visited states, all on device.
 
-    `offer_visited` has no host sync: rows that `task.is_valid` rejects (outside the start
-    box, non-finite) are routed to a spare slot at index `capacity` instead of being
-    filtered, and the write pointer advances by the device-side count of valid rows.
+    `offer_visited` adds no host syncs of its own, but it calls `task.is_valid`, which may
+    sync (contact tasks such as `arm` run a CPU contact check). Rows `is_valid` rejects are
+    routed to a spare slot at index `capacity` instead of being filtered, and the write
+    pointer advances by the device-side count of valid rows. `is_valid` includes the
+    `start_box` check, so high-velocity visited states are excluded on purpose: `VecEnv`
+    would reject them as starts.
     `reset` syncs once to read the fill level. Buffer rows hold `qpos`, `qvel` and `extra`
     (so a restored state carries e.g. the trap), copied at offer time. Rows drawn from the
     buffer get `ic_id = -1`: they are not stable ICs (slots get overwritten), so scores ignore them.
@@ -61,7 +64,7 @@ class Visited(MethodBase):
         rows = capacity + 1  # last row absorbs rejected offers
         self._qpos = torch.zeros(rows, shape.qpos.shape[1], device=d)
         self._qvel = torch.zeros(rows, shape.qvel.shape[1], device=d)
-        self._extra = torch.zeros(rows, shape.extra.shape[1], device=d)
+        self._extra = torch.zeros(rows, ctx.task.extra_dim, device=d)
         self._ptr = torch.zeros((), dtype=torch.long, device=d)
         self._size = torch.zeros((), dtype=torch.long, device=d)
 
