@@ -17,7 +17,8 @@ Contract (train.py relies on it):
   calls `score.observe_rollout` (stale cells dropped). train.py must not call either.
 - `update(it, stats)` needs `stats.ic_versions` (ValueError if None), stacked from
   `episode_versions()` once per step. Every `update_every` iterations the subclass's plan
-  runs: it names the slots to replace and proposes one child per slot.
+  runs: it names the slots to replace and proposes one child per slot. Plans rank, cull
+  and pick parents among trusted ICs only (`_ranked`); untrusted ICs stay until measured.
 - Children go through `_children`: a candidate is kept only when it is finite, inside
   `task.start_box` and accepted by `task.is_valid`, and (when `screen_seconds > 0`) passes
   a zero-action hold screen with `speed_max` = the largest |qvel| bound of `start_box`.
@@ -218,10 +219,17 @@ class PopulationMixin(MethodBase):
     # Helpers for subclasses --------------------------------------------------------------
 
     def _ranked(self) -> tuple[Tensor, Tensor, Tensor]:
-        """`(order, lp, trusted)` over all K slots; `order` lists slots best first, with ties
-        broken at random so equal scores never favour low slot ids."""
+        """`(order, lp, trusted)`: `order` lists only the trusted slots, best first, with
+        ties broken at random so equal scores never favour low slot ids. Untrusted slots
+        hold a median placeholder in `lp`, not a measurement, so selection never ranks them:
+        they are never culled and never parents until their score trusts them."""
         lp, trusted = self._score.values(torch.arange(self._k, device=self.ctx.device))
-        perm = torch.randperm(self._k, generator=self.ctx.gen, device=self.ctx.device)
+        measured = trusted.nonzero(as_tuple=True)[0]
+        perm = measured[
+            torch.randperm(
+                measured.numel(), generator=self.ctx.gen, device=self.ctx.device
+            )
+        ]
         order = perm[torch.argsort(lp[perm], descending=True, stable=True)]
         return order, lp, trusted
 
@@ -239,12 +247,17 @@ class PopulationMixin(MethodBase):
     def _keep_plan(
         self, order: Tensor, *, keep_top: float, parent_power: float
     ) -> tuple[Tensor, Tensor, Tensor] | None:
-        """Keep the top `ceil(keep_top * K)` slots; every other slot is replaced. Returns
-        `(targets, parents, quality)`: ascending targets, a kept parent slot for each drawn
-        with weight `rank^-parent_power` (rank 1 = best kept), and the parent's quality in
-        the kept pool, 1 for the best and 0 for the worst. None when nothing is replaced."""
-        n_keep = min(max(math.ceil(keep_top * self._k), 1), self._k)
-        if n_keep == self._k:
+        """Of the `n` trusted slots in `order` (from `_ranked`), keep the top
+        `ceil(keep_top * n)` and replace the other trusted ones; untrusted slots are left
+        alone. Returns `(targets, parents, quality)`: ascending targets, a kept parent slot
+        for each drawn with weight `rank^-parent_power` (rank 1 = best kept), and the
+        parent's quality in the kept pool, 1 for the best and 0 for the worst. None when
+        fewer than 2 slots are trusted or nothing is replaced."""
+        n = order.numel()
+        if n < 2:
+            return None
+        n_keep = min(max(math.ceil(keep_top * n), 1), n)
+        if n_keep == n:
             return None
         kept = order[:n_keep]
         targets = order[n_keep:].sort().values
@@ -270,6 +283,8 @@ class PopulationMixin(MethodBase):
         return torch.where(self._flat, 0.0, (x - self._low) / self._span)
 
     def _from_unit(self, u: Tensor, extra: Tensor) -> StartStates:
+        # A zero-width dim admits one value: noise must never move it off `low`.
+        u = torch.where(self._flat, 0.0, u)
         x = self._low + u * self._span
         return StartStates(x[:, : self._nq], x[:, self._nq :], extra)
 

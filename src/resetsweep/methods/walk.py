@@ -7,15 +7,18 @@ output is unfiltered (`Rollouts.random_walk`), so every child still goes through
 population filter (finite, inside `start_box`, `task.is_valid`); a rejected child is walked
 again from the same parent, up to `tries` times, then falls back to the task start.
 
-Every `update_every` iterations: the top `ceil(keep_top * K)` ICs by score are kept and
-every other IC is replaced (ours: `keep_top` is the share kept, which is also the parent
-pool). Each replaced IC gets a parent drawn from the kept ones with weight
+Every `update_every` iterations, among the `n` trusted ICs only: the top
+`ceil(keep_top * n)` by score are kept and the other trusted ICs are replaced (ours:
+`keep_top` is the share kept, which is also the parent pool). Untrusted ICs (including
+children not yet measured) are never culled and never parents; with fewer than 2 trusted
+ICs nothing is replaced. Each replaced IC gets a parent drawn from the kept ones with weight
 `rank^-parent_power` (rank 1 = best; 0 makes the draw uniform), and its child is the state
 after `walk_steps` control steps of uniform random actions held for `action_hold` steps.
 Every walk step is charged to the step counter as kind "walk". There is no spread rule
-here (the spec gives it to `ball` and `genetic` only): before any IC is trusted all scores
-equal the median, ties break at random, and the walk keeps expanding the population from
-the task start.
+here (the spec gives it to `ball` and `genetic` only). The `p_task` share of resets goes to
+the task start before any IC is chosen (`mix_task_start`); every other reset restarts from
+the env's own IC, trusted or not, because measuring untrusted ICs is how they become
+trusted. Walk has no separate `base_frac` setting.
 """
 
 from torch import Tensor

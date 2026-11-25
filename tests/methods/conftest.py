@@ -57,6 +57,9 @@ class FixedScore(BaseScore):
         self.recorded: list[Outcomes] = []
         self.observed: list[RolloutStats] = []
         self.forgotten: list[list[int]] = []
+        self.untrust_on_forget = (
+            False  # True mimics a real score: forgotten ICs need data
+        )
 
     def record(self, outcomes: Outcomes) -> None:
         self.recorded.append(outcomes)
@@ -70,6 +73,8 @@ class FixedScore(BaseScore):
 
     def forget(self, ic_ids: Tensor) -> None:
         self.forgotten.append(sorted(ic_ids.tolist()))
+        if self.untrust_on_forget:
+            self.trusted[ic_ids] = False
 
 
 @pytest.fixture

@@ -14,14 +14,20 @@ Both cull only when at least two ICs are trusted and the trusted scores' relativ
 L298-312, which selects only when fitness spread exceeds a threshold relative to the
 median), so neither culls while every score is near zero.
 
-`ball`: keeps the top `ceil(keep_top * K)` ICs and replaces the rest. Each child's parent
+Selection reads measured ICs only: untrusted ICs (a score's median placeholder, not a
+measurement) are never culled, never parents and never ranked, so a child survives until
+its score trusts it.
+
+`ball`: of the `n` trusted ICs, keeps the top `ceil(keep_top * n)` and replaces the other
+trusted ones. Each child's parent
 is a kept IC drawn with weight `rank^-parent_power`; the child is uniform in the ball of
 radius `r = r_min + (r_max - r_min) * (1 - q)^radius_power` around the parent, where `q` is
 the parent's quality in the kept pool (1 best, 0 worst): better parents search closer
 (ours, mirroring `genetic`'s "high-score parents mutate less").
 
-`genetic`: the bottom `m = min(ceil(p * K), K // 2)` ICs are replaced by children of the
-top `m`, each parent drawn uniformly from the top `m`. A child is the parent plus Gaussian
+`genetic`: with `n` trusted ICs, the bottom `m = min(ceil(p * n), n // 2)` trusted ICs
+are replaced by children of the top `m` trusted ones, each parent drawn uniformly from the
+top `m`. A child is the parent plus Gaussian
 noise of scale `sigma = sigma_min + (sigma_max - sigma_min) * (1 - q)`, `q` the parent's
 quality within the top `m`. Parents in the lower half of that pool (`q < 0.5`, ours) draw
 `n_candidates` mutations and keep the most novel valid one: the largest mean distance to
@@ -182,7 +188,8 @@ class Genetic(PopulationMixin):
         order, lp, trusted = self._ranked()
         if not self._spread_ok(lp, trusted, self._spread_threshold):
             return None
-        m = min(math.ceil(self._p * self._k), self._k // 2)
+        n = order.numel()  # trusted slots only (see `_ranked`)
+        m = min(math.ceil(self._p * n), n // 2)
         if m == 0:
             return None
         targets = order[-m:].sort().values
