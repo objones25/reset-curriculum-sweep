@@ -892,3 +892,12 @@ def test_sweep_jobs_get_per_method_ceilings_and_the_hang_guard(
 def test_settings_hang_s_override(tmp_path: Path) -> None:
     assert load_settings(_env(tmp_path)).hang_s == 900.0
     assert load_settings(_env(tmp_path, SWEEP_HANG_S="60")).hang_s == 60.0
+
+
+# --- smoke margin (final-review I6) ---------------------------------------------------------------
+
+
+def test_smoke_run_uses_the_50_cent_margin(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+    # Cap 5: a full run has 5 - 5 = 0 left and refuses; a smoke run has 4.50 to spend.
+    assert _run(_env(tmp_path / "full", SWEEP_CAP_USD="5"), clock, pool_factory) == 3
+    assert _run(_env(tmp_path / "smoke", SWEEP_CAP_USD="5", SWEEP_SMOKE="1"), clock, pool_factory) == 0

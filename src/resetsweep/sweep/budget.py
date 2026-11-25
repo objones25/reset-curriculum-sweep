@@ -40,6 +40,9 @@ _log = logging.getLogger(__name__)
 
 CAP_USD_DEFAULT: Final = 100.0
 MARGIN_USD: Final = 5.0
+# Final-review I6: a smoke run (a few dollars, `--cap 5`) keeps 0.50 for its report and
+# self-delete; a full sweep keeps MARGIN_USD.
+SMOKE_MARGIN_USD: Final = 0.5
 CALIBRATION_CAP_USD: Final = 10.0
 NETWORK_VOLUME_USD_PER_GB_MONTH: Final = 0.07
 NETWORK_VOLUME_GB: Final = 20
@@ -50,6 +53,11 @@ LEDGER_GAP_S: Final = 60.0
 
 class LedgerError(ValueError):
     """The spend ledger is unreadable or inconsistent."""
+
+
+def margin_usd(*, smoke: bool) -> float:
+    """The margin kept below the cap: `SMOKE_MARGIN_USD` for smoke runs, else `MARGIN_USD`."""
+    return SMOKE_MARGIN_USD if smoke else MARGIN_USD
 
 
 def volume_usd_per_h(gb: float) -> float:

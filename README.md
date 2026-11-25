@@ -16,7 +16,8 @@ A sweep of reset-curriculum methods for GPU MuJoCo PPO, run on one RunPod pod un
   calibration leaves. Task variants and other `p_task` values join at rung 1; `inverted(x)`
   controls and the dense tasks run only for finalists. If the rung-0 budget would fall below
   `SWEEP_MIN_R0_STEPS` (default 2,000,000 env steps) the sweep refuses to start.
-- **Budget.** Account-wide cap of $100 (`--cap` accepts at most 100), with a $5 margin.
+- **Budget.** Account-wide cap of $100 (`--cap` accepts at most 100), with a $5 margin ($0.50
+  for a `--smoke` run, so `--cap 5 --smoke` leaves $4.50 to spend).
 - **Output.** A final per-task and overall ranking (IQM with bootstrap intervals).
 
 ## Setup
@@ -142,7 +143,7 @@ Each of these limits is enforced in code:
   RunPod billing API (every earlier launch's pod and volume spend), never below a floor of
   price x min(hours since the launch, its `max_hours`) plus volume storage while billing lags or
   reads 0 for a deleted pod. It exits 3 unless
-  `cap - spent` is more than the $5 margin and the account balance is at least `cap - spent`.
+  `cap - spent` is more than the margin ($5, or $0.50 with `--smoke`) and the account balance is at least `cap - spent`.
 - **One pod at a time.** It exits 2 (dry run included) while any pod in its ledger still exists
   (any state except 404 or TERMINATED, so a stopped pod counts: it still bills its disk), and
   refuses while an earlier pod create is unresolved.

@@ -342,8 +342,9 @@ def test_launch_recorded_in_ledger_with_pod_id_price_and_time(
                 "smoke": True,
                 "name": "resetsweep-smoke-20261125-103000",
                 "unresolved": False,
-                # I3: the SWEEP_MAX_HOURS sent, (100 - 5) / (0.69 + 20 * 0.07 / 730) rounded down
-                "max_hours": 137.29,
+                # I3: the SWEEP_MAX_HOURS sent, rounded down; a smoke launch keeps the 0.50
+                # smoke margin (I6): (100 - 0.5) / (0.69 + 20 * 0.07 / 730)
+                "max_hours": 143.8,
                 "repo_sha": None,
             }
         ],
@@ -1155,3 +1156,25 @@ def test_billing_that_reads_zero_is_floored_by_the_earlier_pods_max_hours(
     assert env["SWEEP_CAP_USD"] == "95.95"
     saved = json.loads(ledger.read_text(encoding="utf-8"))
     assert saved["launches"][0]["spent_usd"] == pytest.approx(4.0 + 20 * 0.07 / 730 * 25.25)
+
+
+# --- smoke margin (final-review I6) ---------------------------------------------------------------
+
+
+def test_readme_smoke_command_cap_5_is_accepted_with_the_smoke_margin(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The README's `sweep-launch --cap 5 --smoke`: the smoke margin is 0.50, so
+    # max_hours = (5 - 0.5) / (0.69 + 20 * 0.07 / 730) = 6.50.
+    code = _run(fake_runpod, env_file, tmp_path, "--cap", "5", "--smoke", "--dry-run")
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "max_hours=6.50" in out
+    assert '"SWEEP_MAX_HOURS": "6.50"' in out
+
+
+def test_full_run_keeps_the_5_usd_margin(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    assert _run(fake_runpod, env_file, tmp_path, "--cap", "5", "--dry-run") == 3

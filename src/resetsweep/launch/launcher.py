@@ -7,7 +7,8 @@ Steps:
    refuse (exit 2, dry run included) while any earlier ledger pod still exists
    (`GET /v2/pods/{id}` answers anything but 404 or TERMINATED, EXITED included since a
    stopped pod bills its disk): its spend is not all billed yet.
-3. `remaining = cap - spent`; refuse (exit 3) unless `remaining - MARGIN_USD > 0` and the
+3. `remaining = cap - spent`; refuse (exit 3) unless `remaining - margin > 0` (margin $5, or
+   $0.50 with `--smoke`: final-review I6) and the
    account balance is at least `remaining`. Ruling (coordinator, 2026-11-25): spec 8 says
    "below the cap", but its intent is that the balance cannot run out mid-sweep, which
    `balance >= remaining` (cap minus what is already spent) satisfies.
@@ -87,8 +88,8 @@ from resetsweep.launch.runpod_client import (
 )
 from resetsweep.sweep.budget import (
     CAP_USD_DEFAULT,
-    MARGIN_USD,
     NETWORK_VOLUME_GB,
+    margin_usd,
     volume_usd_per_h,
 )
 
@@ -252,10 +253,11 @@ def _launch(
     print(
         f"ledger: {spent:.2f} USD spent by {len(launches)} earlier launch(es); cap {args.cap:.2f}"
     )
-    if remaining - MARGIN_USD <= 0:
+    margin = margin_usd(smoke=args.smoke)
+    if remaining - margin <= 0:
         raise LaunchRefused(
             f"{spent:.2f} USD already spent of the {args.cap:.2f} USD cap; "
-            f"{remaining:.2f} left is not above the {MARGIN_USD:.2f} USD margin"
+            f"{remaining:.2f} left is not above the {margin:.2f} USD margin"
         )
     balance = client.balance_usd()
     if balance < remaining:
@@ -264,7 +266,7 @@ def _launch(
         )
     volume = _volume(client, args.volume_id)
     pod_cap = _pod_cap_usd(args.cap, launches, volume.id)
-    if pod_cap - MARGIN_USD <= 0:
+    if pod_cap - margin <= 0:
         raise LaunchRefused(
             f"the pod's cap would be {pod_cap:.2f} USD, not above the margin"
         )
@@ -313,6 +315,7 @@ def _launch(
         pod_cap_usd=pod_cap,
         smoke=args.smoke,
         volume_gb=volume.size_gb,
+        margin=margin,
     )
     first = plan.candidates[0]
     print(
@@ -322,7 +325,7 @@ def _launch(
         f"remaining={remaining:.2f} USD pod_cap={pod_cap:.2f} USD balance={balance:.2f} USD"
     )
     _print_cost(first, volume.size_gb)
-    _print_max_hours(remaining, first, volume.size_gb)
+    _print_max_hours(remaining, first, volume.size_gb, margin=margin)
     if args.dry_run:
         if volume.reused:
             print(f"dry run: reusing network volume {volume.id} in {plan.datacenter}")
@@ -374,7 +377,7 @@ def _launch(
             gpu_id=gpu.id,
             gpu_usd_per_h=gpu.secure_usd_per_h,
             unresolved=True,
-            max_hours=_sent_max_hours(remaining, gpu, volume.size_gb),
+            max_hours=_sent_max_hours(remaining, gpu, volume.size_gb, margin=margin),
         )
         saved = _save_ledger(
             ledger_path,
@@ -417,7 +420,7 @@ def _launch(
         pod_id=pod_id,
         gpu_id=gpu.id,
         gpu_usd_per_h=usd_per_h,
-        max_hours=_sent_max_hours(remaining, gpu, volume.size_gb),
+        max_hours=_sent_max_hours(remaining, gpu, volume.size_gb, margin=margin),
     )
     if not _save_ledger(
         ledger_path,
@@ -427,7 +430,7 @@ def _launch(
         return 1
     print(f"launched pod {pod_id} on {gpu.id} in {plan.datacenter}")
     _print_cost(gpu, volume.size_gb)
-    _print_max_hours(remaining, gpu, volume.size_gb)
+    _print_max_hours(remaining, gpu, volume.size_gb, margin=margin)
     print(
         f"W&B project: https://wandb.ai/<your-entity>/{WANDB_PROJECT} (group = sweep id)"
     )
@@ -586,6 +589,7 @@ class _PodArgs:
     pod_cap_usd: float  # SWEEP_CAP_USD: see _pod_cap_usd
     smoke: bool
     volume_gb: int
+    margin: float
 
     def __repr__(self) -> str:
         return f"_PodArgs(name={self.name!r}, secrets=***)"
@@ -601,7 +605,7 @@ def _pod_body(
         "REPO_REF": a.ref,
         "SWEEP_CAP_USD": _floor2(a.pod_cap_usd),
         "SWEEP_GPU_USD_PER_H": repr(gpu.secure_usd_per_h),
-        "SWEEP_MAX_HOURS": _floor2(_max_hours(a.remaining, gpu, a.volume_gb)),
+        "SWEEP_MAX_HOURS": _floor2(_max_hours(a.remaining, gpu, a.volume_gb, margin=a.margin)),
         "SWEEP_STATE_DIR": STATE_DIR_SMOKE if a.smoke else STATE_DIR_FULL,
         "WANDB_PROJECT": WANDB_PROJECT,
     }
@@ -728,13 +732,13 @@ def _candidate_ids(gpu_id: str) -> tuple[str, ...]:
     return (gpu_id, *(g for g in GPU_FALLBACKS if g != gpu_id))
 
 
-def _max_hours(remaining: float, gpu: GpuType, volume_gb: int) -> float:
+def _max_hours(remaining: float, gpu: GpuType, volume_gb: int, *, margin: float) -> float:
     usd_per_h = gpu.secure_usd_per_h + volume_usd_per_h(volume_gb)
     if not usd_per_h > 0:
         raise RunPodError(
             200, f"catalog price for {gpu.id} is not positive: {gpu.secure_usd_per_h}"
         )
-    hours = (remaining - MARGIN_USD) / usd_per_h
+    hours = (remaining - margin) / usd_per_h
     if not hours > 0:
         raise AssertionError(
             f"max_hours {hours} must be positive once the budget check passed"
@@ -750,13 +754,13 @@ def _print_cost(gpu: GpuType, volume_gb: int) -> None:
     )
 
 
-def _sent_max_hours(remaining: float, gpu: GpuType, volume_gb: int) -> float:
+def _sent_max_hours(remaining: float, gpu: GpuType, volume_gb: int, *, margin: float) -> float:
     """The SWEEP_MAX_HOURS value the pod body carries, as a number (for the ledger floor)."""
-    return float(_floor2(_max_hours(remaining, gpu, volume_gb)))
+    return float(_floor2(_max_hours(remaining, gpu, volume_gb, margin=margin)))
 
 
-def _print_max_hours(remaining: float, gpu: GpuType, volume_gb: int) -> None:
-    print(f"max_hours={_max_hours(remaining, gpu, volume_gb):.2f} on {gpu.id}")
+def _print_max_hours(remaining: float, gpu: GpuType, volume_gb: int, *, margin: float) -> None:
+    print(f"max_hours={_max_hours(remaining, gpu, volume_gb, margin=margin):.2f} on {gpu.id}")
 
 
 def _floor2(x: float) -> str:

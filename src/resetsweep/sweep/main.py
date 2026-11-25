@@ -101,9 +101,9 @@ from resetsweep.sweep.budget import (
     CALIBRATION_CAP_USD,
     CAP_USD_DEFAULT,
     HEARTBEAT_S,
-    MARGIN_USD,
     NETWORK_VOLUME_GB,
     BudgetGuard,
+    margin_usd,
     volume_usd_per_h,
 )
 from resetsweep.sweep.calibration import (
@@ -927,7 +927,7 @@ def _sweep(
     sweep_id = _sweep_id(state)
     guard = BudgetGuard(
         cap_usd=settings.cap_usd,
-        margin_usd=MARGIN_USD,
+        margin_usd=margin_usd(smoke=settings.smoke),
         gpu_usd_per_h=settings.gpu_usd_per_h,
         volume_usd_per_h=volume_usd_per_h(NETWORK_VOLUME_GB),
         ledger_path=state / "ledger.jsonl",
