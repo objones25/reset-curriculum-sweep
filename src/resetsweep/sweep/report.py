@@ -7,7 +7,8 @@ Rules:
 - Equal seeds (spec section 6; controller ruling, fix round 1): a sweep stopped by the budget
   mid-rung leaves arms with different seed counts. Each group is ranked on its common seed
   count k = the fewest ok seeds among its ranked arms, using each arm's first k ok seeds in
-  seed order (deterministic; no choosing the best seeds). k is reported per group; a group
+  seed order (deterministic; no choosing the best seeds). A retry's seed is the original seed
+  plus 1000 per attempt (`scheduler.RETRY_SEED_OFFSET`), so retry seeds sort last. k is reported per group; a group
   with k < 2 is still ranked on those values but flagged "insufficient seeds".
 - Per (group, arm): IQM of the k AUCs used, 95% percentile bootstrap CI (`stats.bootstrap_ci`,
   seed 0), ok seeds, seeds used, total seeds, seeds used whose final success is 0, the rung.
@@ -31,6 +32,7 @@ as in `resetsweep.metrics.WandbSink`.
 """
 
 import json
+import logging
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
@@ -39,7 +41,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from resetsweep.metrics import WandbMode
+from resetsweep.metrics import JsonlSink, WandbMode
 from resetsweep.sweep.arms import Arm
 from resetsweep.sweep.scheduler import (
     ANCHOR_METHOD,
@@ -50,6 +52,8 @@ from resetsweep.sweep.scheduler import (
 )
 from resetsweep.sweep.stats import bootstrap_ci, iqm, normalise
 from resetsweep.train import RunResult
+
+_log = logging.getLogger(__name__)
 
 PER_TASK_COLUMNS = [
     "group",
@@ -121,6 +125,62 @@ class NullReportSink:
 
     def close(self) -> None:
         pass
+
+
+class GuardedSweepSink:
+    """The sweep-level sink used during a paid sweep: a W&B outage must never stop it.
+
+    Every live `log` and every `summary` is first written to `jsonl`, the local copy in the
+    state dir, with the running `sink_errors` count. Then it is forwarded to `primary` (W&B).
+    Any exception from `primary` is an operating error: it is logged at ERROR level with its
+    text, counted, and the sweep goes on. This is not `metrics.MultiSink`, which forwards with
+    no isolation, so a raising first sink would stop the JSONL write too. Tables are not
+    written to the JSONL: they are all in report.json. A JSONL (local disk) failure still raises.
+    """
+
+    def __init__(self, primary: ReportSink, jsonl: JsonlSink) -> None:
+        self._primary = primary
+        self._jsonl = jsonl
+        self.sink_errors = 0
+
+    def failed(self, what: str, error: BaseException) -> None:
+        """Count and log a failure of the primary sink (also used when it cannot start)."""
+        self.sink_errors += 1
+        _log.error(
+            "sweep sink %s failed (%d so far): %r; the sweep continues, metrics are in the JSONL",
+            what,
+            self.sink_errors,
+            error,
+        )
+
+    def log(self, elapsed_s: float, data: dict[str, float]) -> None:
+        try:
+            self._primary.log(elapsed_s, data)
+        except Exception as e:  # noqa: BLE001 # any W&B error is an operating error here
+            self.failed("log", e)
+        row = {**data, "elapsed_s": elapsed_s, "sink_errors": float(self.sink_errors)}
+        self._jsonl.log(round(elapsed_s), row)
+
+    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+        try:
+            self._primary.log_table(name, columns, rows)
+        except Exception as e:  # noqa: BLE001 # any W&B error is an operating error here
+            self.failed(f"log_table {name!r}", e)
+
+    def summary(self, data: dict[str, float | str]) -> None:
+        try:
+            self._primary.summary(data)
+        except Exception as e:  # noqa: BLE001 # any W&B error is an operating error here
+            self.failed("summary", e)
+        self._jsonl.summary({**data, "sink_errors": float(self.sink_errors)})
+
+    def close(self) -> None:
+        try:
+            self._primary.close()
+        except Exception as e:  # noqa: BLE001 # any W&B error is an operating error here
+            self.failed("close", e)
+        finally:
+            self._jsonl.close()
 
 
 class WandbReportSink:

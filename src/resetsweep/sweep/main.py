@@ -19,8 +19,9 @@ Steps:
    by another mode or arm set (`sweep_meta.json`), or a scheduler state without its
    calibration.json, returns 4.
 
-Live per-sweep metrics (spec 5.6) go to the sweep-level W&B run every `HEARTBEAT_S` and when
-the loop stops: spend, projected spend (spend + the pod time owed to jobs in flight), jobs
+Live per-sweep metrics (spec 5.6) go to `state_dir/sweep_metrics.jsonl` and the sweep-level W&B
+run every `HEARTBEAT_S` and when the loop stops. A W&B failure, at start or mid-run, is logged,
+counted in `sink_errors` (in the JSONL) and never stops the sweep (`GuardedSweepSink`). Metrics: spend, projected spend (spend + the pod time owed to jobs in flight), jobs
 running and done, arms by status, and the current rung per group. The report adds the arm
 table (mean, CI, LCB/UCB, rung, status) and the final ranking to the same run.
 
@@ -66,7 +67,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Protocol, get_args
 
-from resetsweep.metrics import WandbMode
+from resetsweep.metrics import JsonlSink, WandbMode
 from resetsweep.sweep.arms import Arm, arm_space
 from resetsweep.sweep.budget import (
     CALIBRATION_CAP_USD,
@@ -100,6 +101,8 @@ from resetsweep.sweep.pool import (
     failed_result,
 )
 from resetsweep.sweep.report import (
+    GuardedSweepSink,
+    NullReportSink,
     ReportSink,
     WandbReportSink,
     group_label,
@@ -566,6 +569,7 @@ def _calibration_settings(settings: Settings, device: str, cap_usd: float) -> Ca
 
 
 META_FILE: Final = "sweep_meta.json"
+SWEEP_METRICS_FILE: Final = "sweep_metrics.jsonl"  # local copy of every live sweep metric
 CALIBRATION_FILE: Final = "calibration.json"
 
 
@@ -582,7 +586,12 @@ def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
     meta = {"version": 1, "mode": "smoke" if smoke else "full", "arms_sha256": _arms_sha256(arms)}
     path = state / META_FILE
     if path.exists():
-        saved = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return f"{path} is corrupt ({e}); restore it or use another SWEEP_STATE_DIR"
+        if not isinstance(saved, dict):
+            return f"{path} is corrupt (not a JSON object); restore it or use another SWEEP_STATE_DIR"
         if saved != meta:
             return (
                 f"{path} is for a {saved.get('mode')} sweep with arm set {saved.get('arms_sha256')}, "
@@ -637,7 +646,14 @@ def _sweep(
             guard.limit_usd(),
         )
         return 3
-    sink = report_sink_factory(settings.wandb_project, sweep_id, settings.wandb_mode)
+    start_error: Exception | None = None
+    try:
+        primary = report_sink_factory(settings.wandb_project, sweep_id, settings.wandb_mode)
+    except Exception as e:  # noqa: BLE001 # W&B down at start (any error type): sweep on the JSONL copy
+        primary, start_error = NullReportSink(), e
+    sink = GuardedSweepSink(primary, JsonlSink(state / SWEEP_METRICS_FILE))
+    if start_error is not None:
+        sink.failed("start", start_error)
     try:
         return _run_sweep(
             settings,

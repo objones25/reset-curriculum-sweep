@@ -561,3 +561,72 @@ def test_loop_logs_projected_spend_including_jobs_in_flight(
     running = [d for _, d in sink.logs if d["jobs_running"] == 1]
     assert running
     assert all(d["projected_usd"] > d["spent_usd"] for d in running)
+
+
+# --- follow-up: live sink failures, corrupt meta ---------------------------------------------------
+
+
+class BrokenSink(RecordingSink):
+    """W&B is down: every call that would reach the network raises."""
+
+    def log(self, elapsed_s: float, data: dict[str, float]) -> None:
+        raise ConnectionError("wandb: network unreachable")
+
+    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+        raise ConnectionError("wandb: network unreachable")
+
+
+def _sweep_metrics(state: Path) -> list[dict[str, Any]]:
+    path = state / "sweep_metrics.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_main_finishes_when_the_live_sink_raises(
+    tmp_path: Path, clock: Any, pool_factory: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    state = tmp_path / "sweep"
+
+    code = _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory, BrokenSink())
+
+    rows = _sweep_metrics(state)
+    live = [r for r in rows if r.get("type") == "log" and "jobs_done" in r]
+    errors = [r for r in caplog.records if r.levelname == "ERROR" and "sweep sink" in r.getMessage()]
+    assert code == 0
+    assert (state / "report.md").exists()
+    assert live and live[-1]["jobs_done"] == 2
+    assert live[-1]["sink_errors"] >= 1
+    assert errors and "network unreachable" in errors[0].getMessage()
+
+
+def test_main_runs_when_the_sweep_sink_cannot_start(
+    tmp_path: Path, clock: Any, pool_factory: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    def factory(project: str, group: str, mode: str) -> RecordingSink:
+        raise ConnectionError("wandb.init: timed out")
+
+    code = main(
+        [],
+        environ=_env(tmp_path, SWEEP_SMOKE="1"),
+        clock=clock,
+        pool_factory=pool_factory,
+        report_sink_factory=factory,
+        device="cpu",
+    )
+
+    rows = _sweep_metrics(tmp_path / "sweep")
+    assert code == 0
+    assert any("jobs_done" in r for r in rows)
+    assert any("timed out" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+
+
+def test_main_exits_4_on_corrupt_sweep_meta(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    state = tmp_path / "sweep"
+    state.mkdir()
+    (state / "sweep_meta.json").write_text('{"mode": "smo')
+
+    code = _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory)
+
+    assert code == 4
+    assert world.submissions == []
