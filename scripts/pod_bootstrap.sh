@@ -23,7 +23,13 @@
 # pod: our key, then RunPod's injected key, then runpodctl, retried with backoff.
 # Exit codes: 0 the sweep finished; 1 refused to start (no RUNPOD_POD_ID or key, bad
 #             SWEEP_MAX_HOURS, corrupt START file, deadline already passed); 124 a step hit the
-#             deadline; otherwise the exit code of the step that failed.
+#             deadline and ended on TERM; 137 it ignored TERM and was KILLed 120 s later
+#             (GNU timeout's 128+9; the no-timeout watchdog reports 124 for both); otherwise
+#             the exit code of the step that failed.
+# Overrun: the deadline is checked between self-delete rounds, and one round (three curl
+# attempts with --max-time 30 --retry 5, plus runpodctl) can take a few minutes, so the last
+# round can end a few minutes past SWEEP_MAX_HOURS. The 120 s KILL grace adds to that too;
+# the 600 s reserve is meant to absorb both.
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 

@@ -3,7 +3,10 @@
 Steps:
 1. Load `.env` secrets (`load_secrets`); a missing or blank key exits 1 naming it, before any
    HTTP call (Review Focus 4). Then load the local ledger (a corrupt ledger exits 1, no HTTP).
-2. Settle the ledger from the billing API: every earlier launch's pod and volume spend.
+2. Settle the ledger from the billing API: every earlier launch's pod and volume spend. Then
+   refuse (exit 2, dry run included) while any earlier ledger pod still exists
+   (`GET /v2/pods/{id}` answers anything but 404 or TERMINATED, EXITED included since a
+   stopped pod bills its disk): its spend is not all billed yet.
 3. `remaining = cap - spent`; refuse (exit 3) unless `remaining - MARGIN_USD > 0` and the
    account balance is at least `remaining`. Ruling (coordinator, 2026-11-25): spec 8 says
    "below the cap", but its intent is that the balance cannot run out mid-sweep, which
@@ -27,8 +30,8 @@ Steps:
    Otherwise create one 20 GB STANDARD volume (or reuse `--volume-id`), then the pod. A
    pod-create 400 (no capacity) moves to the next candidate; another 4xx, or 400 on every
    candidate, exits 2, and a volume created by this launch is reported as orphaned with its
-   delete command and recorded in the ledger (Review Focus 3). A 5xx or a lost connection may
-   have created the pod: it is looked up by its unique name; if found the launch goes on, if
+   delete command and recorded in the ledger (Review Focus 3). A 5xx or a read timeout after
+   sending may have created the pod: it is looked up by its unique name; if found the launch goes on, if
    not it is recorded as `unresolved`, "a pod may exist" is printed, and later launches are
    refused until a settle finds it. A second volume or pod is never created.
 7. Record the launch in the ledger; print the pod id, the hourly cost, the W&B project and
@@ -240,6 +243,10 @@ def _launch(
             "may exist and bill: check the RunPod console, then set its ledger entry's pod_id "
             f"(or unresolved: false if none exists) in {ledger_path}"
         )
+    live = _earlier_pods_still_there(client, launches)
+    if live:
+        _report_live_pods(live)
+        return 2
     spent = ledger.total_spent_usd(launches)
     remaining = args.cap - spent
     print(
@@ -340,7 +347,7 @@ def _launch(
         try:
             volume_id = client.create_volume(name, volume.size_gb, plan.datacenter)
         except RunPodError as e:
-            # A 5xx or a lost connection after sending does not say whether the volume exists.
+            # A 5xx or a read timeout after sending does not say whether the volume exists.
             _err(
                 f"sweep-launch: volume create failed ({e}); a volume named {name} may still exist: "
                 f"check GET {API_V2}/network-volumes before launching again"
@@ -425,6 +432,47 @@ def _launch(
     )
     print(f"  {_delete_volume_command(volume_id)}")
     return 0
+
+
+GONE_STATUSES: Final = frozenset({"TERMINATED"})
+
+
+def _earlier_pods_still_there(
+    client: RunPodClient, launches: list[ledger.Launch]
+) -> list[tuple[str, str]]:
+    """(pod id, status) of every ledger pod that still exists. Billing lags, so a pod that is
+    still up has spend `settle` cannot see yet; sizing a new pod against the same remaining
+    budget could then spend it twice. 404 or TERMINATED counts as gone."""
+    live = []
+    for launch in launches:
+        if launch.pod_id is None:
+            continue
+        status = client.pod_status(launch.pod_id)
+        if status is not None and status not in GONE_STATUSES:
+            live.append((launch.pod_id, status))
+    return live
+
+
+def _report_live_pods(live: list[tuple[str, str]]) -> None:
+    _err(
+        "sweep-launch: refused: an earlier pod from the ledger still exists, and its spend is"
+    )
+    _err("  not all billed yet, so a new pod would be sized against the same money:")
+    for pod_id, status in live:
+        why = (
+            "stopped, but it still bills for its disk"
+            if status == "EXITED"
+            else "it bills while it exists"
+        )
+        _err(f"  {pod_id} ({status}): {why}")
+        _err(
+            f"    terminate it in the RunPod console (Pods > {pod_id} > Terminate), or:"
+        )
+        _err(
+            f'    curl -fsS -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" '
+            f"{API_V2}/pods/{pod_id}"
+        )
+    _err("  (to resume its sweep afterwards, relaunch with --volume-id on its volume)")
 
 
 CreateOutcome = Literal["created", "failed", "ambiguous"]

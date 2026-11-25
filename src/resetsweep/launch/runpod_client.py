@@ -13,6 +13,8 @@ Endpoints, from docs.runpod.io/api-reference-v2 (read 2026-11-25 via the RunPod 
 - `POST /pods` -> 201 with `id` and `cost` (USD/h). 400 = no capacity or a rule violation,
   422 = validation failed.
 - `DELETE /pods/{id}` -> 204.
+- `GET  /pods/{id}` -> `status` (PROVISIONING, STARTING, RUNNING, EXITED, ERROR, TERMINATED);
+  404 when the pod is not found (a terminated pod leaves the pod list).
 - `GET  /pods` (cursor-paginated, `pagination.{nextCursor,hasNextPage}`) -> `pods[]` with
   `id`, `name`; `find_pod_by_name` walks it and matches the name client-side (the `filters`
   parameter's JSON schema is not documented).
@@ -190,6 +192,16 @@ class RunPodClient:
         pod = self._json("POST", "/pods", body=body)
         _str(pod, "id")
         return pod
+
+    def pod_status(self, pod_id: str) -> str | None:
+        """The pod's `status`, or None if the API answers 404 (the pod is gone)."""
+        try:
+            data = self._json("GET", f"/pods/{pod_id}")
+        except RunPodError as e:
+            if e.status == 404:
+                return None
+            raise
+        return _str(data, "status")
 
     def find_pod_by_name(self, name: str) -> dict[str, Any] | None:
         """The one pod named `name`, or None. Two pods with the name raise RunPodError."""

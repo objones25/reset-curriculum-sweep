@@ -1052,3 +1052,83 @@ def test_connect_failure_on_pod_create_is_not_created_not_unresolved(
     assert "a pod may exist" not in err
     assert "orphaned" in err
     assert launch["unresolved"] is False
+
+
+# -- an earlier pod that still exists blocks a new launch --------------------------------
+
+
+@pytest.mark.parametrize("status", ["PROVISIONING", "STARTING", "RUNNING", "ERROR"])
+def test_refuses_launch_while_earlier_pod_running(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch()])
+    fake_runpod.pod_states["pod-old"] = status
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert [r.method for r in fake_runpod.requests if r.method != "GET"] == []
+    assert f"pod-old ({status})" in err
+    assert "console" in err
+    assert "https://api.runpod.io/v2/pods/pod-old" in err
+
+
+def test_refuses_launch_while_earlier_pod_is_stopped_but_billing_storage(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch()])
+    fake_runpod.pod_states["pod-old"] = "EXITED"
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "pod-old (EXITED)" in err
+    assert "still bills" in err
+
+
+@pytest.mark.parametrize("status", [None, "TERMINATED"], ids=["404", "terminated"])
+def test_allows_launch_when_earlier_pods_are_gone(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path, status: str | None
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(
+        ledger, [_old_launch(), _old_launch(pod_id=None, volume_id="vol-orphan")]
+    )
+    if status is not None:  # audit: ignore[BRANCHING] None means the API answers 404
+        fake_runpod.pod_states["pod-old"] = status
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    looked_up = [r.url.path for r in fake_runpod.sent("GET", "/v2/pods/pod-old")]
+    assert code == 0
+    assert looked_up == ["/v2/pods/pod-old"]
+    assert len(fake_runpod.sent("POST", "/v2/pods")) == 1
+
+
+def test_dry_run_reports_running_pod(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ledger = tmp_path / "ledger.json"
+    _write_ledger(ledger, [_old_launch()])
+    fake_runpod.pod_states["pod-old"] = "RUNNING"
+
+    code = _run(fake_runpod, env_file, tmp_path, "--dry-run", ledger=ledger)
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert {r.method for r in fake_runpod.requests} == {"GET"}
+    assert "pod-old (RUNNING)" in err

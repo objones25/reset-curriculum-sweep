@@ -442,3 +442,14 @@ def test_transport_errors_say_whether_the_request_could_have_reached_the_server(
 
     assert info.value.status == 0
     assert info.value.connect_failed is connect_failed
+
+
+def test_pod_status_reads_status_and_maps_404_to_none(fake_runpod: FakeRunPod) -> None:
+    fake_runpod.pod_states["pod-7"] = "RUNNING"
+    client = RunPodClient(FAKE_RUNPOD_KEY, transport=fake_runpod.transport())
+
+    running = client.pod_status("pod-7")
+    gone = client.pod_status("pod-gone")
+
+    assert (running, gone) == ("RUNNING", None)
+    assert fake_runpod.requests[0].url.path == "/v2/pods/pod-7"

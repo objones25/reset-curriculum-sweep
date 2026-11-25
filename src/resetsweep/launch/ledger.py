@@ -10,7 +10,8 @@ File format: `{"version": 1, "launches": [{pod_id, volume_id, gpu_id, gpu_usd_pe
 created_at (ISO 8601 with offset), spent_usd, smoke, name, unresolved}, ...]}`. `name` and
 `unresolved` default to null/false so older files still load.
 
-An `unresolved` launch is one whose pod create failed ambiguously (5xx or a lost connection):
+An `unresolved` launch is one whose pod create failed ambiguously (a 5xx or a read timeout
+after sending):
 a pod with that `name` may exist and bill. `settle` looks it up by name each time; until it is
 found, the launcher refuses new launches (a pod that already ran and deleted itself can no
 longer be found by name, so that case needs a hand edit after checking the console). A file that does not parse raises

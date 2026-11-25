@@ -73,6 +73,9 @@ class FakeRunPod:
     volume_create_status: int = 201
     volumes: dict[str, dict[str, object]] = field(default_factory=dict)
     listed_pods: list[dict[str, object]] = field(default_factory=list)  # GET /v2/pods
+    pod_states: dict[str, str] = field(
+        default_factory=dict
+    )  # GET /v2/pods/{id}; absent: 404
     created_despite_error: bool = (
         False  # a failed create still made the pod (shows in list)
     )
@@ -118,6 +121,13 @@ class FakeRunPod:
             if volume is None:
                 return httpx.Response(404, json={"detail": "volume not found"})
             return httpx.Response(200, json=volume)
+        if request.method == "GET" and request.url.path.startswith("/v2/pods/"):
+            pod_id = request.url.path.rsplit("/", 1)[1]
+            if pod_id not in self.pod_states:
+                return httpx.Response(404, json={"detail": "pod not found"})
+            return httpx.Response(
+                200, json={"id": pod_id, "status": self.pod_states[pod_id]}
+            )
         if route not in routes:
             return httpx.Response(404, json={"detail": f"no fake route {route}"})
         return routes[route](request)
