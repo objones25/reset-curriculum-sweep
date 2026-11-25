@@ -339,3 +339,45 @@ class MazePathFollower:
         desired = error / dist * speed
         # Force that would close the velocity error over ~0.25 s, as a fraction of FORCE_LIMIT_N.
         return ((desired - vel) * 2.0).clamp(-1.0, 1.0)
+
+
+class ConstantAction:
+    """Pushes with the same force every step (full throttle forward is `ConstantAction(1.0)`)."""
+
+    def __init__(self, value: float) -> None:
+        self._value = value
+
+    def __call__(self, env: VecEnv, obs: Tensor) -> Tensor:
+        return torch.full((obs.shape[0], 1), self._value)
+
+
+class RampGreedyUphill:
+    """Greedy on the dense ramp reward (the cart's height): always push the way the height rises.
+
+    Sees (s, v) in obs[:, 0:2]. `height_slope(s)` is d height / d s; ties (a flat plateau, the
+    exact vertex) push forward, the goal's direction.
+    """
+
+    def __init__(self, height_slope: Callable[[Tensor], Tensor]) -> None:
+        self._slope = height_slope
+
+    def __call__(self, env: VecEnv, obs: Tensor) -> Tensor:
+        slope = self._slope(obs[:, 0])
+        return torch.where(slope < 0, -1.0, 1.0).unsqueeze(1)
+
+
+class RampPump:
+    """Scripted back-then-forward bang-bang: push back from rest, then push the way the cart moves
+    (pumping energy), and push forward for good once on the goal plateau.
+
+    Sees (s, v) in obs[:, 0:2].
+    """
+
+    def __init__(self, goal_s: float) -> None:
+        self._goal_s = goal_s
+
+    def __call__(self, env: VecEnv, obs: Tensor) -> Tensor:
+        s, v = obs[:, 0], obs[:, 1]
+        push = torch.where(v > 0, 1.0, -1.0)  # at rest (v == 0) this pushes back
+        push = torch.where(s >= self._goal_s, 1.0, push)
+        return push.unsqueeze(1)
