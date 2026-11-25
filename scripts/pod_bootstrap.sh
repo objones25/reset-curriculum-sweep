@@ -21,6 +21,8 @@
 # cap minus all billed spend, so this pod's time cannot cost more than the money left.
 # On exit (any exit) the EXIT trap writes $SWEEP_STATE_DIR/DONE-$RUNPOD_POD_ID, then deletes the
 # pod: our key, then RunPod's injected key, then runpodctl, retried with backoff.
+# Steps: install uv, uv sync, the CUDA gate (torch and warp must both see a GPU), the GPU
+# tests, sweep-run.
 # Exit codes: 0 the sweep finished; 1 refused to start (no RUNPOD_POD_ID or key, bad
 #             SWEEP_MAX_HOURS, corrupt START file, deadline already passed); 124 a step hit the
 #             deadline and ended on TERM; 137 it ignored TERM and was KILLed 120 s later
@@ -40,6 +42,11 @@ readonly LOG_FILE="${STATE_DIR}/bootstrap.log"
 readonly RESERVE_S="${SWEEP_DEADLINE_RESERVE_S:-600}"
 readonly KILL_AFTER_S=120
 readonly DELETE_FALLBACK_S=3600 # self-delete retry window when no deadline could be computed
+# CUDA gate (final-review I1): a pod without a working GPU would run the sweep on the CPU at GPU
+# prices. Exits non-zero (so the EXIT trap deletes the pod) unless both torch and warp see CUDA.
+# torch.cuda.is_available (torch/cuda/__init__.py:222, torch 2.15.0); warp.is_cuda_available
+# (warp/_src/context.py:9277, get_cuda_device_count() > 0), warp-lang 1.19.0.
+readonly CUDA_GATE='import sys, torch, warp; t = torch.cuda.is_available(); w = warp.is_cuda_available(); print(f"CUDA gate: torch.cuda.is_available()={t} warp.is_cuda_available()={w}"); sys.exit(0 if t and w else 3)'
 
 tee_pid=""
 start_epoch=""   # this pod's first start, epoch seconds
@@ -274,6 +281,7 @@ main() {
   export PATH="${HOME}/.local/bin:${PATH}"
   run_step python3 -m pip install "uv==${UV_VERSION}"
   run_step uv sync --frozen
+  run_step uv run python -c "$CUDA_GATE"
   run_step uv run pytest -m gpu -q
   run_step uv run sweep-run
   log "sweep finished"

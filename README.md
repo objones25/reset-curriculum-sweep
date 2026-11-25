@@ -199,7 +199,10 @@ launcher as orphaned, with the same command.
 `sweep-run` (on the pod): 0 finished; 2 bad settings; 3 budget already spent, or calibration
 produced no usable measurement; 4 state dir made by another mode or arm set, or scheduler state
 without its calibration; 5 the rung-0 budget would be below `SWEEP_MIN_R0_STEPS` (the log names
-the numbers and the knobs: fewer tasks, fewer arms, fewer seeds). `scripts/pod_bootstrap.sh` exits 1 if it refuses
+the numbers and the knobs: fewer tasks, fewer arms, fewer seeds); 6 the device is the CPU on a
+RunPod pod (`RUNPOD_POD_ID` set). Before the GPU tests, `scripts/pod_bootstrap.sh` runs a CUDA
+gate (`torch.cuda.is_available()` and `warp.is_cuda_available()` must both be true); if it
+fails, the bootstrap exits and the pod deletes itself. `scripts/pod_bootstrap.sh` exits 1 if it refuses
 to start, 124 if a step hit the deadline, 137 if a step ignored TERM and was killed, otherwise
 the failing step's exit code.
 

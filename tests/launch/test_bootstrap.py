@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -164,15 +165,13 @@ def test_success_runs_steps_in_order_then_terminates_pod(tmp_path: Path) -> None
     code, calls, _ = _run(tmp_path)
 
     assert code == 0
-    assert calls[:4] == [
-        "python3 -m pip install uv==0.13.7",
-        "uv sync --frozen",
-        "uv run pytest -m gpu -q",
-        "uv run sweep-run",
-    ]
-    assert calls[4].startswith("curl -fsS -X DELETE")
-    assert calls[4].endswith(DELETE_URL)
-    assert len(calls) == 5
+    assert calls[0] == "python3 -m pip install uv==0.13.7"
+    assert calls[1] == "uv sync --frozen"
+    assert calls[2].startswith("uv run python -c ")  # the CUDA gate (I1)
+    assert calls[3:5] == ["uv run pytest -m gpu -q", "uv run sweep-run"]
+    assert calls[5].startswith("curl -fsS -X DELETE")
+    assert calls[5].endswith(DELETE_URL)
+    assert len(calls) == 6
 
 
 def test_failed_gpu_tests_stop_before_sweep_and_still_terminate_pod(
@@ -574,3 +573,62 @@ def test_unwritable_state_dir_still_self_deletes(tmp_path: Path) -> None:
     calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
     assert result.returncode != 0
     assert calls[-1].endswith(DELETE_URL)
+
+
+# --- CUDA gate (final-review I1, G5) -------------------------------------------------------------
+
+
+def _cuda_gate() -> str:
+    """The `python -c` program the bootstrap runs before any GPU work."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"^readonly CUDA_GATE='([^']+)'$", text, flags=re.MULTILINE)
+    assert match, "CUDA_GATE not found in pod_bootstrap.sh"
+    return match.group(1)
+
+
+def test_failed_cuda_gate_stops_before_gpu_tests_and_sweep_and_terminates_pod(
+    tmp_path: Path,
+) -> None:
+    code, calls, output = _run(tmp_path, fail_step="run python -c")
+
+    assert code == 7
+    assert "uv run pytest -m gpu -q" not in calls
+    assert "uv run sweep-run" not in calls
+    assert calls[-1].endswith(DELETE_URL)
+    assert "python -c" in output
+
+
+def test_cuda_gate_program_checks_torch_and_warp() -> None:
+    gate = _cuda_gate()
+
+    assert "torch.cuda.is_available()" in gate
+    assert "warp.is_cuda_available()" in gate
+
+
+@pytest.mark.skipif(
+    __import__("torch").cuda.is_available(), reason="checks the refusal on a machine without CUDA"
+)
+def test_cuda_gate_program_fails_without_cuda() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _cuda_gate()],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "CUDA" in result.stdout + result.stderr
+
+
+@pytest.mark.gpu
+def test_g5_cuda_gate_program_passes_on_the_pod() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _cuda_gate()],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

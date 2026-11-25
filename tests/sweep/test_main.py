@@ -683,3 +683,17 @@ def test_main_exits_4_on_corrupt_sweep_meta(
 
     assert code == 4
     assert world.submissions == []
+
+
+# --- no CPU fallback on a pod (final-review I1) --------------------------------------------------
+
+
+def test_main_refuses_cpu_device_on_a_runpod_pod(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+    env = _env(tmp_path, RUNPOD_POD_ID="pod-xyz")
+
+    assert _run(env, clock, pool_factory) == 6
+    assert not (tmp_path / "sweep" / "ledger.jsonl").exists()
+
+
+def test_main_allows_cpu_device_off_pod(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+    assert _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory) == 0

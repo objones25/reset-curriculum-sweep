@@ -22,7 +22,8 @@ Steps:
    done or the guard refuses a job; then wait for the jobs in flight.
 5. Write the report (`report.write_report`) and log it to a sweep-level W&B run.
 6. Return 0. Bad settings return 2; a new sweep whose budget is already spent, or calibration
-   with no usable measurement, returns 3; r0 below `SWEEP_MIN_R0_STEPS` returns 5; a state dir made
+   with no usable measurement, returns 3; r0 below `SWEEP_MIN_R0_STEPS` returns 5; device "cpu" while `RUNPOD_POD_ID` is set (a
+   pod whose GPU is not visible) returns 6; a state dir made
    by another mode or arm set (`sweep_meta.json`), or a scheduler state without its
    calibration.json, returns 4.
 
@@ -950,8 +951,9 @@ def main(
     )
     parser.parse_args(argv)
     _configure_logging()
+    env = os.environ if environ is None else environ
     try:
-        settings = load_settings(os.environ if environ is None else environ)
+        settings = load_settings(env)
     except SettingsError as e:
         _log.error("bad settings: %s", e)  # obs: allow LOG006 (a clear message; no traceback)
         return 2
@@ -959,6 +961,12 @@ def main(
         from resetsweep.device import pick_device
 
         device = pick_device()
+    if device == "cpu" and env.get("RUNPOD_POD_ID"):
+        _log.error(
+            "device is cpu on RunPod pod %s: refusing to run the sweep on the CPU at GPU prices",
+            env.get("RUNPOD_POD_ID"),
+        )
+        return 6
     return _sweep(
         settings,
         device=device,
