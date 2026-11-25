@@ -326,3 +326,53 @@ def test_step_rejects_wrong_action_shape(make_task: Callable[..., Task]) -> None
 
     with pytest.raises(ValueError, match="action"):
         env.step(torch.zeros(NUM_ENVS, 2))
+
+
+def test_final_obs_survives_reset_when_observe_returns_view(
+    make_task: Callable[..., Task],
+) -> None:
+    task = make_task(max_steps=2)
+    task.observe = lambda sim, extra: sim.qpos[:, :1]  # a view of sim state, not a copy
+    env, method, _ = _env(task)
+    env.reset_all()
+    env.ep_step.fill_(0)
+    method.start = _states([0.5])
+
+    env.step(_zeros())
+    out = env.step(_zeros())
+
+    assert out.truncated.all().item() is True
+    assert torch.allclose(out.obs, torch.full((NUM_ENVS, 1), 0.5))
+    assert torch.allclose(out.final_obs, torch.full((NUM_ENVS, 1), pi), atol=0.05)
+
+
+def test_hold_and_success_reset_between_episodes(
+    make_task: Callable[..., Task],
+) -> None:
+    # episode 1 ends with 2 success steps, episode 2 opens with 1: a leaked hold counter
+    # would reach hold_steps=3 on episode 2's first step.
+    script = [False, False, True, True, True, False, False, False]
+    env, _, _ = _env(make_task(max_steps=4, hold_steps=3, success_script=script))
+    env.reset_all()
+    env.ep_step.fill_(0)
+
+    outs = [env.step(_zeros()).outcomes for _ in range(8)]
+
+    first, second = outs[3], outs[7]
+    assert first is not None
+    assert second is not None
+    assert first.success.tolist() == [False] * NUM_ENVS
+    assert second.success.tolist() == [False] * NUM_ENVS
+
+
+def test_rejects_generator_on_wrong_device(make_task: Callable[..., Task]) -> None:
+    # A CPU generator with a "cuda" env must fail in __init__, before any CUDA work, so this
+    # runs on CPU-only machines (a meta-device Generator cannot be created).
+    with pytest.raises(ValueError, match="generator"):
+        VecEnv(
+            make_task(),
+            num_envs=2,
+            device="cuda",
+            counter=StepCounter(budget=100),
+            gen=torch.Generator(device="cpu"),
+        )

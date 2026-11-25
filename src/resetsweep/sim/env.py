@@ -37,12 +37,22 @@ class _ResetMethod(Protocol):
     ) -> None: ...
 
 
+def _check_generator_device(gen: torch.Generator, device: str) -> None:
+    want = torch.device(device)
+    if gen.device.type != want.type or (
+        gen.device.index is not None
+        and want.index is not None
+        and gen.device.index != want.index
+    ):
+        raise ValueError(f"generator is on {gen.device}, but the env device is {want}")
+
+
 class VecEnv:
     """`num_envs` copies of `task`, auto-reset through the bound method.
 
-    No `.item()`/`.cpu()` on the per-step path. Finding which envs finished
-    (`nonzero`) and validating the method's start states sync the host, and only
-    happen on steps where some env finished.
+    No `.item()`/`.cpu()` on the per-step path, but `done.nonzero()` syncs the host
+    once per step (it returns a variable-size result). Validating the method's start
+    states adds a second sync, only on steps where some env finished.
     """
 
     def __init__(
@@ -63,6 +73,7 @@ class VecEnv:
             raise ValueError(
                 f"max_steps and hold_steps must be positive, got {task.max_steps}, {task.hold_steps}"
             )
+        _check_generator_device(gen, device)
         self.task = task
         self.num_envs = num_envs
         self.device = device
@@ -124,7 +135,8 @@ class VecEnv:
         )
         self._success |= self._hold >= self.task.hold_steps
         truncated = (self.ep_step >= self.task.max_steps) & ~terminated
-        final_obs = self.task.observe(self.sim, self.extra)
+        # clone: `observe` may return a view of sim state, which the reset below overwrites
+        final_obs = self.task.observe(self.sim, self.extra).clone()
 
         if self._t % self._visit_every == 0:
             qpos, qvel = self.sim.get_state(

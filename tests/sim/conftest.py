@@ -1,4 +1,13 @@
+import math
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
 import pytest
+import torch
+from torch import Tensor
+
+from resetsweep.sim.batch import BatchSim
+from resetsweep.types import Box, StartStates
 
 PENDULUM_TIMESTEP_S = 0.002
 
@@ -30,16 +39,6 @@ def pendulum_timestep_s() -> float:
 
 
 # --- stub task -------------------------------------------------------------
-
-import math
-from collections.abc import Callable
-from dataclasses import dataclass, field
-
-import torch
-from torch import Tensor
-
-from resetsweep.sim.batch import BatchSim
-from resetsweep.types import Box, StartStates
 
 _SUCCESS_TOL_RAD = 0.1
 
@@ -100,7 +99,7 @@ class StubTask:
         self, sim: BatchSim, extra: Tensor, *, _count: bool = True
     ) -> Tensor:
         if self.success_script is None:
-            wrapped = (sim.qpos[:, 0] - math.pi + math.pi) % (2 * math.pi) - math.pi
+            wrapped = sim.qpos[:, 0] % (2 * math.pi) - math.pi
             return wrapped.abs() < _SUCCESS_TOL_RAD
         flag = self.success_script[
             min(self._success_calls, len(self.success_script) - 1)
