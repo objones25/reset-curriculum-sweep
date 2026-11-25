@@ -11,11 +11,11 @@ contacts are frictionless (condim 1), so the puck is only ever shoved along the 
 """
 
 import torch
-import warp as wp
 from torch import Tensor
 
 from resetsweep.sim.batch import BatchSim
 from resetsweep.tasks.base import TASKS
+from resetsweep.tasks.contacts import InterpenetrationCheck
 from resetsweep.types import Box, StartStates
 
 LINK_LENGTHS_M = (0.30, 0.28, 0.22)
@@ -45,7 +45,6 @@ _ARM_START_NOISE_RAD = 0.15
 # were measured to sag up to 1.3 cm, and the soft-contact time constant cannot go below twice
 # the timestep, so the contacts cannot be made stiffer.
 PENETRATION_TOL_M = 0.02
-_VALIDATION_CHUNK = 128
 _ACTION_COST = 0.01
 _MJCF = f"""
 <mujoco model="arm_push">
@@ -116,7 +115,12 @@ class _Arm:
             + [_PUCK_SPIN_SPEED_RAD_S]
         )
         self.start_box = Box(-bound, bound)
-        self._validation_sim: BatchSim | None = None  # built on the first is_valid call
+        self._contacts = InterpenetrationCheck(
+            self.mjcf,
+            frame_skip=self.frame_skip,
+            canonical=self.canonical_start(),
+            tolerance_m=PENETRATION_TOL_M,
+        )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
         arm = (
@@ -158,57 +162,12 @@ class _Arm:
         low = self.start_box.low.to(x.device)
         high = self.start_box.high.to(x.device)
         in_box = ((x >= low) & (x <= high)).all(dim=1) & torch.isfinite(x).all(dim=1)
-        no_overlap = self._no_interpenetration(states.qpos.cpu(), in_box.cpu())
+        no_overlap = self._contacts.ok(states.qpos.cpu(), in_box.cpu())
         return in_box & no_overlap.to(x.device)
 
     def eval_states(self, n: int, seed: int) -> StartStates:
         # A local generator: never touches the global torch RNG.
         return self.sample_start(n, torch.Generator().manual_seed(seed))
-
-    def _no_interpenetration(self, qpos: Tensor, checkable: Tensor) -> Tensor:
-        """True per row unless a link overlaps the puck by more than `PENETRATION_TOL_M`.
-
-        Runs `mjw.forward` (inside `BatchSim.set_state`) on a CPU sim of `_VALIDATION_CHUNK`
-        worlds, then reads the contact list: `data.nacon` (shape (1,), contacts across all worlds),
-        `data.contact.dist` (negative = penetration) and `data.contact.worldid`, each of length
-        `naconmax` with only the first `nacon` entries live. Margins are zero, so a contact exists
-        only when `dist < 0`. Rows that fail the cheap checks are replaced by the canonical start
-        so a NaN or an absurd pose never reaches the solver; the caller masks them out anyway.
-        """
-        if self._validation_sim is None:
-            self._validation_sim = BatchSim(
-                self.mjcf,
-                nworld=_VALIDATION_CHUNK,
-                device="cpu",
-                frame_skip=self.frame_skip,
-            )
-        sim = self._validation_sim
-        safe = torch.where(checkable.unsqueeze(1), qpos, self.canonical_start().qpos)
-        ok = torch.ones(safe.shape[0], dtype=torch.bool)
-        for lo in range(0, safe.shape[0], _VALIDATION_CHUNK):
-            chunk = safe[lo : lo + _VALIDATION_CHUNK]
-            size = chunk.shape[0]
-            padded = self.canonical_start().qpos.repeat(_VALIDATION_CHUNK, 1)
-            padded[:size] = chunk
-            sim.set_state(
-                torch.arange(_VALIDATION_CHUNK),
-                padded,
-                torch.zeros(_VALIDATION_CHUNK, 6),
-            )
-            ok[lo : lo + size] = _worst_penetration_ok(sim, _VALIDATION_CHUNK)[:size]
-        return ok
-
-
-def _worst_penetration_ok(sim: BatchSim, nworld: int) -> Tensor:
-    nacon = int(sim.data.nacon.numpy()[0])
-    if nacon > sim.data.naconmax:
-        raise RuntimeError(f"contact buffer overflowed: {nacon} > {sim.data.naconmax}")
-    dist = wp.to_torch(sim.data.contact.dist)[:nacon]
-    world = wp.to_torch(sim.data.contact.worldid)[:nacon].long()
-    deepest = torch.zeros(nworld).scatter_reduce(
-        0, world, dist, reduce="amin", include_self=True
-    )
-    return deepest >= -PENETRATION_TOL_M
 
 
 def _hand_xy(qpos: Tensor) -> Tensor:
