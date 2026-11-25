@@ -1,5 +1,6 @@
 """Shared value types: start states, state boxes and the step-budget counter."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from typing import Literal
 
@@ -151,3 +152,17 @@ class StepOut:
     final_obs: Tensor
     ic_ids: Tensor
     outcomes: Outcomes | None
+
+
+@dataclass(frozen=True)
+class RolloutStats:
+    """PPO rollout data handed to scores. `ic_ids`, `adv`, `returns` and `values` are `(T, N)`
+    (`T` vector steps, `N` envs); `start_obs` holds the observation at each IC's start, and
+    `critic` maps a batch of observations to values in one call."""
+
+    ic_ids: Tensor
+    adv: Tensor
+    returns: Tensor
+    values: Tensor
+    start_obs: Tensor
+    critic: Callable[[Tensor], Tensor]
