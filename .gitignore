@@ -1,0 +1,22 @@
+# secrets and local agent config
+.env
+.env.*
+.claude/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# run outputs
+runs/
+wandb/
+
+# macOS
+.DS_Store
