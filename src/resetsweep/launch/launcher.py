@@ -76,6 +76,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -961,6 +962,9 @@ def _pinned_sha(
 
 
 def _git(*args: str) -> str:
+    # GIT_TERMINAL_PROMPT=0: a private or missing https repo makes `git ls-remote` fail at once
+    # instead of waiting on the terminal for a username (git(1), ENVIRONMENT VARIABLES).
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
         out = subprocess.run(
             ["git", *args],
@@ -968,6 +972,7 @@ def _git(*args: str) -> str:
             text=True,
             check=True,
             timeout=GIT_TIMEOUT_S,
+            env=env,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         raise GitError(

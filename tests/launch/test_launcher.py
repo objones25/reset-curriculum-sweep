@@ -1258,6 +1258,42 @@ def test_default_ref_is_head_sha_checked_on_the_remote_and_recorded(
     assert saved["launches"][0]["repo_sha"] == HEAD_SHA
 
 
+def test_real_git_runs_ls_remote_with_terminal_prompts_disabled(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # smoke-patch item 4: the default runner (no FakeGit injected) runs a stub `git` on PATH,
+    # which logs GIT_TERMINAL_PROMPT per call, so a private or missing repo fails instead of
+    # waiting for a username on the terminal.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "git.log"
+    stub = bin_dir / "git"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s %s\\n" "$1" "${{GIT_TERMINAL_PROMPT-unset}}" >> "{log}"\n'
+        f'if [ "$1" = ls-remote ]; then printf "{SHA}\\trefs/heads/feat/sweep\\n"; fi\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.delenv("GIT_TERMINAL_PROMPT", raising=False)
+
+    code = main(
+        ["--repo-url", REPO, "--ref", "feat/sweep", "--dry-run"],
+        transport=fake_runpod.transport(),
+        env_path=env_file,
+        ledger_path=tmp_path / "ledger.json",
+        sleep=_no_sleep,
+        now=lambda: NOW,
+    )
+
+    assert code == 0
+    assert log.read_text(encoding="utf-8").splitlines() == ["ls-remote 0"]
+
+
 def test_unpushed_sha_is_refused_with_exit_2_before_any_http(
     fake_runpod: FakeRunPod,
     env_file: Path,
