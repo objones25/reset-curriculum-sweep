@@ -546,23 +546,34 @@ def test_workers_that_die_during_startup_three_times_raise() -> None:
     assert _wait_until(lambda: multiprocessing.active_children() == [], 10.0)
 
 
-def slow_warm_up() -> None:
-    threading.Event().wait(3.0)  # stands in for torch/warp imports and Warp init
+def _warm_log() -> Path:
+    """Where `counting_warm_up` records each warm-up; named by the test process's pid."""
+    return Path(tempfile.gettempdir()) / f"resetsweep-test-warm-{os.getppid()}.log"
+
+
+def counting_warm_up() -> None:
+    """Records its worker's pid after a pause standing in for torch/warp imports and Warp init."""
+    threading.Event().wait(0.5)
+    with _warm_log().open("a") as f:
+        f.write(f"{os.getpid()}\n")
 
 
 def test_the_pool_starts_warm_workers_so_jobs_pay_no_startup() -> None:
-    start = time.monotonic()
+    log = Path(tempfile.gettempdir()) / f"resetsweep-test-warm-{os.getpid()}.log"
+    log.unlink(missing_ok=True)
     with WorkerPool(
-        n_workers=2, device="cpu", runner=scripted_runner, warm_up=slow_warm_up
+        n_workers=2, device="cpu", runner=scripted_runner, warm_up=counting_warm_up
     ) as pool:
-        built_s = time.monotonic() - start
-        start = time.monotonic()
-        _run_one(pool, 0)
-        _run_one(pool, 1)
-        jobs_s = time.monotonic() - start
+        warmed_at_return = [int(p) for p in log.read_text().split()]
+        job_pids = {_pid(_run_one(pool, seed)) for seed in (0, 1, 2, 7)}
+        warmed_after_jobs = [int(p) for p in log.read_text().split()]
+    log.unlink(missing_ok=True)
 
-    assert built_s >= 3.0  # both workers warmed in parallel, before any job
-    assert jobs_s < 1.5
+    # Both workers finished warming up before the constructor returned ...
+    assert len(warmed_at_return) == 2 and len(set(warmed_at_return)) == 2
+    # ... and the jobs ran on those workers, with no further warm-up.
+    assert warmed_after_jobs == warmed_at_return
+    assert job_pids <= set(warmed_at_return)
 
 
 def test_close_leaves_no_live_children() -> None:
