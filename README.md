@@ -125,7 +125,7 @@ and the volume delete command.
 | `--max-usd-per-h X` | Price ceiling for automatic picks (the default GPU and the fallbacks). Default 1.20. If nothing at or under it has stock, the launcher exits 2 and lists the in-stock GPUs above it with the command that picks each. |
 | `--cap X` | Account-wide cap in USD, at most 100 (default 100). |
 | `--volume-id ID` | Reuse this network volume (and its data center) to resume a sweep. |
-| `--ref REF` | Branch, tag or SHA the pod checks out, resolved to a commit the remote serves. Default: the SHA recorded for `--volume-id`, else `git rev-parse HEAD`. A resume with a different SHA prints a warning: `sweep-run` refuses the state dir (exit 4) if the arm set changed. |
+| `--ref REF` | Branch, tag or SHA the pod checks out, resolved to a commit the remote serves. Default: the SHA recorded for `--volume-id`, else `git rev-parse HEAD`. A resume with a different SHA prints a warning: `sweep-run` records the commit (`REPO_REF`) in `sweep_meta.json` on first start and refuses to resume that state dir on another commit (exit 4). |
 | `--repo-url URL` | Repo the pod clones. Default: `git remote get-url origin`. |
 | `--dry-run` | Print the request bodies, create nothing. |
 | `--smoke` | Short GPU smoke run (`SWEEP_SMOKE=1`). Uses state dir `/workspace/sweep-smoke`. |
@@ -225,7 +225,8 @@ launcher as orphaned, with the same command.
 `sweep-run` (on the pod): 0 finished (also when it stopped at the budget or 300 s before the
 bootstrap's deadline, `SWEEP_DEADLINE_EPOCH`, having written the report); 128 + signal number
 after SIGTERM/SIGINT (workers killed, state saved, report written); 2 bad settings; 3 budget already spent, or calibration
-produced no usable measurement; 4 state dir made by another mode or arm set, or scheduler state
+produced no usable measurement; 4 state dir made by another mode or arm set or on another commit
+(`REPO_REF`, recorded in `sweep_meta.json`; skipped when unset, as in local runs), or scheduler state
 without its calibration; 5 the rung-0 budget would be below `SWEEP_MIN_R0_STEPS` (the log names
 the numbers and the knobs: fewer tasks, fewer arms, fewer seeds); 6 the device is the CPU on a
 RunPod pod (`RUNPOD_POD_ID` set). Before the GPU tests, `scripts/pod_bootstrap.sh` runs a CUDA

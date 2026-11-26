@@ -30,7 +30,8 @@ Steps:
 6. Return 0. Bad settings return 2; a new sweep whose budget is already spent, or calibration
    with no usable measurement, returns 3; r0 below `SWEEP_MIN_R0_STEPS` returns 5; device "cpu" while `RUNPOD_POD_ID` is set (a
    pod whose GPU is not visible) returns 6; a state dir made
-   by another mode or arm set (`sweep_meta.json`), or a scheduler state without its
+   by another mode or arm set or on another commit (`sweep_meta.json` records `REPO_REF`;
+   skipped when it is unset), or a scheduler state without its
    calibration.json, returns 4.
 
 Stopping before the pod's deadline (final-review I2): the bootstrap exports
@@ -299,6 +300,7 @@ class Settings:
     smoke_min_r0_steps: int
     smoke_r0_max_steps: int
     project_cap_usd: float
+    repo_ref: str | None  # REPO_REF: the commit the pod checked out (None off the pod)
     deadline_epoch: float | None
     report_reserve_s: float
     hang_s: float
@@ -387,6 +389,7 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         min_r0_steps=required_int("SWEEP_MIN_R0_STEPS", MIN_R0_STEPS_DEFAULT),
         smoke_min_r0_steps=smoke_min,
         smoke_r0_max_steps=smoke_max,
+        repo_ref=environ.get("REPO_REF") or None,
         project_cap_usd=(
             _positive_float(environ, "SWEEP_PROJECT_CAP_USD")
             if environ.get("SWEEP_PROJECT_CAP_USD")
@@ -1095,12 +1098,16 @@ def _arms_sha256(arms: list[Arm]) -> str:
     ).hexdigest()
 
 
-def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
+def _check_state(
+    state: Path, *, smoke: bool, arms: list[Arm], repo_ref: str | None
+) -> str | None:
     """Why `state` cannot be used for this sweep, or None (and the sweep's meta is saved).
 
-    `sweep_meta.json` records the mode and a hash of the initial arm set on first start; a later
-    start with another mode or arm set would resume a different sweep's state. A scheduler
-    state without its calibration.json cannot rebuild the arm ids."""
+    `sweep_meta.json` records the mode, a hash of the initial arm set and the commit
+    (`REPO_REF`, null off the pod) on first start; a later start with another mode or arm set
+    would resume a different sweep's state, and one on another commit would resume it on
+    different code (smoke-patch item 3). The commit check is skipped when either side has no
+    value. A scheduler state without its calibration.json cannot rebuild the arm ids."""
     meta = {
         "version": 1,
         "mode": "smoke" if smoke else "full",
@@ -1114,11 +1121,18 @@ def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
             return f"{path} is corrupt ({e}); restore it or use another SWEEP_STATE_DIR"
         if not isinstance(saved, dict):
             return f"{path} is corrupt (not a JSON object); restore it or use another SWEEP_STATE_DIR"
-        if saved != meta:
+        if {k: saved.get(k) for k in meta} != meta:
             return (
                 f"{path} is for a {saved.get('mode')} sweep with arm set {saved.get('arms_sha256')}, "
                 f"this start is {meta['mode']} with arm set {meta['arms_sha256']}; use another "
                 "SWEEP_STATE_DIR or the settings the state was made with"
+            )
+        saved_ref = saved.get("repo_ref")
+        if saved_ref is not None and repo_ref is not None and saved_ref != repo_ref:
+            return (
+                f"{path} was started on commit {saved_ref}, this start is on commit {repo_ref} "
+                f"(REPO_REF); resume with sweep-launch --ref {saved_ref}, or use another "
+                "SWEEP_STATE_DIR"
             )
     elif any(
         (state / name).exists()
@@ -1128,7 +1142,9 @@ def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
     if (state / STATE_FILE).exists() and not (state / CALIBRATION_FILE).exists():
         return f"{state / STATE_FILE} exists but {CALIBRATION_FILE} is missing: arm ids cannot be rebuilt"
     if not path.exists():
-        path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+        path.write_text(
+            json.dumps({**meta, "repo_ref": repo_ref}) + "\n", encoding="utf-8"
+        )
     return None
 
 
@@ -1252,7 +1268,9 @@ def _sweep(
     state = settings.state_dir
     state.mkdir(parents=True, exist_ok=True)
     arms = _smoke_arms() if settings.smoke else arm_space("rung0")
-    problem = _check_state(state, smoke=settings.smoke, arms=arms)
+    problem = _check_state(
+        state, smoke=settings.smoke, arms=arms, repo_ref=settings.repo_ref
+    )
     if problem is not None:
         _log.error("state dir mismatch: %s", problem)
         return 4

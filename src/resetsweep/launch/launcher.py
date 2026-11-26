@@ -7,7 +7,8 @@ Steps:
    `--ref` (branch, tag or SHA), else the SHA the ledger recorded for `--volume-id`, else
    `git rev-parse HEAD`, and `git ls-remote <url>` (argument list, 30 s timeout) must show the
    remote serves it, else exit 2 "push your branch first". The pod gets that SHA as REPO_REF
-   and the ledger records it.
+   and the ledger records it; sweep-run records it in sweep_meta.json and refuses (exit 4) to
+   resume that state dir on another commit.
 2. Settle the ledger from the billing API: every earlier launch's pod and volume spend. Then
    refuse (exit 2, dry run included) while any earlier ledger pod still exists
    (`GET /v2/pods/{id}` answers anything but 404 or TERMINATED, EXITED included since a
@@ -951,8 +952,9 @@ def _pinned_sha(
     if recorded is not None and sha != recorded:
         _err(
             f"sweep-launch: warning: volume {volume_id} last ran commit {recorded}; this launch "
-            f"checks out {sha}. If that changes the arm set or the run defaults, sweep-run "
-            "refuses the volume's state dir (exit 4)"
+            f"checks out {sha}. sweep-run records the commit in sweep_meta.json and refuses "
+            "to resume the volume's state dir on another commit (exit 4); pass "
+            f"--ref {recorded} to resume"
         )
     print(f"repo {repo_url} at commit {sha}")
     return sha

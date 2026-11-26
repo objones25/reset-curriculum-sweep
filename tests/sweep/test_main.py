@@ -906,6 +906,70 @@ def test_main_refuses_state_dir_whose_arm_set_changed(
     assert _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory) == 4
 
 
+SHA_1 = "1111111111111111111111111111111111111111"
+SHA_2 = "2222222222222222222222222222222222222222"
+
+
+def _meta(tmp_path: Path) -> dict[str, Any]:
+    return json.loads((tmp_path / "sweep" / "sweep_meta.json").read_text())
+
+
+def test_main_records_repo_ref_in_sweep_meta_on_first_start(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    assert (
+        _run(_env(tmp_path, SWEEP_SMOKE="1", REPO_REF=SHA_1), clock, pool_factory) == 0
+    )
+
+    assert _meta(tmp_path)["repo_ref"] == SHA_1
+
+
+def test_main_refuses_to_resume_on_a_different_repo_ref_naming_both(
+    tmp_path: Path,
+    clock: Any,
+    pool_factory: Any,
+    world: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _run(_env(tmp_path, SWEEP_SMOKE="1", REPO_REF=SHA_1), clock, pool_factory)
+    n_before = len(world.submissions)
+
+    code = _run(_env(tmp_path, SWEEP_SMOKE="1", REPO_REF=SHA_2), clock, pool_factory)
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert code == 4
+    assert any(SHA_1 in m and SHA_2 in m for m in errors)
+    assert len(world.submissions) == n_before
+    assert _meta(tmp_path)["repo_ref"] == SHA_1
+
+
+def test_main_resumes_on_the_same_repo_ref(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    _run(_env(tmp_path, SWEEP_SMOKE="1", REPO_REF=SHA_1), clock, pool_factory)
+
+    assert (
+        _run(_env(tmp_path, SWEEP_SMOKE="1", REPO_REF=SHA_1), clock, pool_factory) == 0
+    )
+
+
+def test_main_records_null_repo_ref_off_pod_and_skips_the_check(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    # a local run has no REPO_REF: null is recorded, and a missing value on either side
+    # (recorded null, or no env on resume) skips the comparison
+    _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory)
+    assert _meta(tmp_path)["repo_ref"] is None
+    assert (
+        _run(_env(tmp_path, SWEEP_SMOKE="1", REPO_REF=SHA_1), clock, pool_factory) == 0
+    )
+
+    other = tmp_path / "other"
+    _run(_env(other, SWEEP_SMOKE="1", REPO_REF=SHA_1), clock, pool_factory)
+    assert _run(_env(other, SWEEP_SMOKE="1"), clock, pool_factory) == 0
+    assert _meta(other)["repo_ref"] == SHA_1
+
+
 def test_main_refuses_scheduler_state_without_calibration_json(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:

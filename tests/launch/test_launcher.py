@@ -1373,6 +1373,9 @@ def test_volume_resume_with_another_ref_warns_about_exit_4(
     assert code == 0
     assert SHA in err and HEAD_SHA in err
     assert "exit 4" in err
+    # smoke-patch item 3: sweep-run enforces the commit itself, not only on an arm-set change
+    assert "sweep_meta.json" in err
+    assert "if that changes" not in err.lower()
 
 
 # --- the created pod's reported price (final-review minor) ---------------------------------------
