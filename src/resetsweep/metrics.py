@@ -14,7 +14,7 @@ import math
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import ClassVar, Literal, Protocol
 
 import wandb
 
@@ -116,9 +116,11 @@ class WandbSink:
     W&B's own step counter never drops a point.
 
     `reinit="create_new"` lets one worker process hold several runs in turn without
-    `wandb.init` returning the previous one. Raises ValueError, naming the key but never
+    `wandb.init` returning the previous one; `live` counts the sinks not yet closed. Raises ValueError, naming the key but never
     the value, when any config key (at any depth) matches `(?i)key|token|secret`.
     """
+
+    live: ClassVar[int] = 0
 
     def __init__(
         self,
@@ -142,6 +144,7 @@ class WandbSink:
             mode=mode,
             reinit="create_new",
         )
+        WandbSink.live += 1
         self._run.define_metric(_STEP_KEY)
         self._run.define_metric("*", step_metric=_STEP_KEY)
         self.closed = False
@@ -156,3 +159,11 @@ class WandbSink:
         if not self.closed:
             self._run.finish()
             self.closed = True
+            WandbSink.live -= 1
+
+
+def live_wandb_runs() -> int:
+    """How many `WandbSink`s in this process are open: a reused worker checks it is 0 between
+    jobs. `wandb.run` cannot tell, since `reinit="create_new"` runs in online and offline mode
+    do not set it (checked with wandb 0.31.2)."""
+    return WandbSink.live

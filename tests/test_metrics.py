@@ -129,3 +129,18 @@ def test_wandb_sink_disabled_mode_logs_summarises_and_closes() -> None:
     sink.close()
 
     assert sink.closed
+
+
+def test_live_wandb_runs_counts_sinks_until_each_is_closed_once() -> None:
+    from resetsweep.metrics import live_wandb_runs
+
+    before = live_wandb_runs()
+    a = WandbSink(project="p", group="g", name="a", config={}, mode="disabled")
+    b = WandbSink(project="p", group="g", name="b", config={}, mode="disabled")
+    opened = live_wandb_runs()
+    a.close()
+    a.close()  # idempotent: counted once
+    after_one = live_wandb_runs()
+    b.close()
+
+    assert (before, opened, after_one, live_wandb_runs()) == (0, 2, 1, 0)
