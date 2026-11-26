@@ -337,12 +337,15 @@ class Scheduler:
 
     # --- public interface ----------------------------------------------------------------------
 
-    def next_jobs(self, k: int) -> list[Job]:
+    def next_jobs(self, k: int, *, max_rung: int | None = None) -> list[Job]:
         """Up to `k` new jobs: resubmitted in-flight jobs first, then rung 0 in arm order, then
         batch-UCB picks. Never a job already running or done, past the final rung's seed count,
-        or for an arm that is not live. Runs `promotions()` first."""
+        or for an arm that is not live. With `max_rung`, never a job above that rung (smoke
+        mode runs rung 0 only). Runs `promotions()` first."""
         if k < 0:
             raise ValueError(f"k must be >= 0, got {k}")
+        if max_rung is not None and max_rung < 0:
+            raise ValueError(f"max_rung must be >= 0, got {max_rung}")
         self.promotions()
         jobs: list[Job] = []
         resubmit, self._resubmit = self._resubmit, []
@@ -351,15 +354,15 @@ class Scheduler:
             ok = self._is_live(i) and self._states[i].rung == job.rung
             if not (ok and job.seed in self._pending_seeds(i)):
                 continue  # pruned, failed or promoted since: drop it
-            if len(jobs) < k:
+            if len(jobs) < k and (max_rung is None or job.rung <= max_rung):
                 jobs.append(self._issue(i, job.seed))
             else:
                 self._resubmit.append(job)  # keeps its priority for the next call
         for i in [i for i in self._live() if self._states[i].rung == 0]:
             for seed in self._pending_seeds(i)[: k - len(jobs)]:
                 jobs.append(self._issue(i, seed))
-        if len(jobs) < k:
-            jobs += self._ucb_batch(k - len(jobs))
+        if len(jobs) < k and (max_rung is None or max_rung >= 1):
+            jobs += self._ucb_batch(k - len(jobs), max_rung=max_rung)
         if jobs:
             self.save()
         assert len(jobs) <= k, (len(jobs), k)
@@ -570,11 +573,12 @@ class Scheduler:
             for i, sd in spreads.items()
         }
 
-    def _ucb_batch(self, k: int) -> list[Job]:
+    def _ucb_batch(self, k: int, *, max_rung: int | None = None) -> list[Job]:
+        top = self._last_rung if max_rung is None else max_rung
         pending = {
             i: seeds
             for i in self._live()
-            if self._states[i].rung >= 1
+            if 1 <= self._states[i].rung <= top
             if (seeds := self._pending_seeds(i))
         }
         spreads = self._spreads(pending)

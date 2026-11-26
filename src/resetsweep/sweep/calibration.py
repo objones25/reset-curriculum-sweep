@@ -261,7 +261,10 @@ def chosen_lr(record: CalibrationRecord, family: str) -> float | None:
 
 
 def _planned(
-    families: Sequence[str], s: CalibrationSettings, record: CalibrationRecord
+    families: Sequence[str],
+    s: CalibrationSettings,
+    record: CalibrationRecord,
+    probe_families: Sequence[str],
 ) -> Iterator[_Batch]:
     """Batches in priority order; lazily, because throughput needs the config winner."""
     base = s.base_num_envs
@@ -286,7 +289,7 @@ def _planned(
                 for seed in range(n)
             )
             yield _Batch(f"throughput/{fam}/{n_envs}/{n}", fam, n, jobs)
-    for fam in families:
+    for fam in probe_families:
         lr = chosen_lr(record, fam) or START_CONFIG.lr
         for task, method in PROBES.get(fam, ()):
             arm = _probe_arm(task, method)
@@ -409,13 +412,17 @@ def calibrate(
     runner_cfg: RunnerConfig,
     path: Path,
     clock: Callable[[], float],
+    probe_families: Sequence[str] | None = None,
 ) -> CalibrationRecord:
-    """Run (or resume) calibration for `families`; see the module docstring."""
+    """Run (or resume) calibration for `families`; see the module docstring. `probe_families`
+    (default: `families`) selects whose probes run; smoke mode adds `arm_dense` there to
+    exercise the arm task's CPU contact check without calibrating that family."""
     if not families:
         raise ValueError("no families to calibrate")
+    probe_families = families if probe_families is None else probe_families
     record = CalibrationRecord.load(path) if path.exists() else CalibrationRecord(batches={})
     record.capped = False
-    for batch in _planned(families, settings, record):
+    for batch in _planned(families, settings, record, probe_families):
         if batch.key in record.batches:
             continue
         budget_usd = min(settings.cap_usd - record.spent_usd, guard.remaining())

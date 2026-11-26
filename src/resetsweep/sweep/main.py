@@ -43,8 +43,10 @@ counted in `sink_errors` (in the JSONL) and never stops the sweep (`GuardedSweep
 running and done, arms by status, and the current rung per group. The report adds the arm
 table (mean, CI, LCB/UCB, rung, status) and the final ranking to the same run.
 
-`SWEEP_SMOKE=1`: calibrate the pendulum family only, then run only `uniform` and `visited`
-(p_task 0.5) on `pendulum_sparse` for one rung of r0, and rank that rung in the report.
+`SWEEP_SMOKE=1`: calibrate the pendulum family only (plus the arm-family probes:
+`visited` and `buffer_scored` on arm_sparse), then run only `uniform` and `visited` (p_task 0.5)
+on `pendulum_sparse` and `uniform` on `maze_trap` for one rung of r0, and rank that rung in the
+report (final-review I8).
 
 Budget handling (spec section 8):
 - A job's wall-clock estimate is
@@ -172,7 +174,14 @@ CALIBRATION_JOB_TIMEOUT_S: Final = 1800.0
 CORRECTION_WINDOW: Final = 50
 CORRECTION_BOUNDS: Final = (0.5, 4.0)
 SMOKE_FAMILY: Final = "pendulum_dense"
-SMOKE_LABELS: Final = ("pendulum_sparse/uniform/-", "pendulum_sparse/visited[p_task=0.5]/-")
+# Final-review I8: smoke also runs the arm-family probes (visited / buffer_scored on arm_sparse:
+# the CPU contact check) and one maze_trap uniform run (substep graph + applied force).
+SMOKE_PROBE_FAMILIES: Final = ("pendulum_dense", "arm_dense")
+SMOKE_LABELS: Final = (
+    "pendulum_sparse/uniform/-",
+    "pendulum_sparse/visited[p_task=0.5]/-",
+    "maze_trap/uniform/-",
+)
 _MAX_EVENTS: Final = 1_000_000  # loop passes that handle a result or a submission
 
 
@@ -214,8 +223,8 @@ class _SignalSafeScheduler:
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
-    def next_jobs(self, k: int) -> list[Job]:
-        return self._masked(lambda: self.inner.next_jobs(k))
+    def next_jobs(self, k: int, *, max_rung: int | None = None) -> list[Job]:
+        return self._masked(lambda: self.inner.next_jobs(k, max_rung=max_rung))
 
     def report(self, result: RunResult) -> None:
         self._masked(lambda: self.inner.report(result))
@@ -461,7 +470,7 @@ def ladder_cost_usd(
 
 
 class SchedulerLike(Protocol):
-    def next_jobs(self, k: int) -> list[Job]: ...
+    def next_jobs(self, k: int, *, max_rung: int | None = None) -> list[Job]: ...
 
     def report(self, result: RunResult) -> None: ...
 
@@ -605,7 +614,9 @@ class SweepLoop:
         while self._pool.free_slots() > 0:
             if self._smoke and self._smoke_rung0_over():
                 return False
-            jobs = self._sched.next_jobs(1)
+            # Smoke runs rung 0 only: a group that finished it must not start rung 1 while
+            # another group is still on rung 0.
+            jobs = self._sched.next_jobs(1, max_rung=0 if self._smoke else None)
             if not jobs:
                 return False
             (job,) = jobs
@@ -1010,6 +1021,7 @@ def _run_sweep(
                 runner_cfg=runner_cfg,
                 path=calib_path,
                 clock=clock,
+                probe_families=SMOKE_PROBE_FAMILIES if settings.smoke else None,
             )
         plan = choose_plan(record, arms_per_family=arms_per_family, settings=calib_settings)
     except CalibrationError:

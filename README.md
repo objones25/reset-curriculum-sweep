@@ -91,7 +91,8 @@ SHA is recorded in the ledger.
    `SWEEP_STATE_DIR` and `WANDB_PROJECT`.
 
 2. **Smoke run (costs money, not run for this README).** One short GPU run: calibrate the pendulum
-   family, then run `uniform` and `visited` on `pendulum_sparse` for one rung.
+   family and run the arm-family probes (`visited` and `buffer_scored` on `arm_sparse`), then
+   run `uniform` and `visited` on `pendulum_sparse` and `uniform` on `maze_trap` for one rung.
 
    ```bash
    uv run sweep-launch --cap 5 --smoke
@@ -232,8 +233,10 @@ the failing step's exit code.
   sizes are therefore unknown until a GPU run reports them.
 - GPU-only checks still open: the CUDA one-substep graph with per-substep callback, torch/warp
   stream ordering, CUDA generators, CPU contact checks inside arm `visited` methods, and
-  host syncs in `buffer_scored`. They are listed in the task notes and covered only by
-  `pytest -m gpu` and the smoke run.
+  host syncs in `buffer_scored`. They are covered only by `pytest -m gpu` (tests/test_gpu.py:
+  G2 a GPU smoke of every method x score pair on pendulum and arm and every method on the two
+  maze tasks, G3 CPU vs CUDA dynamics, G4 the worker pool on CUDA; plus G1 CUDA start states
+  and G5 the CUDA gate) and the smoke run. None has run on a GPU yet.
 - GPU batched MuJoCo is not reproducible run to run, so conclusions come from seeds, not single
   runs.
 - The paid launches (`--smoke` and the full sweep) were not run while writing this README.

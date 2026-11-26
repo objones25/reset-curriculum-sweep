@@ -1246,3 +1246,18 @@ def test_rung0_nan_ever_succeeded_is_neutral_not_worst(tmp_path: Path) -> None:
 
     assert s.state(V00_A).status == "promoted"
     assert s.state(WALK_A).status == "pruned"
+
+
+def test_next_jobs_with_max_rung_0_never_issues_a_later_rung(tmp_path: Path) -> None:
+    # Smoke mode (final-review I8) runs rung 0 only; with two groups one can finish rung 0 and
+    # promote while the other still runs, and its rung-1 jobs must not be issued.
+    s = _new(tmp_path, SMALL_A + MAZE_TRIO)
+    jobs = s.next_jobs(100)
+    for job in jobs:
+        if job.arm.task == TASK_A:
+            s.report(_result(job, 0.5))
+    s.promotions()
+    assert any(st.rung == 1 for st in s.states())
+
+    assert s.next_jobs(100, max_rung=0) == []
+    assert {j.rung for j in s.next_jobs(100)} == {1}

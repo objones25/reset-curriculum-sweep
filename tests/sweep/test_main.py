@@ -316,10 +316,15 @@ def test_main_resume_ledger_counts_first_session(
     assert _sweep_jobs(world, session=1) == []
 
 
-def test_smoke_mode_runs_only_uniform_and_visited_on_pendulum(
+def test_smoke_mode_runs_uniform_and_visited_on_pendulum_and_uniform_on_maze_trap(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:
-    env = _env(tmp_path, SWEEP_SMOKE="1")
+    """Final-review I8 adds the maze_trap uniform run and the arm-family probes.
+
+    r0 is fixed: maze_trap's family is not calibrated in smoke, and the fallback plan (the
+    slowest measured steps/s, at base N=128) is twice as fast as this fake world runs N=128,
+    so a 90%-of-budget r0 would hit the cap mid-job (a known limit of the fallback plan)."""
+    env = _env(tmp_path, SWEEP_SMOKE="1", SWEEP_R0_STEPS="1000000")
     state = tmp_path / "sweep"
     sink = RecordingSink()
 
@@ -330,11 +335,15 @@ def test_smoke_mode_runs_only_uniform_and_visited_on_pendulum(
     calib_tasks = {s.spec.task for s in world.submissions if s.job.rung < 0}
     report = json.loads((state / "report.json").read_text())
     assert code == 0
-    assert sorted(s.job.arm.label() for s in sweep) == sorted([ARM_UNIFORM.label(), ARM_VISITED.label()])
+    probes = {s.spec.method for s in world.submissions if s.job.rung < 0 and s.spec.task == "arm_sparse"}
+    assert sorted(s.job.arm.label() for s in sweep) == sorted(
+        [ARM_UNIFORM.label(), ARM_VISITED.label(), "maze_trap/uniform/-"]
+    )
     assert {(s.job.rung, s.job.step_budget) for s in sweep} == {(0, r0)}
     assert (r1, r2) == (3 * r0, 9 * r0)
-    assert calib_tasks <= {"pendulum_dense", "pendulum_sparse"}
-    assert [len(g["arms"]) for g in report["groups"]] == [2]
+    assert calib_tasks <= {"pendulum_dense", "pendulum_sparse", "arm_sparse"}
+    assert probes == {"visited", "buffer_scored"}
+    assert sorted(len(g["arms"]) for g in report["groups"]) == [1, 2]
     assert "per_task" in sink.tables
 
 
@@ -387,8 +396,10 @@ class StubScheduler:
         self.reports: list[RunResult] = []
         self.report_error: Exception | None = None
 
-    def next_jobs(self, k: int) -> list[Job]:
-        out, self._pending = self._pending[:k], self._pending[k:]
+    def next_jobs(self, k: int, *, max_rung: int | None = None) -> list[Job]:
+        pending = [j for j in self._pending if max_rung is None or j.rung <= max_rung]
+        out = pending[:k]
+        self._pending = [j for j in self._pending if j not in out]
         self._running |= set(out)
         return out
 
