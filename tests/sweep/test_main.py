@@ -24,6 +24,7 @@ from resetsweep.sweep.main import (
     SweepLoop,
     load_settings,
     main,
+    project_full_ladder,
     size_rungs,
     size_smoke_rung,
 )
@@ -223,6 +224,131 @@ def test_size_rungs_fits_the_whole_ladder_in_90_percent_of_remaining() -> None:
     # USD per rung: (2955 * 0.02 + 30) * 0.01, (2955 * 0.072 + 36) * 0.01, (2955 * 0.18 + 30) * 0.01
     assert sizing.cost_usd == pytest.approx((0.891, 2.48760, 5.619))
     assert sum(sizing.cost_usd) <= 0.9 * 10.0
+
+
+# Smoke-patch item 2: full runs weight each job by its measured probe slowdown. "walk" on family
+# a runs 2x uniform, so 5 walk arms on a cost what 5 uniform arms on b (half a's speed) do in
+# COUNTS, and the hand-computed r0 = 2955 carries over. Ignoring the factor would give
+# r0 = floor((900 - 96) / (0.015 + 0.054 + 0.135)) = 3941.
+W = ("a", "walk")
+FACTOR_PLAN = dataclasses.replace(PLAN, method_factors={W: 2.0})
+COUNTS_W = ({A: 10.0, W: 5.0}, {A: 4.0, W: 2.0}, {A: 2.0, W: 1.0})
+
+
+def test_size_rungs_applies_measured_method_factors_in_full_runs() -> None:
+    sizing = size_rungs(
+        arms_per_rung=COUNTS_W,
+        plan=FACTOR_PLAN,
+        remaining_usd=10.0,
+        usd_per_s=0.01,
+        min_r0_steps=1000,
+    )
+
+    assert sizing.rungs == (2955, 8865, 26595)
+    assert sizing.cost_usd == pytest.approx((0.891, 2.48760, 5.619))
+
+
+def test_size_rungs_counts_an_unprobed_method_as_uniform_in_full_runs() -> None:
+    # "visited" has no probe: x1 in a full run (the loop's learned correction covers it), so
+    # this is COUNTS with b's uniform arms relabelled, and r0 stays 2955.
+    v = ("b", "visited")
+    counts = ({A: 10.0, v: 5.0}, {A: 4.0, v: 2.0}, {A: 2.0, v: 1.0})
+
+    sizing = size_rungs(
+        arms_per_rung=counts,
+        plan=FACTOR_PLAN,
+        remaining_usd=10.0,
+        usd_per_s=0.01,
+        min_r0_steps=1000,
+    )
+
+    assert sizing.rungs[0] == 2955
+
+
+def test_full_ladder_projection_sizes_the_full_ladder_at_the_hypothetical_cap() -> None:
+    # remaining = cap 25 - 5 margin - 10 calibration cap = 10 USD: the size_rungs case above.
+    proj = project_full_ladder(
+        arms_per_rung=COUNTS_W,
+        plan=FACTOR_PLAN,
+        cap_usd=25.0,
+        usd_per_s=0.01,
+        min_r0_steps=3000,
+    )
+
+    assert proj.remaining_usd == pytest.approx(10.0)
+    assert proj.arms_per_rung == pytest.approx((15.0, 6.0, 3.0))
+    assert proj.r0 == 2955
+    assert proj.cost_usd == pytest.approx((0.891, 2.48760, 5.619))
+    assert proj.would_exit_5 is True  # 2955 < 3000
+    ok = project_full_ladder(
+        arms_per_rung=COUNTS_W,
+        plan=FACTOR_PLAN,
+        cap_usd=25.0,
+        usd_per_s=0.01,
+        min_r0_steps=1000,
+    )
+    assert ok.would_exit_5 is False
+
+
+def test_full_ladder_projection_with_nothing_left_after_calibration_exits_5() -> None:
+    proj = project_full_ladder(
+        arms_per_rung=COUNTS_W,
+        plan=FACTOR_PLAN,
+        cap_usd=12.0,  # 12 - 5 - 10 < 0
+        usd_per_s=0.01,
+        min_r0_steps=1,
+    )
+
+    assert (proj.r0, proj.would_exit_5) == (0, True)
+    assert proj.remaining_usd == pytest.approx(-3.0)
+
+
+def test_settings_project_cap_default_and_override(tmp_path: Path) -> None:
+    assert load_settings(_env(tmp_path)).project_cap_usd == 100.0
+    s = load_settings(_env(tmp_path, SWEEP_PROJECT_CAP_USD="60"))
+    assert s.project_cap_usd == 60.0
+    with pytest.raises(SettingsError, match="SWEEP_PROJECT_CAP_USD"):
+        load_settings(_env(tmp_path, SWEEP_PROJECT_CAP_USD="lots"))
+
+
+def test_smoke_logs_the_full_ladder_projection_everywhere(
+    tmp_path: Path,
+    clock: Any,
+    pool_factory: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state = tmp_path / "sweep"
+    sink = RecordingSink()
+
+    assert _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory, sink) == 0
+
+    out = capsys.readouterr().out
+    [line] = [x for x in out.splitlines() if x.startswith("full-ladder projection")]
+    assert "smoke-calibrated" in line and "cap 100.00 USD" in line
+    report = json.loads((state / "report.json").read_text())
+    extra = report["extra"]
+    assert extra["full_projection_cap_usd"] == 100.0
+    assert extra["full_projection_min_r0_steps"] == 512.0
+    assert extra["full_projection_exits_5"] in ("yes", "no")
+    assert extra["full_projection_r0"] >= 0
+    for k in range(3):
+        assert extra[f"full_projection_arms_r{k}"] > 0
+        assert extra[f"full_projection_usd_r{k}"] >= 0
+    # rung 0 is the whole full arm space (rung-0 arms are always present)
+    assert extra["full_projection_arms_r0"] == float(len(arm_space("rung0")))
+    assert "smoke-calibrated" in str(extra["full_projection_note"])
+    assert "full_projection_note" in (state / "report.md").read_text()
+    assert sink.summaries[-1]["full_projection_r0"] == extra["full_projection_r0"]
+
+
+def test_full_runs_do_not_log_a_full_ladder_projection(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    state = tmp_path / "sweep"
+    _run(_env(tmp_path, SWEEP_R0_STEPS="10000000"), clock, pool_factory)
+
+    extra = json.loads((state / "report.json").read_text())["extra"]
+    assert not any(k.startswith("full_projection") for k in extra)
 
 
 def test_size_rungs_charges_a_full_job_wall_when_the_pool_is_not_full() -> None:

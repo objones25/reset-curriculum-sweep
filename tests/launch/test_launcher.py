@@ -221,6 +221,19 @@ def test_smoke_flag_sets_env(
     assert env["SWEEP_STATE_DIR"] == "/workspace/sweep-smoke"
 
 
+def test_pod_gets_the_account_cap_for_the_full_ladder_projection(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    # smoke-patch item 2: sweep-run projects the full ladder at the user's account cap
+    code = _run(fake_runpod, env_file, tmp_path, "--cap", "80", "--smoke")
+
+    [pod] = fake_runpod.bodies("POST", "/v2/pods")
+    env = pod["env"]
+    assert isinstance(env, dict)
+    assert code == 0
+    assert env["SWEEP_PROJECT_CAP_USD"] == "80.00"
+
+
 def test_state_dirs_differ_and_full_matches_sweep_run_default() -> None:
     from resetsweep.launch.launcher import WANDB_PROJECT
     from resetsweep.sweep.main import PROJECT_DEFAULT, STATE_DIR_DEFAULT

@@ -351,6 +351,7 @@ def _launch(
         ref=ref,
         remaining=remaining,
         pod_cap_usd=pod_cap,
+        account_cap_usd=args.cap,
         smoke=args.smoke,
         volume_gb=volume.size_gb,
         margin=margin,
@@ -686,6 +687,9 @@ class _PodArgs:
     ref: str
     remaining: float  # new money this launch may spend: sets max_hours
     pod_cap_usd: float  # SWEEP_CAP_USD: see _pod_cap_usd
+    account_cap_usd: (
+        float  # SWEEP_PROJECT_CAP_USD: smoke projects the full ladder at it
+    )
     smoke: bool
     volume_gb: int
     margin: float
@@ -703,6 +707,7 @@ def _pod_body(
         "REPO_URL": a.repo_url,
         "REPO_REF": a.ref,
         "SWEEP_CAP_USD": _floor2(a.pod_cap_usd),
+        "SWEEP_PROJECT_CAP_USD": _floor2(a.account_cap_usd),
         "SWEEP_GPU_USD_PER_H": repr(gpu.secure_usd_per_h),
         "SWEEP_MAX_HOURS": _floor2(
             _max_hours(a.remaining, gpu, a.volume_gb, margin=a.margin)

@@ -13,7 +13,7 @@ A sweep of reset-curriculum methods for GPU MuJoCo PPO, run on one RunPod pod un
   the steps, and arms that cannot win are pruned. Rung sizes are set from calibration
   measurements and the remaining budget, not hard-coded: the whole expected ladder (rung 0, the
   promoted arms and their expansions, with 1, 3 and 5 seeds) is sized to cost 90% of what
-  calibration leaves. Task variants and other `p_task` values join at rung 1; `inverted(x)`
+  calibration leaves, each job weighted by its measured calibration-probe slowdown. Task variants and other `p_task` values join at rung 1; `inverted(x)`
   controls and the dense tasks run only for finalists. If the rung-0 budget would fall below
   `SWEEP_MIN_R0_STEPS` (default 2,000,000 env steps) the sweep refuses to start.
 - **Budget.** Account-wide cap of $100 (`--cap` accepts at most 100), with a $5 margin ($0.50
@@ -87,8 +87,8 @@ SHA is recorded in the ledger.
    ```
 
    In the pod body, `SWEEP_RUNPOD_API_KEY` and `WANDB_API_KEY` appear as `"***"`; the other `env`
-   entries are `REPO_URL`, `REPO_REF`, `SWEEP_CAP_USD`, `SWEEP_GPU_USD_PER_H`, `SWEEP_MAX_HOURS`,
-   `SWEEP_STATE_DIR` and `WANDB_PROJECT`.
+   entries are `REPO_URL`, `REPO_REF`, `SWEEP_CAP_USD`, `SWEEP_PROJECT_CAP_USD` (the `--cap`
+   value), `SWEEP_GPU_USD_PER_H`, `SWEEP_MAX_HOURS`, `SWEEP_STATE_DIR` and `WANDB_PROJECT`.
 
 2. **Smoke run (costs money, not run for this README).** One short GPU run: calibrate the pendulum
    family and run the arm-family probes (`visited` and `buffer_scored` on `arm_sparse`), then
@@ -97,6 +97,12 @@ SHA is recorded in the ledger.
    own calibration probe (here `visited`, and `maze_trap`, whose family smoke does not
    calibrate) at 3x uniform's time, with r0 clamped to [100,000, 1,000,000] env steps
    (`SWEEP_SMOKE_MIN_R0_STEPS`, `SWEEP_SMOKE_R0_MAX_STEPS`). Smoke never exits 5.
+   After calibration the smoke prints a `full-ladder projection` line (also in report.md,
+   report.json and the W&B summary as `full_projection_*`): the full sweep's expected arms
+   and USD per rung, r0, and whether a full run would exit 5, at `SWEEP_PROJECT_CAP_USD`
+   (the launcher sends `--cap`) less the $5 margin and the $10 calibration cap. It uses the
+   throughput smoke measured (pendulum) and a fallback for every other family, so treat it
+   as a rough check.
 
    ```bash
    uv run sweep-launch --cap 5 --smoke

@@ -11,7 +11,8 @@ Steps:
 3. Size the rungs (`size_rungs`, final-review ruling C2b): `ladder.project_ladder` gives the
    expected arm count per family at each rung from the real arm space (quota ceil(n / eta) per
    group plus the expected rung-1 and final-rung expansions); a rung-k arm costs
-   seeds_k x budget_k = 1, 9, 45 rung-0 runs. r0 is chosen so the whole expected ladder costs
+   seeds_k x budget_k = 1, 9, 45 rung-0 runs, times the job's measured probe slowdown
+   (`Plan.method_factors`; unprobed methods x1). r0 is chosen so the whole expected ladder costs
    `LADDER_SHARE` (90%) of what calibration left, at the calibrated steps/s and worker count;
    r1 = 3 r0, r2 = 9 r0. The projected USD per rung and r0 are logged. If r0 would fall below
    `SWEEP_MIN_R0_STEPS` (default 2,000,000) the sweep refuses to start (exit 5) and logs the
@@ -51,7 +52,14 @@ table (mean, CI, LCB/UCB, rung, status) and the final ranking to the same run.
 `SWEEP_SMOKE=1`: calibrate the pendulum family only (plus the arm-family probes:
 `visited` and `buffer_scored` on arm_sparse), then run only `uniform` and `visited` (p_task 0.5)
 on `pendulum_sparse` and `uniform` on `maze_trap` for one rung of r0, and rank that rung in the
-report (final-review I8).
+report (final-review I8). After calibration, smoke also projects the FULL ladder
+(`project_full_ladder`, smoke-patch item 2): what `size_rungs` would give the full arm set at
+`SWEEP_PROJECT_CAP_USD` (default 100; the launcher passes the account cap) minus the $5 margin
+and the whole $10 calibration cap, using smoke-calibrated throughput (measured only for the
+families smoke calibrated, the fallback for the rest) and the measured method factors. It
+prints one "full-ladder projection" line to stdout, logs it, and adds `full_projection_*`
+keys (arms and USD per rung, r0, whether a full run would exit 5) to report.md, report.json
+and the W&B summary.
 
 Budget handling (spec section 8):
 - A job's wall-clock estimate is
@@ -109,6 +117,7 @@ from resetsweep.sweep.budget import (
     CALIBRATION_CAP_USD,
     CAP_USD_DEFAULT,
     HEARTBEAT_S,
+    MARGIN_USD,
     NETWORK_VOLUME_GB,
     BudgetGuard,
     margin_usd,
@@ -173,6 +182,9 @@ MIN_R0_STEPS_DEFAULT: Final = 2_000_000
 SMOKE_SHARE: Final = 0.5
 SMOKE_MIN_R0_STEPS_DEFAULT: Final = 100_000
 SMOKE_R0_MAX_STEPS_DEFAULT: Final = 1_000_000
+# Smoke-patch item 2: smoke projects the full ladder at SWEEP_PROJECT_CAP_USD (the launcher
+# passes the account cap).
+PROJECT_CAP_USD_DEFAULT: Final = CAP_USD_DEFAULT
 REPORT_RESERVE_S_DEFAULT: Final = 300.0  # stop this long before SWEEP_DEADLINE_EPOCH
 SEEDS_PER_RUNG: Final = (1, 3, 5)
 ETA: Final = 3
@@ -286,6 +298,7 @@ class Settings:
     min_r0_steps: int
     smoke_min_r0_steps: int
     smoke_r0_max_steps: int
+    project_cap_usd: float
     deadline_epoch: float | None
     report_reserve_s: float
     hang_s: float
@@ -374,6 +387,11 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         min_r0_steps=required_int("SWEEP_MIN_R0_STEPS", MIN_R0_STEPS_DEFAULT),
         smoke_min_r0_steps=smoke_min,
         smoke_r0_max_steps=smoke_max,
+        project_cap_usd=(
+            _positive_float(environ, "SWEEP_PROJECT_CAP_USD")
+            if environ.get("SWEEP_PROJECT_CAP_USD")
+            else PROJECT_CAP_USD_DEFAULT
+        ),
         deadline_epoch=(
             _positive_float(environ, "SWEEP_DEADLINE_EPOCH")
             if environ.get("SWEEP_DEADLINE_EPOCH")
@@ -408,9 +426,14 @@ ArmKey = tuple[str, str]  # (family, method): the unit rung sizing counts arms i
 JobFactor = Callable[[str, str], float]  # (family, method) -> job wall vs uniform's
 
 
-def _unit_factor(family: str, method: str) -> float:
-    del family, method
-    return 1.0
+def full_job_factor(plan: Plan) -> JobFactor:
+    """Full-run sizing's per-job factor (smoke-patch item 2): the probe's measured slowdown
+    when (family, method) has one, else 1 (the loop's learned correction covers the rest)."""
+
+    def factor(family: str, method: str) -> float:
+        return plan.method_factors.get((family, method), 1.0)
+
+    return factor
 
 
 def smoke_job_factor(plan: Plan) -> JobFactor:
@@ -527,7 +550,7 @@ def size_rungs(
             f"arm counts must be non-negative with a non-empty rung 0: {arms_per_rung}"
         )
     budget_s = share * remaining_usd / usd_per_s
-    lines = _ladder_lines(arms_per_rung, plan, seeds_per_rung, _unit_factor)
+    lines = _ladder_lines(arms_per_rung, plan, seeds_per_rung, full_job_factor(plan))
     r0 = _max_r0(lines, budget_s)
     rollout = _rollout_steps(arms_per_rung[0], plan)
     floor_steps = max(min_r0_steps, rollout)
@@ -592,11 +615,98 @@ def ladder_cost_usd(
     r0: int,
     usd_per_s: float,
     *,
-    factor: JobFactor = _unit_factor,
+    factor: JobFactor,
 ) -> tuple[float, ...]:
     """Projected USD per rung for a given r0 (used to log an `SWEEP_R0_STEPS` override)."""
     return _rung_cost_usd(
         _ladder_lines(arms_per_rung, plan, SEEDS_PER_RUNG, factor), r0, usd_per_s
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class FullLadderProjection:
+    """What `size_rungs` would give a full sweep at `cap_usd` (smoke-patch item 2)."""
+
+    cap_usd: float
+    remaining_usd: float  # cap - MARGIN_USD - CALIBRATION_CAP_USD
+    arms_per_rung: tuple[float, ...]
+    cost_usd: tuple[float, ...]
+    r0: int
+    min_r0_steps: int
+    would_exit_5: bool
+
+
+def project_full_ladder(
+    *,
+    arms_per_rung: Sequence[Mapping[ArmKey, float]],
+    plan: Plan,
+    cap_usd: float,
+    usd_per_s: float,
+    min_r0_steps: int,
+) -> FullLadderProjection:
+    """The full ladder at a hypothetical `SWEEP_CAP_USD = cap_usd`: the budget is what a full run
+    would have after its `MARGIN_USD` and, at worst, the whole `CALIBRATION_CAP_USD`; then the
+    same lines, share and floor as `size_rungs` (measured method factors included), without
+    raising, so the caller can say whether the full run would exit 5."""
+    remaining = cap_usd - MARGIN_USD - CALIBRATION_CAP_USD
+    lines = _ladder_lines(arms_per_rung, plan, SEEDS_PER_RUNG, full_job_factor(plan))
+    r0 = _max_r0(lines, LADDER_SHARE * remaining / usd_per_s)
+    floor_steps = max(min_r0_steps, _rollout_steps(arms_per_rung[0], plan))
+    return FullLadderProjection(
+        cap_usd=cap_usd,
+        remaining_usd=remaining,
+        arms_per_rung=tuple(sum(c.values()) for c in arms_per_rung),
+        cost_usd=_rung_cost_usd(lines, r0, usd_per_s),
+        r0=r0,
+        min_r0_steps=min_r0_steps,
+        would_exit_5=r0 < floor_steps,
+    )
+
+
+def _projection_note(plan: Plan) -> str:
+    measured = ", ".join(f"{f} {p.steps_per_s:.0f}" for f, p in plan.families.items())
+    factors = (
+        ", ".join(f"{f}/{m} x{x:.2f}" for (f, m), x in plan.method_factors.items())
+        or "none"
+    )
+    return (
+        "smoke-calibrated: steps/s measured only for the families smoke calibrated "
+        f"({measured}); every other family uses the fallback "
+        f"{plan.fallback.steps_per_s:.0f} steps/s; measured method factors: {factors}; "
+        "unprobed methods x1"
+    )
+
+
+def _projection_extra(proj: FullLadderProjection, plan: Plan) -> dict[str, float | str]:
+    extra: dict[str, float | str] = {
+        "full_projection_note": _projection_note(plan),
+        "full_projection_cap_usd": proj.cap_usd,
+        "full_projection_remaining_usd": proj.remaining_usd,
+        "full_projection_r0": float(proj.r0),
+        "full_projection_min_r0_steps": float(proj.min_r0_steps),
+        "full_projection_exits_5": "yes" if proj.would_exit_5 else "no",
+    }
+    for k, (n, usd) in enumerate(zip(proj.arms_per_rung, proj.cost_usd, strict=True)):
+        extra[f"full_projection_arms_r{k}"] = n
+        extra[f"full_projection_usd_r{k}"] = usd
+    return extra
+
+
+def _projection_line(proj: FullLadderProjection, plan: Plan) -> str:
+    return (
+        f"full-ladder projection ({_projection_note(plan)}): cap {proj.cap_usd:.2f} USD -> "
+        f"{proj.remaining_usd:.2f} USD after the {MARGIN_USD:.2f} margin and the "
+        f"{CALIBRATION_CAP_USD:.2f} calibration cap; expected arms per rung "
+        + ", ".join(f"{n:.1f}" for n in proj.arms_per_rung)
+        + "; projected USD per rung "
+        + ", ".join(f"{c:.2f}" for c in proj.cost_usd)
+        + f" (total {sum(proj.cost_usd):.2f}); r0={proj.r0}; SWEEP_MIN_R0_STEPS="
+        f"{proj.min_r0_steps}: a full run would "
+        + (
+            "EXIT 5 (r0 below the minimum)"
+            if proj.would_exit_5
+            else "start (r0 >= the minimum)"
+        )
     )
 
 
@@ -1045,7 +1155,7 @@ def _plan_rungs(
     if settings.r0_steps is not None:
         r0 = settings.r0_steps
         rungs = (r0, ETA * r0, ETA * ETA * r0)
-        factor = smoke_job_factor(plan) if settings.smoke else _unit_factor
+        factor = smoke_job_factor(plan) if settings.smoke else full_job_factor(plan)
         cost = ladder_cost_usd(counts, plan, r0, guard.usd_per_s, factor=factor)
         source = "SWEEP_R0_STEPS"
     elif settings.smoke:
@@ -1257,6 +1367,20 @@ def _run_sweep(
         ),
     )
 
+    projection: dict[str, float | str] = {}
+    if settings.smoke:
+        proj = project_full_ladder(
+            arms_per_rung=_arm_counts(arm_space("rung0"), smoke=False),
+            plan=plan,
+            cap_usd=settings.project_cap_usd,
+            usd_per_s=guard.usd_per_s,
+            min_r0_steps=settings.min_r0_steps,
+        )
+        projection = _projection_extra(proj, plan)
+        line = _projection_line(proj, plan)
+        print(line, flush=True)  # stdout: the operator reads this off the pod log
+        _log.info("%s", line)
+
     def arm_id_of(arm: Arm, step_budget: int) -> str:
         defaults = _defaults(plan, arm, step_budget, settings, device)
         return spec_for(
@@ -1315,6 +1439,7 @@ def _run_sweep(
         "cap_usd": settings.cap_usd,
         "calibration_usd": record.spent_usd,
         "n_workers": float(plan.n_workers),
+        **projection,
     }
     _final_report(
         scheduler, state, sink, smoke=settings.smoke, extra=extra, tick=guard.heartbeat
