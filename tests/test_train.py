@@ -616,3 +616,26 @@ def test_vmax_is_rejected_for_a_task_with_no_positive_reward() -> None:
     )
     with pytest.raises(ValueError, match="reward_max"):
         build_score(spec, task)
+
+
+def test_ic_success_capacity_is_read_after_the_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Final-review minor. phased switches tables when the first reward arrives, inside a
+    # rollout; per-IC success must use the table in force after that rollout. pendulum_dense
+    # pays reward on the first steps, so the switch happens in iteration 0.
+    seen: list[int] = []
+    real = train._ic_success
+
+    def spy(outcomes: list[Outcomes], capacity: int) -> tuple[float, float]:
+        seen.append(capacity)
+        return real(outcomes, capacity)
+
+    monkeypatch.setattr(train, "_ic_success", spy)
+    torch.manual_seed(0)
+    sink = _Recorder()
+
+    run(_spec(task="pendulum_dense", method="phased"), sink)
+
+    task: Task = TASKS.construct("pendulum_dense")  # pyright: ignore[reportAssignmentType] # registry is untyped
+    first_phase = next(d["method/phase"] for _, d in sink.logs if "method/phase" in d)
+    assert first_phase == 1.0
+    assert seen[0] == table_capacity(task, max_trajectories=16)

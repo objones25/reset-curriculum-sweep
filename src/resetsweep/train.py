@@ -752,8 +752,6 @@ def run(spec: RunSpec, sink: MetricsSink) -> RunResult:
             )
         iter_start_s = time.perf_counter()
         iter_start_steps = counter.total
-        table = method.ic_states()
-        capacity = table.n if table is not None else 0
         roll = collect_rollout(
             env,
             model,
@@ -765,6 +763,9 @@ def run(spec: RunSpec, sink: MetricsSink) -> RunResult:
             first_reward_step=first_reward,
         )
         obs, first_reward = roll.next_obs, roll.first_reward_step
+        # After the rollout: phased switches tables inside it, at its first reward.
+        table = method.ic_states()
+        capacity = table.n if table is not None else 0
         adv, returns = compute_gae(
             roll.rewards,
             roll.values,
