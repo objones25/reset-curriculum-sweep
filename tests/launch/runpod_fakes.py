@@ -151,6 +151,12 @@ class FakeRunPod:
         self, request: httpx.Request, id_param: str, spend: dict[str, float]
     ) -> httpx.Response:
         resource_id = request.url.params[id_param]
+        params = request.url.params
+        if ("startTime" in params) != ("endTime" in params):
+            # The live API (checked 2026-11-26) rejects one without the other.
+            return httpx.Response(
+                400, json={"detail": "startTime and endTime must be provided together"}
+            )
         total = spend.get(resource_id, 0.0)
         return httpx.Response(
             200,

@@ -294,13 +294,16 @@ def test_pod_spend_reads_billing_totals_for_one_pod(fake_runpod: FakeRunPod) -> 
     fake_runpod.pod_spend_usd["pod-old"] = 12.25
     client = RunPodClient(FAKE_RUNPOD_KEY, transport=fake_runpod.transport())
 
-    spend = client.pod_spend_usd("pod-old", since="2026-11-24T10:00:00Z")
+    spend = client.pod_spend_usd(
+        "pod-old", since="2026-11-24T10:00:00Z", until="2026-11-24T13:00:00Z"
+    )
 
     params = dict(fake_runpod.requests[0].url.params)
     assert spend == pytest.approx(12.25)
     assert params == {
         "podId": "pod-old",
         "startTime": "2026-11-24T10:00:00Z",
+        "endTime": "2026-11-24T13:00:00Z",
         "bucketSize": "hour",
     }
 
@@ -311,11 +314,14 @@ def test_volume_spend_reads_billing_totals_for_one_volume(
     fake_runpod.volume_spend_usd["vol-old"] = 0.5
     client = RunPodClient(FAKE_RUNPOD_KEY, transport=fake_runpod.transport())
 
-    spend = client.volume_spend_usd("vol-old", since="2026-11-24T10:00:00Z")
+    spend = client.volume_spend_usd(
+        "vol-old", since="2026-11-24T10:00:00Z", until="2026-11-24T13:00:00Z"
+    )
 
     assert spend == pytest.approx(0.5)
     assert fake_runpod.requests[0].url.path == "/v2/billing/network-volumes"
     assert fake_runpod.requests[0].url.params["networkVolumeId"] == "vol-old"
+    assert fake_runpod.requests[0].url.params["endTime"] == "2026-11-24T13:00:00Z"
 
 
 def test_get_volume_reads_datacenter_size_and_type(fake_runpod: FakeRunPod) -> None:

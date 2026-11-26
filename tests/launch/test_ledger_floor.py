@@ -21,12 +21,12 @@ class FakeBilling:
         self.pod = pod
         self.volume = volume
 
-    def pod_spend_usd(self, pod_id: str, *, since: str) -> float:
-        del pod_id, since
+    def pod_spend_usd(self, pod_id: str, *, since: str, until: str) -> float:
+        del pod_id, since, until
         return self.pod
 
-    def volume_spend_usd(self, volume_id: str, *, since: str) -> float:
-        del volume_id, since
+    def volume_spend_usd(self, volume_id: str, *, since: str, until: str) -> float:
+        del volume_id, since, until
         return self.volume
 
     def find_pod_by_name(self, name: str) -> dict[str, object] | None:

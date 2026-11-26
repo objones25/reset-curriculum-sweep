@@ -249,14 +249,21 @@ class RunPodClient:
     def balance_usd(self) -> float:
         return _number(self._json("GET", "/billing/balance"), "balanceAmount")
 
-    def pod_spend_usd(self, pod_id: str, *, since: str) -> float:
-        params = {"podId": pod_id, "startTime": since, "bucketSize": "hour"}
+    def pod_spend_usd(self, pod_id: str, *, since: str, until: str) -> float:
+        # The live API rejects startTime without endTime (400, checked 2026-11-26).
+        params = {
+            "podId": pod_id,
+            "startTime": since,
+            "endTime": until,
+            "bucketSize": "hour",
+        }
         return _billing_total(self._json("GET", "/billing/pods", params=params))
 
-    def volume_spend_usd(self, volume_id: str, *, since: str) -> float:
+    def volume_spend_usd(self, volume_id: str, *, since: str, until: str) -> float:
         params = {
             "networkVolumeId": volume_id,
             "startTime": since,
+            "endTime": until,
             "bucketSize": "hour",
         }
         return _billing_total(

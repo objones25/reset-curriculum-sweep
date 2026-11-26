@@ -122,6 +122,8 @@ def settle(
     minutes, so a fresh read can lag an earlier one."""
     if now.utcoffset() is None:
         raise ValueError("now must carry a UTC offset")
+    # billing snaps endTime up to the end of its hour bucket, so now covers the current hour
+    until = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     first_use: dict[str, int] = {}
     for i, launch in enumerate(launches):
         j = first_use.get(launch.volume_id)
@@ -134,9 +136,9 @@ def settle(
         since = _billing_start(launch.created())
         spent = 0.0
         if first_use[launch.volume_id] == i:
-            spent += client.volume_spend_usd(launch.volume_id, since=since)
+            spent += client.volume_spend_usd(launch.volume_id, since=since, until=until)
         if launch.pod_id is not None:
-            spent += client.pod_spend_usd(launch.pod_id, since=since)
+            spent += client.pod_spend_usd(launch.pod_id, since=since, until=until)
         floor = _floor_usd(
             launch, now=now, first_on_volume=first_use[launch.volume_id] == i
         )
