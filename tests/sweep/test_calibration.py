@@ -220,6 +220,24 @@ def test_calibration_closes_pool_when_cap_reached_mid_batch(
     assert record.batch_keys() == []  # a batch cut short is not a measurement
 
 
+def test_calibration_cap_counts_the_pools_startup(
+    tmp_path: Path, clock: Any, pool_factory: Any, world: Any
+) -> None:
+    # The real pool's constructor blocks while its workers warm up; here that costs 20 s
+    # (0.2 USD) per batch. A 0.5 USD cap must hold with the startup inside it.
+    world.slowdown = lambda spec: 50.0
+    world.enforce_timeouts = False
+
+    def slow_start(n_workers: int, device: str, cfg: RunnerConfig) -> Any:
+        clock.t += 20.0
+        return pool_factory(n_workers, device, cfg)
+
+    record = _calibrate(tmp_path, clock, slow_start, ("pendulum_dense",), cap_usd=0.5)
+
+    assert record.capped is True
+    assert record.spent_usd <= 0.5 + 1e-9
+
+
 def test_calibration_stops_when_the_sweep_budget_runs_out(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:

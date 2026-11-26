@@ -437,6 +437,9 @@ def _run_batch(
     if not budget_s > 0:
         raise ValueError(f"batch budget must be > 0, got {budget_usd} USD")
     timeout_s = min(s.job_timeout_s, budget_s)
+    # Read before building the pool: its constructor blocks while workers warm up, and that
+    # pod time counts against the batch budget like the jobs do.
+    start_usd = guard.spent()
     pool = pool_factory(batch.n_workers, s.device, runner_cfg)
     pending = {
         (spec.arm_id(), spec.seed): (job, spec, lr) for job, spec, lr in batch.jobs
@@ -444,7 +447,6 @@ def _run_batch(
     if len(pending) != len(batch.jobs):
         raise RuntimeError(f"batch {batch.key} has duplicate (arm_id, seed) jobs")
     done: dict[tuple[str, int], Measurement] = {}
-    start_usd = guard.spent()
     try:
         submitted_at: dict[tuple[str, int], float] = {}
         for key, (job, spec, _) in pending.items():
