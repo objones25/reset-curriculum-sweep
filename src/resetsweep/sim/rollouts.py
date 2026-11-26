@@ -18,9 +18,12 @@ SPEED_MAX_DEFAULT = 5.0
 
 
 class Rollouts:
-    """Random walks and hold screens on a private `BatchSim` of `nworld_max` worlds.
+    """Random walks and hold screens on private `BatchSim`s.
 
-    Starts are processed in chunks of at most `nworld_max`. The sim is built on first use.
+    Starts are processed in chunks of at most `nworld_max`. Each chunk runs on a sim sized to
+    it, rounded up to a power of two (capped at `nworld_max`), built on first use and cached,
+    so a handful of starts simulates a handful of worlds and the charged steps match the work
+    (final-review minor; at most log2(nworld_max) + 1 sims are ever built).
     `speed_max` bounds `max |qvel|` over a hold screen, in the task's own velocity units.
     """
 
@@ -44,7 +47,7 @@ class Rollouts:
         self._gen = gen
         self._nworld_max = nworld_max
         self._speed_max = speed_max
-        self._sim: BatchSim | None = None
+        self._sims: dict[int, BatchSim] = {}
         self._extra = torch.zeros(nworld_max, task.extra_dim, device=device)
         model = mujoco.MjModel.from_xml_string(task.mjcf)  # pyright: ignore[reportAttributeAccessIssue] # mujoco ships no stub for the C-extension class
         self._control_dt_s = float(model.opt.timestep) * task.frame_skip
@@ -66,11 +69,12 @@ class Rollouts:
         out: list[StartStates] = []
         for chunk in self._chunks(starts):
             sim = self._load(chunk)
+            extra = self._extra[: sim.qpos.shape[0]]
             action = torch.zeros(sim.ctrl.shape, device=self._device)
             for t in range(steps):
                 if t % action_hold == 0:
                     action = self._random_action(sim.ctrl.shape)
-                step_task(self._task, sim, self._extra, action)
+                step_task(self._task, sim, extra, action)
             out.append(self._read(sim, chunk.n))
         return StartStates.cat(out)
 
@@ -93,11 +97,12 @@ class Rollouts:
         keep: list[Tensor] = []
         for chunk in self._chunks(starts):
             sim = self._load(chunk)
+            extra = self._extra[: sim.qpos.shape[0]]
             zero = torch.zeros(sim.ctrl.shape, device=self._device)
             ok = torch.ones(sim.qpos.shape[0], dtype=torch.bool, device=self._device)
             for _ in range(steps):
-                step_task(self._task, sim, self._extra, zero)
-                ok &= ~self._task.terminated(sim, self._extra)
+                step_task(self._task, sim, extra, zero)
+                ok &= ~self._task.terminated(sim, extra)
                 ok &= sim.qvel.abs().amax(dim=1) <= speed_max
             keep.append(ok[: chunk.n])
         return torch.cat(keep)
@@ -113,15 +118,22 @@ class Rollouts:
             for i in range(0, n, self._nworld_max)
         ]
 
+    def sim_worlds(self) -> tuple[int, ...]:
+        """World counts of the sims built so far, ascending."""
+        return tuple(sorted(self._sims))
+
     def _load(self, chunk: StartStates) -> BatchSim:
-        if self._sim is None:
-            self._sim = BatchSim(
+        size = min(self._nworld_max, 1 << max(chunk.n - 1, 0).bit_length())
+        assert chunk.n <= size <= self._nworld_max, (chunk.n, size, self._nworld_max)
+        sim = self._sims.get(size)
+        if sim is None:
+            sim = BatchSim(
                 self._task.mjcf,
-                nworld=self._nworld_max,
+                nworld=size,
                 device=self._device,
                 frame_skip=self._task.frame_skip,
             )
-        sim = self._sim
+            self._sims[size] = sim
         rows = torch.arange(chunk.n, device=self._device)
         sim.set_state(rows, chunk.qpos.to(self._device), chunk.qvel.to(self._device))
         self._extra[: chunk.n] = chunk.extra.to(self._device)
