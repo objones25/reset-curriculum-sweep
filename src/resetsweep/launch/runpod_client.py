@@ -193,6 +193,13 @@ class RunPodClient:
         _str(pod, "id")
         return pod
 
+    def update_pod_env(self, pod_id: str, env: Mapping[str, str]) -> dict[str, object]:
+        """`PATCH /v2/pods/{id}` with the full `env` (docs.runpod.io/api-reference-v2/pods/
+        update-a-pod, read 2026-11-25: `env` is mutable; updating it restarts the pod)."""
+        pod = self._json("PATCH", f"/pods/{pod_id}", body={"env": dict(env)})
+        _str(pod, "id")
+        return pod
+
     def pod_status(self, pod_id: str) -> str | None:
         """The pod's `status`, or None if the API answers 404 (the pod is gone)."""
         try:

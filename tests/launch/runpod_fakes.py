@@ -82,6 +82,8 @@ class FakeRunPod:
     echo_body_on_error: bool = (
         False  # error detail repeats the request body, as some APIs do
     )
+    create_cost: float | None = None  # the create response's `cost`; None: the catalog price
+    patch_status: int = 200  # PATCH /v2/pods/{id}
     requests: list[httpx.Request] = field(default_factory=list)
     _pods_created: int = 0
 
@@ -121,6 +123,13 @@ class FakeRunPod:
             if volume is None:
                 return httpx.Response(404, json={"detail": "volume not found"})
             return httpx.Response(200, json=volume)
+        if request.method == "PATCH" and request.url.path.startswith("/v2/pods/"):
+            if self.patch_status != 200:
+                return httpx.Response(self.patch_status, json={"detail": "fake patch error"})
+            pod_id = request.url.path.rsplit("/", 1)[1]
+            return httpx.Response(200, json={"id": pod_id, **json.loads(request.content)})
+        if request.method == "DELETE" and request.url.path.startswith("/v2/pods/"):
+            return httpx.Response(204)
         if request.method == "GET" and request.url.path.startswith("/v2/pods/"):
             pod_id = request.url.path.rsplit("/", 1)[1]
             if pod_id not in self.pod_states:
@@ -176,7 +185,7 @@ class FakeRunPod:
             201,
             json={
                 "id": f"pod-{self._pods_created}",
-                "cost": price,
+                "cost": price if self.create_cost is None else self.create_cost,
                 "status": "PROVISIONING",
                 "createdAt": "2026-11-25T10:00:00Z",
             },

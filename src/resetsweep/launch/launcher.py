@@ -40,7 +40,10 @@ Steps:
    sending may have created the pod: it is looked up by its unique name; if found the launch goes on, if
    not it is recorded as `unresolved`, "a pod may exist" is printed, and later launches are
    refused until a settle finds it. A second volume or pod is never created.
-7. Record the launch in the ledger; print the pod id, the hourly cost, the W&B project and
+7. If the create response's `cost` (docs.runpod.io/api-reference-v2/pods/create-a-pod:
+   "The pod's hourly compute rate in USD") is above the catalog price the env was built from,
+   PATCH the pod's env with that price and SWEEP_MAX_HOURS redone at it (the pod restarts to
+   apply it); if the PATCH fails, delete the pod and exit 3. Record the launch in the ledger; print the pod id, the hourly cost, the W&B project and
    how to resume.
 
 Pod cap: `SWEEP_CAP_USD` is `cap - spent` for a new volume. For a reused volume it is
@@ -451,12 +454,29 @@ def _launch(
         _err(
             f"sweep-launch: warning: pod cost {usd_per_h} USD/h differs from the catalog's {gpu.secure_usd_per_h}"
         )
+    # The pod's env was built from the catalog price. A higher reported price would let the
+    # pod's SWEEP_MAX_HOURS cost more than remaining - margin, so redo the cap math at that
+    # price and rewrite the env; if that fails, delete the pod (fail closed). A lower price
+    # leaves the env as is: it is then conservative.
+    priced = gpu
+    if usd_per_h > gpu.secure_usd_per_h + 1e-6:
+        priced = replace(gpu, secure_usd_per_h=usd_per_h)
+        if not _reprice_pod(client, pod_id, plan.datacenter, volume_id, priced, pod_args):
+            refused = replace(
+                record,
+                pod_id=pod_id,
+                gpu_id=gpu.id,
+                gpu_usd_per_h=usd_per_h,
+                max_hours=_sent_max_hours(remaining, gpu, volume.size_gb, margin=margin),
+            )
+            _save_ledger(ledger_path, [*launches, refused], note=f"pod {pod_id}, deleted")
+            return 3
     launch = replace(
         record,
         pod_id=pod_id,
         gpu_id=gpu.id,
         gpu_usd_per_h=usd_per_h,
-        max_hours=_sent_max_hours(remaining, gpu, volume.size_gb, margin=margin),
+        max_hours=_sent_max_hours(remaining, priced, volume.size_gb, margin=margin),
     )
     if not _save_ledger(
         ledger_path,
@@ -481,6 +501,43 @@ def _launch(
     )
     print(f"  {_delete_volume_command(volume_id)}")
     return 0
+
+
+def _reprice_pod(
+    client: RunPodClient,
+    pod_id: str,
+    datacenter: str,
+    volume_id: str,
+    priced: GpuType,
+    pod_args: "_PodArgs",
+) -> bool:
+    """Rewrite `pod_id`'s env with SWEEP_GPU_USD_PER_H and SWEEP_MAX_HOURS at `priced`'s
+    price. On failure, delete the pod and say so; returns whether the pod may run."""
+    env = _pod_body(priced, datacenter, volume_id, pod_args)["env"]
+    if not isinstance(env, dict):
+        raise TypeError("pod body env must be a dict")
+    try:
+        client.update_pod_env(pod_id, env)  # pyright: ignore[reportUnknownArgumentType] # str -> str, built by _pod_body
+    except RunPodError as e:
+        _err(
+            f"sweep-launch: refused: pod {pod_id} costs {priced.secure_usd_per_h} USD/h, above the "
+            f"catalog price its SWEEP_MAX_HOURS was sized for, and updating its env failed ({e}); "
+            "deleting it"
+        )
+        try:
+            client.delete_pod(pod_id)
+        except RunPodError as d:
+            _err(
+                f"sweep-launch: could not delete pod {pod_id} ({d}); terminate it by hand: "
+                f'curl -fsS -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" '
+                f"{API_V2}/pods/{pod_id}"
+            )
+        return False
+    print(
+        f"pod {pod_id} reports {priced.secure_usd_per_h} USD/h; its env now carries that price "
+        f"and SWEEP_MAX_HOURS={env['SWEEP_MAX_HOURS']} (the pod restarts to apply it)"
+    )
+    return True
 
 
 GONE_STATUSES: Final = frozenset({"TERMINATED"})

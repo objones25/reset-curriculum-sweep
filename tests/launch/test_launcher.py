@@ -1334,3 +1334,58 @@ def test_volume_resume_with_another_ref_warns_about_exit_4(
     assert code == 0
     assert SHA in err and HEAD_SHA in err
     assert "exit 4" in err
+
+
+# --- the created pod's reported price (final-review minor) ---------------------------------------
+
+
+def test_higher_reported_pod_cost_rewrites_price_and_max_hours(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    # Catalog 0.69, but the create response says cost 0.80 USD/h (docs: `cost`, "The pod's
+    # hourly compute rate in USD"). SWEEP_MAX_HOURS must be redone at 0.80:
+    # floor2((100 - 5) / (0.80 + 20 * 0.07 / 730)) = 118.46.
+    fake_runpod.create_cost = 0.80
+    ledger = tmp_path / "ledger.json"
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    [patch] = fake_runpod.bodies("PATCH", "/v2/pods/pod-1")
+    env = patch["env"]
+    assert isinstance(env, dict)
+    assert code == 0
+    assert env["SWEEP_GPU_USD_PER_H"] == "0.8"
+    assert env["SWEEP_MAX_HOURS"] == "118.46"
+    assert env["REPO_REF"] == SHA  # the rest of the env is resent unchanged
+    saved = json.loads(ledger.read_text(encoding="utf-8"))["launches"][0]
+    assert (saved["gpu_usd_per_h"], saved["max_hours"]) == (0.8, 118.46)
+
+
+def test_lower_or_equal_reported_cost_leaves_the_pod_alone(
+    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path
+) -> None:
+    fake_runpod.create_cost = 0.60
+
+    code = _run(fake_runpod, env_file, tmp_path)
+
+    assert code == 0
+    assert fake_runpod.sent("PATCH", "/v2/pods/pod-1") == []
+
+
+def test_failed_price_rewrite_deletes_the_pod_and_refuses(
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_runpod.create_cost = 0.80
+    fake_runpod.patch_status = 422
+    ledger = tmp_path / "ledger.json"
+
+    code = _run(fake_runpod, env_file, tmp_path, ledger=ledger)
+
+    assert code == 3
+    assert len(fake_runpod.sent("DELETE", "/v2/pods/pod-1")) == 1
+    assert "0.8" in capsys.readouterr().err
+    saved = json.loads(ledger.read_text(encoding="utf-8"))["launches"][0]
+    assert saved["pod_id"] == "pod-1"  # recorded, so the spend floor still counts it
