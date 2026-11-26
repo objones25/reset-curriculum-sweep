@@ -1,11 +1,13 @@
-"""Worker pool: one spawned process per job (Review Focus 1: a crash is a failed result).
+"""Worker pool: long-lived spawned workers, killed and respawned to stop a job (Review Focus
+1: a crash is a failed result, and any job can be killed).
 
 These tests spawn real processes on CPU. The job functions are module-level so the spawn
-child can unpickle them; none of them trains anything.
+child can unpickle them; only the determinism tests train (a tiny CPU config).
 """
 
 import dataclasses
 import math
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -18,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from resetsweep.metrics import NullSink
 from resetsweep.ppo.update import START_CONFIG
 from resetsweep.sweep.arms import arm_space
 from resetsweep.sweep.pool import (
@@ -27,7 +30,7 @@ from resetsweep.sweep.pool import (
     run_log_path,
 )
 from resetsweep.sweep.scheduler import Job
-from resetsweep.train import RunResult, RunSpec
+from resetsweep.train import RunResult, RunSpec, run
 
 ARM = arm_space("rung0")[0]
 POLL_LIMIT_S = 120.0  # a spawn child imports torch and warp: a few seconds each
@@ -393,3 +396,224 @@ def test_heartbeat_sink_touches_the_file_on_every_log(tmp_path: Path) -> None:
 
     assert path.stat().st_mtime_ns > 10**9
     assert first > 0
+
+
+# --- persistent workers -------------------------------------------------------------------------
+
+SEED_RAISES, SEED_SIGKILL, SEED_HANGS, SEED_SLOW = 3, 4, 5, 6
+
+
+def _pid_file(seed: int) -> Path:
+    """Where `scripted_runner` records its worker's pid; named by the test process's pid."""
+    return (
+        Path(tempfile.gettempdir())
+        / f"resetsweep-test-worker-{os.getppid()}-{seed}.pid"
+    )
+
+
+def _test_pid_file(seed: int) -> Path:
+    return (
+        Path(tempfile.gettempdir()) / f"resetsweep-test-worker-{os.getpid()}-{seed}.pid"
+    )
+
+
+def scripted_runner(spec: RunSpec) -> RunResult:
+    """Behaves by seed; an ok result carries its worker's pid in `env_steps_extra`."""
+    if spec.seed == SEED_RAISES:
+        raise FloatingPointError(f"NaN loss in seed {spec.seed}")
+    if spec.seed == SEED_SIGKILL:
+        os.kill(os.getpid(), signal.SIGKILL)
+    if spec.seed == SEED_HANGS:
+        _pid_file(spec.seed).write_text(str(os.getpid()))
+        threading.Event().wait(600.0)
+        raise AssertionError("not killed")
+    if spec.seed == SEED_SLOW:
+        threading.Event().wait(2.0)
+    return dataclasses.replace(_ok_result(spec), env_steps_extra={"pid": os.getpid()})
+
+
+def _pid(result: RunResult) -> int:
+    assert result.status == "ok", result
+    return result.env_steps_extra["pid"]
+
+
+def _run_one(
+    pool: WorkerPool, seed: int, *, timeout_s: float = POLL_LIMIT_S
+) -> RunResult:
+    pool.submit(_job(seed), _spec(seed), timeout_s=timeout_s)
+    (result,) = _poll_until(pool, 1)
+    return result
+
+
+def test_consecutive_jobs_on_one_slot_reuse_the_worker_process() -> None:
+    with WorkerPool(n_workers=1, device="cpu", runner=scripted_runner) as pool:
+        first = _pid(_run_one(pool, 0))
+        second = _pid(_run_one(pool, 1))
+
+    assert first == second != os.getpid()
+
+
+def test_failed_runner_keeps_the_worker_for_the_next_job() -> None:
+    with WorkerPool(n_workers=1, device="cpu", runner=scripted_runner) as pool:
+        before = _pid(_run_one(pool, 0))
+        failed = _run_one(pool, SEED_RAISES)
+        after = _pid(_run_one(pool, 1))
+
+    assert failed.error == "FloatingPointError('NaN loss in seed 3')"
+    assert before == after
+
+
+def test_worker_crash_fails_the_job_and_respawns_the_slot() -> None:
+    with WorkerPool(n_workers=1, device="cpu", runner=scripted_runner) as pool:
+        before = _pid(_run_one(pool, 0))
+        crashed = _run_one(pool, SEED_SIGKILL)
+        after = _pid(_run_one(pool, 1))
+
+        assert pool.free_slots() == 1
+    assert crashed.error == "worker died without a result: exit code -9 (SIGKILL)"
+    assert before != after
+
+
+def test_timeout_kills_the_worker_and_respawns_the_slot() -> None:
+    with WorkerPool(n_workers=1, device="cpu", runner=scripted_runner) as pool:
+        before = _pid(_run_one(pool, 0))
+        timed_out = _run_one(pool, SEED_HANGS, timeout_s=0.5)
+        after = _pid(_run_one(pool, 1))
+
+    assert timed_out.error == "timed out after 0.5 s; worker killed"
+    assert before != after
+
+
+def test_kill_respawns_the_slot_and_leaves_the_other_slots_job_running() -> None:
+    pid_file = _test_pid_file(SEED_HANGS)
+    pid_file.unlink(missing_ok=True)
+    with WorkerPool(n_workers=2, device="cpu", runner=scripted_runner) as pool:
+        pool.submit(_job(SEED_HANGS), _spec(SEED_HANGS), timeout_s=POLL_LIMIT_S)
+        pool.submit(_job(SEED_SLOW), _spec(SEED_SLOW), timeout_s=POLL_LIMIT_S)
+        assert _wait_until(
+            lambda: pid_file.exists() and pid_file.read_text() != "", POLL_LIMIT_S
+        )
+        killed = int(pid_file.read_text())
+
+        pool.kill(_job(SEED_HANGS))
+        (slow,) = _poll_until(pool, 1)
+        pool.submit(_job(0), _spec(0), timeout_s=POLL_LIMIT_S)
+        pool.submit(_job(1), _spec(1), timeout_s=POLL_LIMIT_S)
+        later = _poll_until(pool, 2)
+
+    pid_file.unlink(missing_ok=True)
+    assert _wait_until(lambda: not _alive(killed), 10.0)
+    assert slow.seed == SEED_SLOW and _pid(slow) != killed
+    assert sorted(r.seed for r in later) == [0, 1]
+    later_pids = {_pid(r) for r in later}
+    # one job per slot: the slow job's worker, reused, and the killed slot's new worker
+    assert len(later_pids) == 2 and _pid(slow) in later_pids
+    assert killed not in later_pids
+
+
+def test_hang_guard_kills_the_worker_and_respawns_the_slot(tmp_path: Path) -> None:
+    clock = _Clock()
+    beat = tmp_path / "job.heartbeat"
+    with WorkerPool(
+        n_workers=1, device="cpu", runner=scripted_runner, clock=clock
+    ) as pool:
+        before = _pid(_run_one(pool, 0))
+        pool.submit(
+            _job(SEED_HANGS),
+            _spec(SEED_HANGS),
+            timeout_s=10_000.0,
+            heartbeat=beat,
+            hang_s=100.0,
+        )
+        clock.t = 101.0
+        (hung,) = pool.poll(timeout_s=0.0)
+        after = _pid(_run_one(pool, 1))
+
+    assert hung.error is not None and "no progress for 100" in hung.error
+    assert before != after
+
+
+def dying_warm_up() -> None:
+    os._exit(3)  # an import or Warp init that kills the worker before it is ready
+
+
+def test_workers_that_die_during_startup_three_times_raise() -> None:
+    with pytest.raises(RuntimeError, match="died during startup 3 times in a row"):
+        WorkerPool(
+            n_workers=1, device="cpu", runner=scripted_runner, warm_up=dying_warm_up
+        )
+
+    assert _wait_until(lambda: multiprocessing.active_children() == [], 10.0)
+
+
+def slow_warm_up() -> None:
+    threading.Event().wait(3.0)  # stands in for torch/warp imports and Warp init
+
+
+def test_the_pool_starts_warm_workers_so_jobs_pay_no_startup() -> None:
+    start = time.monotonic()
+    with WorkerPool(
+        n_workers=2, device="cpu", runner=scripted_runner, warm_up=slow_warm_up
+    ) as pool:
+        built_s = time.monotonic() - start
+        start = time.monotonic()
+        _run_one(pool, 0)
+        _run_one(pool, 1)
+        jobs_s = time.monotonic() - start
+
+    assert built_s >= 3.0  # both workers warmed in parallel, before any job
+    assert jobs_s < 1.5
+
+
+def test_close_leaves_no_live_children() -> None:
+    pool = WorkerPool(n_workers=2, device="cpu", runner=scripted_runner)
+    _run_one(pool, 0)
+    pool.submit(_job(SEED_HANGS), _spec(SEED_HANGS), timeout_s=POLL_LIMIT_S)
+    assert multiprocessing.active_children() != []
+
+    pool.close()
+    pool.close()  # idempotent
+
+    assert multiprocessing.active_children() == []
+    _test_pid_file(SEED_HANGS).unlink(missing_ok=True)
+
+
+# --- state isolation between jobs in one worker ---------------------------------------------------
+
+SEED_POISON = 99
+
+
+class _RaisingSink(NullSink):
+    def log(self, step: int, data: dict[str, float]) -> None:
+        raise RuntimeError(f"sink failed at step {step}")
+
+
+def training_runner(spec: RunSpec) -> RunResult:
+    """Trains `spec` for real; seed SEED_POISON fails after one PPO iteration, having moved the
+    global RNGs and built a sim, so the next job in the worker starts from dirty state."""
+    sink = _RaisingSink() if spec.seed == SEED_POISON else NullSink()
+    return run(spec, sink)
+
+
+def _tiny_spec(seed: int) -> RunSpec:
+    # `ball` needs a score; `random` draws from a seed derived from spec.seed
+    return dataclasses.replace(_spec(seed), score="random", eval_n=4)
+
+
+def _scores(result: RunResult) -> RunResult:
+    assert result.status == "ok", result
+    return dataclasses.replace(result, wall_s=0.0)
+
+
+def test_same_spec_twice_in_one_worker_gives_identical_results() -> None:
+    with WorkerPool(n_workers=1, device="cpu", runner=training_runner) as pool:
+        results = []
+        for seed in (0, 0, SEED_POISON, 0):
+            pool.submit(_job(seed), _tiny_spec(seed), timeout_s=POLL_LIMIT_S)
+            results += _poll_until(pool, 1)
+
+    first, second, poisoned, after_failure = results
+    assert poisoned.status == "failed"
+    assert poisoned.error is not None and "sink failed" in poisoned.error
+    assert _scores(first) == _scores(second) == _scores(after_failure)
+    assert first.env_steps_train > 0

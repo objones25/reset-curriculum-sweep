@@ -19,8 +19,13 @@ useful numbers exist first if the $10 cap (`CALIBRATION_CAP_USD`) stops it early
    methods' per-update IC churn and `walk` waiting for 2 trusted ICs (pendulum_sparse). Each
    records steps/s and the last value of every `method/`, `method_update/` and `ic/` metric.
 
-Per-job overhead (spawn, imports, kernel compile, evals) is measured on the config jobs as
-wall clock from submit to result minus ``env_steps / steps_per_s``.
+Per-job overhead (sim build, kernel load, evals, W&B setup and finish) is measured on the
+config jobs as wall clock from submit to result minus ``env_steps / steps_per_s``. Each batch
+builds its own pool, and `WorkerPool` returns only once its workers are warm (process start,
+imports and Warp init done), so that startup, which the sweep pays once per worker slot and
+not once per job, is not in the measured overhead. Calibration jobs are each a fresh worker's
+first job, so anything a worker loads lazily on its first job and keeps (Warp kernel modules,
+the CUDA context, the W&B service) is still counted: the estimate errs on the high side.
 
 Everything lands in `calibration.json` after each batch (atomic replace), with the spend so far
 (guard spend while calibrating, summed over sessions). On restart, finished batches are reused
