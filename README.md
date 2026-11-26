@@ -87,8 +87,8 @@ SHA is recorded in the ledger.
    ```
 
    In the pod body, `SWEEP_RUNPOD_API_KEY` and `WANDB_API_KEY` appear as `"***"`; the other `env`
-   entries are `REPO_URL`, `REPO_REF`, `SWEEP_CAP_USD`, `SWEEP_PROJECT_CAP_USD` (the `--cap`
-   value), `SWEEP_GPU_USD_PER_H`, `SWEEP_MAX_HOURS`, `SWEEP_STATE_DIR` and `WANDB_PROJECT`.
+   entries are `REPO_URL`, `REPO_REF`, `SWEEP_CAP_USD`, `SWEEP_PROJECT_CAP_USD` (always
+   100, the default account cap), `SWEEP_GPU_USD_PER_H`, `SWEEP_MAX_HOURS`, `SWEEP_STATE_DIR` and `WANDB_PROJECT`.
 
 2. **Smoke run (costs money, not run for this README).** One short GPU run: calibrate the pendulum
    family and run the arm-family probes (`visited` and `buffer_scored` on `arm_sparse`), then
@@ -100,7 +100,7 @@ SHA is recorded in the ledger.
    After calibration the smoke prints a `full-ladder projection` line (also in report.md,
    report.json and the W&B summary as `full_projection_*`): the full sweep's expected arms
    and USD per rung, r0, and whether a full run would exit 5, at `SWEEP_PROJECT_CAP_USD`
-   (the launcher sends `--cap`) less the $5 margin and the $10 calibration cap. It uses the
+   (the launcher always sends 100, so a $5 smoke still answers the $100 question) less the $5 margin and the $10 calibration cap. It uses the
    throughput smoke measured (pendulum) and a fallback for every other family, so treat it
    as a rough check.
 

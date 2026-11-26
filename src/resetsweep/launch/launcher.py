@@ -353,7 +353,7 @@ def _launch(
         ref=ref,
         remaining=remaining,
         pod_cap_usd=pod_cap,
-        account_cap_usd=args.cap,
+        account_cap_usd=CAP_USD_DEFAULT,  # smoke projects the full ladder at $100, not at its own --cap
         smoke=args.smoke,
         volume_gb=volume.size_gb,
         margin=margin,
@@ -689,9 +689,7 @@ class _PodArgs:
     ref: str
     remaining: float  # new money this launch may spend: sets max_hours
     pod_cap_usd: float  # SWEEP_CAP_USD: see _pod_cap_usd
-    account_cap_usd: (
-        float  # SWEEP_PROJECT_CAP_USD: smoke projects the full ladder at it
-    )
+    account_cap_usd: float  # SWEEP_PROJECT_CAP_USD: CAP_USD_DEFAULT; smoke projects the full ladder at it
     smoke: bool
     volume_gb: int
     margin: float
