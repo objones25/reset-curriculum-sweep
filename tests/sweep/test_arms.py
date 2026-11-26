@@ -205,7 +205,9 @@ def test_final_expand_takes_rung1_arms_and_clears_task_kw_on_dense(
     variant = Arm(**{**base.__dict__, "task_kw": (("lanes", 5),)})
     p_variant = Arm(**{**base.__dict__, "method_kw": (("p_task", 0.2),)})
     expanded = arm_space("final_expand", survivors=[variant, p_variant])
-    dense = {a.label() for a in expanded if a.task in DENSE_TASKS and a.method == "walk"}
+    dense = {
+        a.label() for a in expanded if a.task in DENSE_TASKS and a.method == "walk"
+    }
     assert dense == {
         f"{t}/walk[p_task={p}]/rnd" for t in DENSE_TASKS for p in (0.5, 0.2)
     }
@@ -271,7 +273,11 @@ def test_rung1_expand_adds_anchors_for_each_task_variant(rung0: list[Arm]) -> No
 
 def test_variant_anchors_match_the_plain_anchors(rung0: list[Arm]) -> None:
     maze = _survivor(rung0, task="maze", method="walk", score="rnd")
-    plain = {a.method: a for a in rung0 if a.task == "maze" and a.method in {"uniform", "point"}}
+    plain = {
+        a.method: a
+        for a in rung0
+        if a.task == "maze" and a.method in {"uniform", "point"}
+    }
     expanded = arm_space("rung1_expand", survivors=[maze])
     variant = [a for a in expanded if a.task_kw and a.method in {"uniform", "point"}]
     assert variant == [

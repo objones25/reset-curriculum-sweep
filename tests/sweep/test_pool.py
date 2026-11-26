@@ -273,7 +273,9 @@ def test_kill_also_kills_the_workers_grandchildren() -> None:
     pid_file.unlink(missing_ok=True)
     with WorkerPool(n_workers=1, device="cpu", runner=grandchild_runner) as pool:
         pool.submit(_job(seed), _spec(seed), timeout_s=POLL_LIMIT_S)
-        assert _wait_until(lambda: pid_file.exists() and pid_file.read_text() != "", POLL_LIMIT_S)
+        assert _wait_until(
+            lambda: pid_file.exists() and pid_file.read_text() != "", POLL_LIMIT_S
+        )
         grandchild = int(pid_file.read_text())
 
         pool.kill(_job(seed))
@@ -316,7 +318,9 @@ def test_job_with_progress_is_not_killed_past_hang_s(tmp_path: Path) -> None:
     clock = _Clock()
     beat = tmp_path / "job.heartbeat"
     beat.touch()
-    with WorkerPool(n_workers=1, device="cpu", runner=hanging_runner, clock=clock) as pool:
+    with WorkerPool(
+        n_workers=1, device="cpu", runner=hanging_runner, clock=clock
+    ) as pool:
         pool.submit(_job(), _spec(), timeout_s=10_000.0, heartbeat=beat, hang_s=100.0)
         for n, t in enumerate((50.0, 140.0, 230.0), start=1):
             clock.t = t
@@ -330,7 +334,9 @@ def test_job_with_progress_is_not_killed_past_hang_s(tmp_path: Path) -> None:
 def test_job_without_progress_for_hang_s_is_killed_and_failed(tmp_path: Path) -> None:
     clock = _Clock()
     beat = tmp_path / "job.heartbeat"
-    with WorkerPool(n_workers=1, device="cpu", runner=hanging_runner, clock=clock) as pool:
+    with WorkerPool(
+        n_workers=1, device="cpu", runner=hanging_runner, clock=clock
+    ) as pool:
         pool.submit(_job(), _spec(), timeout_s=10_000.0, heartbeat=beat, hang_s=100.0)
         clock.t = 60.0
         beat.touch()  # first progress seen at 60
@@ -346,7 +352,9 @@ def test_job_without_progress_for_hang_s_is_killed_and_failed(tmp_path: Path) ->
 def test_progress_does_not_lift_the_absolute_ceiling(tmp_path: Path) -> None:
     clock = _Clock()
     beat = tmp_path / "job.heartbeat"
-    with WorkerPool(n_workers=1, device="cpu", runner=hanging_runner, clock=clock) as pool:
+    with WorkerPool(
+        n_workers=1, device="cpu", runner=hanging_runner, clock=clock
+    ) as pool:
         pool.submit(_job(), _spec(), timeout_s=150.0, heartbeat=beat, hang_s=100.0)
         clock.t = 80.0
         beat.touch()

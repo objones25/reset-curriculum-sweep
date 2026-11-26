@@ -90,7 +90,9 @@ class VecEnv:
         self._hold = torch.zeros(num_envs, dtype=torch.long, device=device)
         self._success = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._reached = torch.zeros(num_envs, dtype=torch.bool, device=device)
-        self._first_reward = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+        self._first_reward = torch.full(
+            (num_envs,), -1, dtype=torch.long, device=device
+        )
         self._full = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._start_step = torch.zeros(num_envs, dtype=torch.long, device=device)
         self._ic_ids = torch.zeros(num_envs, dtype=torch.long, device=device)

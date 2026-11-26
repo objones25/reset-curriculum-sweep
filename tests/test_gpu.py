@@ -116,12 +116,18 @@ G3_QPOS_ATOL = 1e-3
 G3_QVEL_ATOL = 1e-2
 
 
-def _g3_inputs(task: Task) -> tuple[list[tuple[Tensor, Tensor, Tensor]], Tensor, Tensor]:
+def _g3_inputs(
+    task: Task,
+) -> tuple[list[tuple[Tensor, Tensor, Tensor]], Tensor, Tensor]:
     gen = torch.Generator().manual_seed(0)
     first = task.sample_start(G3_WORLDS, gen)
-    resets = [task.sample_start(G3_RESET_ROWS, gen) for _ in range(G3_STEPS // G3_RESET_EVERY)]
+    resets = [
+        task.sample_start(G3_RESET_ROWS, gen) for _ in range(G3_STEPS // G3_RESET_EVERY)
+    ]
     actions = torch.rand(G3_STEPS, G3_WORLDS, task.act_dim, generator=gen) * 2 - 1
-    states = [(first.qpos, first.qvel, first.extra)] + [(r.qpos, r.qvel, r.extra) for r in resets]
+    states = [(first.qpos, first.qvel, first.extra)] + [
+        (r.qpos, r.qvel, r.extra) for r in resets
+    ]
     return states, actions, first.extra
 
 
@@ -130,7 +136,9 @@ def g3_trajectory(task_name: str, device: str) -> tuple[Tensor, Tensor]:
     fixed starts, fixed actions and fixed partial resets of rows [0, G3_RESET_ROWS)."""
     task: Task = TASKS.construct(task_name)  # pyright: ignore[reportAssignmentType] # registry is untyped
     states, actions, extra0 = _g3_inputs(task)
-    sim = BatchSim(task.mjcf, nworld=G3_WORLDS, device=device, frame_skip=task.frame_skip)
+    sim = BatchSim(
+        task.mjcf, nworld=G3_WORLDS, device=device, frame_skip=task.frame_skip
+    )
     qpos0, qvel0, _ = states[0]
     sim.set_state(
         torch.arange(G3_WORLDS, device=device), qpos0.to(device), qvel0.to(device)
@@ -177,9 +185,15 @@ G4_POLL_LIMIT_S = 600.0
 
 
 def _g4_jobs(device: str) -> list[tuple[Job, RunSpec]]:
-    arm = next(a for a in arm_space("rung0") if a.label() == "pendulum_sparse/uniform/-")
+    arm = next(
+        a for a in arm_space("rung0") if a.label() == "pendulum_sparse/uniform/-"
+    )
     defaults = RunDefaults(
-        num_envs=64, rollout_len=8, ppo=ppo_for(3e-4, 64, 8), eval_every_steps=512, eval_n=8,
+        num_envs=64,
+        rollout_len=8,
+        ppo=ppo_for(3e-4, 64, 8),
+        eval_every_steps=512,
+        eval_n=8,
         device=device,
     )
     out = []
@@ -190,7 +204,9 @@ def _g4_jobs(device: str) -> list[tuple[Job, RunSpec]]:
 
 
 def g4_run_two_jobs(device: str, runs_dir: Path) -> list[RunResult]:
-    cfg = RunnerConfig(project="g4", group="g4", wandb_mode="disabled", runs_dir=runs_dir)
+    cfg = RunnerConfig(
+        project="g4", group="g4", wandb_mode="disabled", runs_dir=runs_dir
+    )
     runner: Callable[[RunSpec], RunResult] = functools.partial(train_job, cfg)
     results: list[RunResult] = []
     with WorkerPool(n_workers=2, device=device, runner=runner) as pool:
@@ -206,11 +222,15 @@ def g4_run_two_jobs(device: str, runs_dir: Path) -> list[RunResult]:
 def test_g4_worker_pool_runs_two_jobs_on_cpu(tmp_path: Path) -> None:
     results = g4_run_two_jobs("cpu", tmp_path)
 
-    assert sorted((r.seed, r.status) for r in results) == [(0, "ok"), (1, "ok")], results
+    assert sorted((r.seed, r.status) for r in results) == [(0, "ok"), (1, "ok")], (
+        results
+    )
 
 
 @pytest.mark.gpu
 def test_g4_worker_pool_runs_two_jobs_on_cuda(tmp_path: Path) -> None:
     results = g4_run_two_jobs("cuda:0", tmp_path)
 
-    assert sorted((r.seed, r.status) for r in results) == [(0, "ok"), (1, "ok")], results
+    assert sorted((r.seed, r.status) for r in results) == [(0, "ok"), (1, "ok")], (
+        results
+    )

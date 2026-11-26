@@ -134,13 +134,17 @@ def test_hold_screen_rejects_non_positive_speed_max() -> None:
         rollouts.hold_screen(task.canonical_start(), seconds=0.5, speed_max=0.0)
 
 
-def test_sim_is_sized_to_the_starts_rounded_up_to_a_power_of_two(pendulum: Task) -> None:
+def test_sim_is_sized_to_the_starts_rounded_up_to_a_power_of_two(
+    pendulum: Task,
+) -> None:
     # Final-review minor: a 5-start walk must not simulate nworld_max = 4096 worlds.
     rollouts, counter = _rollouts(pendulum, nworld_max=4096)
     starts = pendulum.sample_start(5, torch.Generator().manual_seed(0))
 
     out = rollouts.random_walk(starts, steps=3, action_hold=1)
-    rollouts.hold_screen(pendulum.sample_start(20, torch.Generator().manual_seed(1)), 0.1)
+    rollouts.hold_screen(
+        pendulum.sample_start(20, torch.Generator().manual_seed(1)), 0.1
+    )
 
     assert out.n == 5
     assert rollouts.sim_worlds() == (8, 32)

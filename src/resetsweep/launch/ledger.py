@@ -100,14 +100,20 @@ def _floor_usd(launch: Launch, *, now: datetime, first_on_volume: bool) -> float
     hours = max(0.0, (now - launch.created()).total_seconds() / 3600.0)
     floor = 0.0
     pod_may_exist = launch.pod_id is not None or launch.unresolved
-    if pod_may_exist and launch.gpu_usd_per_h is not None and launch.max_hours is not None:
+    if (
+        pod_may_exist
+        and launch.gpu_usd_per_h is not None
+        and launch.max_hours is not None
+    ):
         floor += launch.gpu_usd_per_h * min(hours, launch.max_hours)
     if first_on_volume:
         floor += volume_usd_per_h(NETWORK_VOLUME_GB) * hours
     return floor
 
 
-def settle(client: RunPodClient, launches: list[Launch], *, now: datetime) -> list[Launch]:
+def settle(
+    client: RunPodClient, launches: list[Launch], *, now: datetime
+) -> list[Launch]:
     """Each launch with `spent_usd` set to its pod + volume spend from the billing API, but
     never below the spend floor at `now` (see the module docstring).
 
@@ -131,7 +137,9 @@ def settle(client: RunPodClient, launches: list[Launch], *, now: datetime) -> li
             spent += client.volume_spend_usd(launch.volume_id, since=since)
         if launch.pod_id is not None:
             spent += client.pod_spend_usd(launch.pod_id, since=since)
-        floor = _floor_usd(launch, now=now, first_on_volume=first_use[launch.volume_id] == i)
+        floor = _floor_usd(
+            launch, now=now, first_on_volume=first_use[launch.volume_id] == i
+        )
         settled.append(replace(launch, spent_usd=max(spent, floor, launch.spent_usd)))
     if len(settled) != len(launches):
         raise AssertionError("settle must keep every launch")
@@ -201,9 +209,14 @@ def _parse(path: Path, index: int, item: Any) -> Launch:
         raise LedgerError(f"{where}: unresolved must be true or false")
     if launch.unresolved and (launch.name is None or launch.pod_id is not None):
         raise LedgerError(f"{where}: an unresolved launch needs a name and no pod_id")
-    for field, value in (("gpu_usd_per_h", launch.gpu_usd_per_h), ("max_hours", launch.max_hours)):
+    for field, value in (
+        ("gpu_usd_per_h", launch.gpu_usd_per_h),
+        ("max_hours", launch.max_hours),
+    ):
         if value is not None and (
-            isinstance(value, bool) or not isinstance(value, int | float) or not value >= 0
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not value >= 0
         ):
             raise LedgerError(f"{where}: {field} must be null or a non-negative number")
     if launch.repo_sha is not None and (

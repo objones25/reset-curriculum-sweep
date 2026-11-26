@@ -100,7 +100,9 @@ def test_construct_unknown_name_raises_key_error() -> None:
         registry.construct("nope")
 
 
-def test_load_imports_public_modules_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_imports_public_modules_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pkg = tmp_path / "plugpkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")

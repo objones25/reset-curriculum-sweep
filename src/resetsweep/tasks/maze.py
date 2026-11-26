@@ -407,7 +407,9 @@ class _Maze:
             torch.rand(n, 2, generator=gen, device=d) * 2 - 1
         ) * _START_SPEED_NOISE_M_S
         return StartStates(
-            centres.to(d) + pos_noise, vel_noise, torch.zeros(n, self.extra_dim, device=d)
+            centres.to(d) + pos_noise,
+            vel_noise,
+            torch.zeros(n, self.extra_dim, device=d),
         )
 
     def canonical_start(self) -> StartStates:

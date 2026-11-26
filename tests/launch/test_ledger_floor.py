@@ -80,7 +80,9 @@ def test_floor_never_lowers_an_earlier_settled_spend() -> None:
 
 def test_orphaned_volume_is_floored_by_storage_only() -> None:
     (settled,) = _settle(
-        FakeBilling(), [_launch(pod_id=None, gpu_id=None, gpu_usd_per_h=None, max_hours=None)], hours=5.0
+        FakeBilling(),
+        [_launch(pod_id=None, gpu_id=None, gpu_usd_per_h=None, max_hours=None)],
+        hours=5.0,
     )
 
     assert settled.spent_usd == pytest.approx(VOLUME_USD_PER_H * 5)
@@ -88,7 +90,9 @@ def test_orphaned_volume_is_floored_by_storage_only() -> None:
 
 def test_reused_volume_storage_is_floored_once() -> None:
     first = _launch()
-    second = _launch(pod_id="pod-2", created_at=(CREATED + timedelta(hours=1)).isoformat())
+    second = _launch(
+        pod_id="pod-2", created_at=(CREATED + timedelta(hours=1)).isoformat()
+    )
 
     a, b = _settle(FakeBilling(), [first, second], hours=3.0)
 

@@ -74,7 +74,10 @@ def test_spent_counts_wall_clock_times_gpu_and_volume_price(tmp_path: Path) -> N
 
 def test_spent_includes_prior_ledger_entries(tmp_path: Path) -> None:
     (tmp_path / "ledger.jsonl").write_text(
-        json.dumps({"t": 0.0, "spent": 1.0}) + "\n" + json.dumps({"t": 30.0, "spent": 7.5}) + "\n"
+        json.dumps({"t": 0.0, "spent": 1.0})
+        + "\n"
+        + json.dumps({"t": 30.0, "spent": 7.5})
+        + "\n"
     )
     clock = FakeClock()
     guard = _guard(tmp_path, clock)
@@ -96,7 +99,10 @@ def test_restart_writes_session_start_line_with_prior_spend(tmp_path: Path) -> N
 
     _guard(tmp_path, FakeClock())
 
-    assert _ledger(tmp_path)[-1] == {"t": 0.0, "spent": pytest.approx(3.0 + LEDGER_GAP_S)}
+    assert _ledger(tmp_path)[-1] == {
+        "t": 0.0,
+        "spent": pytest.approx(3.0 + LEDGER_GAP_S),
+    }
 
 
 def test_ledger_torn_last_line_is_truncated(tmp_path: Path) -> None:
@@ -134,7 +140,9 @@ def test_can_start_true_when_projected_within_cap_minus_margin(tmp_path: Path) -
     assert guard.can_start(30.0, 15.0) is True
 
 
-def test_can_start_false_when_projected_exceeds_cap_minus_margin(tmp_path: Path) -> None:
+def test_can_start_false_when_projected_exceeds_cap_minus_margin(
+    tmp_path: Path,
+) -> None:
     clock = FakeClock()
     guard = _guard(tmp_path, clock, cap=100.0, margin=5.0)
     clock.t += 50.0  # spent 50
@@ -200,9 +208,16 @@ def test_new_session_resumes_from_previous_session_ledger(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("cap_usd", 0.0), ("margin_usd", -1.0), ("gpu_usd_per_h", 0.0), ("volume_usd_per_h", -0.1)],
+    [
+        ("cap_usd", 0.0),
+        ("margin_usd", -1.0),
+        ("gpu_usd_per_h", 0.0),
+        ("volume_usd_per_h", -0.1),
+    ],
 )
-def test_constructor_rejects_bad_prices(tmp_path: Path, field: str, value: float) -> None:
+def test_constructor_rejects_bad_prices(
+    tmp_path: Path, field: str, value: float
+) -> None:
     kw: dict[str, float] = {
         "cap_usd": 100.0,
         "margin_usd": 5.0,
@@ -229,7 +244,10 @@ def test_every_ledger_line_carries_a_utc_timestamp(tmp_path: Path) -> None:
     clock.t += HEARTBEAT_S
     guard.heartbeat()
 
-    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "ledger.jsonl").read_text().splitlines()
+    ]
     assert [row["utc"] for row in rows] == ["2026-11-25T12:00:00+00:00"] * 2
 
 

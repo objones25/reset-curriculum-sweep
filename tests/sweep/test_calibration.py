@@ -51,10 +51,14 @@ def _guard(tmp_path: Path, clock: Any) -> BudgetGuard:
 
 
 def _runner_cfg(tmp_path: Path) -> RunnerConfig:
-    return RunnerConfig(project="p", group="g", wandb_mode="disabled", runs_dir=tmp_path / "runs")
+    return RunnerConfig(
+        project="p", group="g", wandb_mode="disabled", runs_dir=tmp_path / "runs"
+    )
 
 
-def _calibrate(tmp_path: Path, clock: Any, pool_factory: Any, families: tuple[str, ...], **kw: Any):
+def _calibrate(
+    tmp_path: Path, clock: Any, pool_factory: Any, families: tuple[str, ...], **kw: Any
+):
     return calibrate(
         families=families,
         settings=_settings(**kw),
@@ -71,10 +75,18 @@ def test_calibration_compares_lr_and_keeps_higher_final_return(
 ) -> None:
     record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",))
 
-    plan = choose_plan(record, arms_per_family={"pendulum_dense": 10}, settings=_settings())
+    plan = choose_plan(
+        record, arms_per_family={"pendulum_dense": 10}, settings=_settings()
+    )
 
-    configs = {m.lr: (m.final_return, m.kl_stopped_rate) for m in record.config("pendulum_dense")}
-    assert configs == {1e-3: (50.0, pytest.approx(0.6)), 3e-4: (100.0, pytest.approx(0.1))}
+    configs = {
+        m.lr: (m.final_return, m.kl_stopped_rate)
+        for m in record.config("pendulum_dense")
+    }
+    assert configs == {
+        1e-3: (50.0, pytest.approx(0.6)),
+        3e-4: (100.0, pytest.approx(0.1)),
+    }
     assert plan.families["pendulum_dense"].ppo.lr == 3e-4
 
 
@@ -113,7 +125,9 @@ def test_plan_picks_smallest_num_envs_within_10pct_and_fastest_worker_count(
     world.saturate_envs = 128  # 128 and 256 envs give the same steps/s
     record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",))
 
-    plan = choose_plan(record, arms_per_family={"pendulum_dense": 10}, settings=_settings())
+    plan = choose_plan(
+        record, arms_per_family={"pendulum_dense": 10}, settings=_settings()
+    )
 
     fam = plan.families["pendulum_dense"]
     assert (plan.n_workers, fam.num_envs) == (4, 128)
@@ -126,7 +140,9 @@ def test_plan_overhead_is_measured_from_config_jobs(
 ) -> None:
     record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",))
 
-    plan = choose_plan(record, arms_per_family={"pendulum_dense": 10}, settings=_settings())
+    plan = choose_plan(
+        record, arms_per_family={"pendulum_dense": 10}, settings=_settings()
+    )
 
     # fake jobs pay overhead_s = 2 on top of steps / steps_per_s; the fake pool reports at once
     assert plan.families["pendulum_dense"].overhead_s == pytest.approx(world.overhead_s)
@@ -135,10 +151,14 @@ def test_plan_overhead_is_measured_from_config_jobs(
 def test_failed_throughput_batch_is_unusable(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:
-    world.fails = lambda spec: spec.num_envs == 256 and spec.seed == 3  # one of 4 workers OOMs
+    world.fails = lambda spec: (
+        spec.num_envs == 256 and spec.seed == 3
+    )  # one of 4 workers OOMs
     record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",))
 
-    plan = choose_plan(record, arms_per_family={"pendulum_dense": 10}, settings=_settings())
+    plan = choose_plan(
+        record, arms_per_family={"pendulum_dense": 10}, settings=_settings()
+    )
 
     # without (256, 4) the best is 2 workers at 256 envs: 256 * 100 * sqrt(2) = 36,204 steps/s,
     # above 4 workers at 128 envs: 128 * 100 * 2 = 25,600
@@ -165,7 +185,9 @@ def test_calibration_stops_at_calibration_cap(
     # One config batch costs 4000 / (128 * 100 / sqrt 2) + 2 = 2.44 s = 0.0244 USD. With a
     # 0.06 USD cap the first batch fits; 0.0356 USD (3.56 s) is then left, less than one 5 s
     # poll, so the second batch does not start.
-    record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense", "arm_dense"), cap_usd=0.06)
+    record = _calibrate(
+        tmp_path, clock, pool_factory, ("pendulum_dense", "arm_dense"), cap_usd=0.06
+    )
 
     assert record.capped is True
     assert record.batch_keys() == ["config/pendulum_dense"]
@@ -232,7 +254,9 @@ def test_calibration_resumes_where_the_cap_stopped_it(
     _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=0.06)
     n_first = len(world.submissions)  # the config batch only
 
-    record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=10.0)
+    record = _calibrate(
+        tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=10.0
+    )
 
     keys = [(s.spec.arm_id(), s.spec.seed, s.n_workers) for s in world.submissions]
     assert n_first == 2
@@ -276,16 +300,24 @@ def test_plan_for_sparse_task_uses_its_dense_sibling(
 ) -> None:
     record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",))
 
-    plan = choose_plan(record, arms_per_family={"pendulum_dense": 10}, settings=_settings())
+    plan = choose_plan(
+        record, arms_per_family={"pendulum_dense": 10}, settings=_settings()
+    )
 
     assert plan.for_task("pendulum_sparse") == plan.families["pendulum_dense"]
 
 
-def test_plan_without_any_throughput_raises(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
-    record = _calibrate(tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=0.01)
+def test_plan_without_any_throughput_raises(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    record = _calibrate(
+        tmp_path, clock, pool_factory, ("pendulum_dense",), cap_usd=0.01
+    )
 
     with pytest.raises(CalibrationError, match="no usable steps/s measurement"):
-        choose_plan(record, arms_per_family={"pendulum_dense": 10}, settings=_settings())
+        choose_plan(
+            record, arms_per_family={"pendulum_dense": 10}, settings=_settings()
+        )
 
 
 # --- per-(family, method) job estimates (final-review I5) ----------------------------------------
@@ -305,7 +337,9 @@ def test_plan_scales_probed_methods_by_their_measured_slowdown(
     plan = choose_plan(record, arms_per_family={"arm_dense": 10}, settings=_settings())
 
     assert plan.job_factor("arm_dense", "visited") == pytest.approx(4.0)
-    assert plan.job_factor("arm_dense", "buffer_scored") == pytest.approx(1.0)  # as fast
+    assert plan.job_factor("arm_dense", "buffer_scored") == pytest.approx(
+        1.0
+    )  # as fast
 
 
 def test_plan_uses_factor_3_for_unprobed_methods_and_1_for_uniform(

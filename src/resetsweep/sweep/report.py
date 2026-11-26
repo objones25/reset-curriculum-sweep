@@ -112,7 +112,9 @@ class ReportSink(Protocol):
 
     def log(self, elapsed_s: float, data: dict[str, float]) -> None: ...
 
-    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None: ...
+    def log_table(
+        self, name: str, columns: list[str], rows: list[list[object]]
+    ) -> None: ...
 
     def summary(self, data: dict[str, float | str]) -> None: ...
 
@@ -123,7 +125,9 @@ class NullReportSink:
     def log(self, elapsed_s: float, data: dict[str, float]) -> None:
         del elapsed_s, data
 
-    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+    def log_table(
+        self, name: str, columns: list[str], rows: list[list[object]]
+    ) -> None:
         del name, columns, rows
 
     def summary(self, data: dict[str, float | str]) -> None:
@@ -167,7 +171,9 @@ class GuardedSweepSink:
         row = {**data, "elapsed_s": elapsed_s, "sink_errors": float(self.sink_errors)}
         self._jsonl.log(round(elapsed_s), row)
 
-    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+    def log_table(
+        self, name: str, columns: list[str], rows: list[list[object]]
+    ) -> None:
         try:
             self._primary.log_table(name, columns, rows)
         except Exception as e:  # noqa: BLE001 # any W&B error is an operating error here
@@ -203,7 +209,9 @@ class WandbReportSink:
 
         bad = _secret_like_keys(config)
         if bad:
-            raise ValueError(f"W&B config has secret-like keys {bad}; secrets must never be logged")
+            raise ValueError(
+                f"W&B config has secret-like keys {bad}; secrets must never be logged"
+            )
         self._wandb = wandb
         self._run = wandb.init(
             project=project,
@@ -221,7 +229,9 @@ class WandbReportSink:
     def log(self, elapsed_s: float, data: dict[str, float]) -> None:
         self._run.log({**data, _ELAPSED_KEY: elapsed_s})
 
-    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+    def log_table(
+        self, name: str, columns: list[str], rows: list[list[object]]
+    ) -> None:
         # Table's `columns` is list[ColumnKey] (str | int), invariant; copy into that type.
         keys: list[str | int] = list(columns)
         table = self._wandb.Table(columns=keys, data=rows, allow_mixed_types=True)
@@ -264,7 +274,9 @@ def _first_ok(results: Sequence[RunResult], k: int) -> list[RunResult]:
     return sorted((r for r in results if r.status == "ok"), key=lambda r: r.seed)[:k]
 
 
-def _arm_row(st: ArmState, results: list[RunResult], rung: int, k: int) -> dict[str, Any]:
+def _arm_row(
+    st: ArmState, results: list[RunResult], rung: int, k: int
+) -> dict[str, Any]:
     used = _first_ok(results, k)
     assert len(used) == k, (st.arm.label(), len(used), k)
     aucs = np.asarray([r.auc for r in used], dtype=float)
@@ -296,7 +308,9 @@ def _arm_table_row(source: ReportSource, st: ArmState) -> dict[str, Any]:
         mean = iqm(arr)
         ci_lo, ci_hi = bootstrap_ci(arr, seed=0)
     b = source.bounds(st.arm)
-    lcb, ucb = (None, None) if b is None else (_finite_or_none(b[0]), _finite_or_none(b[1]))
+    lcb, ucb = (
+        (None, None) if b is None else (_finite_or_none(b[0]), _finite_or_none(b[1]))
+    )
     return {
         "arm": st.arm.label(),
         "group": group_label(group_of(st.arm)),
@@ -324,7 +338,9 @@ def _normalise_group(rows: list[dict[str, Any]], anchored: bool) -> bool:
     return True
 
 
-def _has_equal_seed_ranking(source: ReportSource, states: Sequence[ArmState], rung: int) -> bool:
+def _has_equal_seed_ranking(
+    source: ReportSource, states: Sequence[ArmState], rung: int
+) -> bool:
     """True if some group has >= MIN_COMMON_SEEDS common ok seeds among its ranked arms at `rung`."""
     counts: dict[GroupKey, list[int]] = {}
     for st in states:
@@ -403,13 +419,17 @@ def build_report(
     scores: dict[str, list[float]] = {}
     anchorless: list[GroupKey] = []
     for group, rows in by_group.items():
-        anchored = group not in flagged and any(r["method"] == ANCHOR_METHOD for r in rows)
+        anchored = group not in flagged and any(
+            r["method"] == ANCHOR_METHOD for r in rows
+        )
         if not anchored:
             anchorless.append(group)
         scaled = _normalise_group(rows, anchored)
         if rung == 0:
             rows.sort(key=lambda r: r["label"])
-            rows.sort(key=lambda r: r.pop("rung0_order"), reverse=True)  # stable: label breaks ties
+            rows.sort(
+                key=lambda r: r.pop("rung0_order"), reverse=True
+            )  # stable: label breaks ties
         else:
             rows.sort(key=lambda r: (-r["iqm_auc"], r["label"]))
         if scaled:
@@ -433,7 +453,7 @@ def build_report(
         ),
         key=lambda row: (-row["iqm_normalised"], row["config"]),
     )
-    unranked.sort(key=lambda r: (r["label"]))
+    unranked.sort(key=lambda r: r["label"])
     arms: list[dict[str, Any]] = []
     for st in states:
         tick()
@@ -485,10 +505,16 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         if not g["anchored"]:
             notes.append("anchorless: ranked by raw AUC, not in the overall ranking")
         elif not g["scaled"]:
-            notes.append("unscaled: uniform is the best arm, not in the overall ranking")
+            notes.append(
+                "unscaled: uniform is the best arm, not in the overall ranking"
+            )
         k = g["common_seeds"]
         if g["insufficient_seeds"]:
-            notes.append(f"insufficient seeds: ranked on {k} seed per arm" if k == 1 else f"insufficient seeds: ranked on {k} seeds per arm")
+            notes.append(
+                f"insufficient seeds: ranked on {k} seed per arm"
+                if k == 1
+                else f"insufficient seeds: ranked on {k} seeds per arm"
+            )
         else:
             notes.append(f"ranked on the first {k} seeds per arm")
         lines += [f"### {name}" + (f" ({'; '.join(notes)})" if notes else ""), ""]
@@ -506,7 +532,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         lines.append("")
     lines += ["## Unranked arms", ""]
     lines += [f"{report['not_started']} arms never ran.", ""]
-    lines += ["| arm | status | rung reached | IQM AUC there | ok seeds |", "|---|---|---|---|---|"]
+    lines += [
+        "| arm | status | rung reached | IQM AUC there | ok seeds |",
+        "|---|---|---|---|---|",
+    ]
     lines += [
         f"| {u['label']} | {u['status']} | {u['rung']} | {_fmt(u['iqm_auc'])} | {u['seeds_ok']} |"
         for u in report["unranked"]
@@ -521,7 +550,9 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def _tables(report: Mapping[str, Any]) -> dict[str, tuple[list[str], list[list[object]]]]:
+def _tables(
+    report: Mapping[str, Any],
+) -> dict[str, tuple[list[str], list[list[object]]]]:
     per_task: list[list[object]] = [
         [
             group_label((g["task"], tuple(g["task_kw"].items()))),

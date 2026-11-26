@@ -135,7 +135,9 @@ class _Arm:
             _PUCK_START_Y_M[1] - _PUCK_START_Y_M[0]
         )
         qpos = torch.cat([arm, puck_x, puck_y, torch.zeros(n, 1, device=d)], dim=1)
-        return StartStates(qpos, torch.zeros(n, 6, device=d), torch.zeros(n, 0, device=d))
+        return StartStates(
+            qpos, torch.zeros(n, 6, device=d), torch.zeros(n, 0, device=d)
+        )
 
     def canonical_start(self) -> StartStates:
         x = sum(_PUCK_START_X_M) / 2

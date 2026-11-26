@@ -461,15 +461,21 @@ def _launch(
     priced = gpu
     if usd_per_h > gpu.secure_usd_per_h + 1e-6:
         priced = replace(gpu, secure_usd_per_h=usd_per_h)
-        if not _reprice_pod(client, pod_id, plan.datacenter, volume_id, priced, pod_args):
+        if not _reprice_pod(
+            client, pod_id, plan.datacenter, volume_id, priced, pod_args
+        ):
             refused = replace(
                 record,
                 pod_id=pod_id,
                 gpu_id=gpu.id,
                 gpu_usd_per_h=usd_per_h,
-                max_hours=_sent_max_hours(remaining, gpu, volume.size_gb, margin=margin),
+                max_hours=_sent_max_hours(
+                    remaining, gpu, volume.size_gb, margin=margin
+                ),
             )
-            _save_ledger(ledger_path, [*launches, refused], note=f"pod {pod_id}, deleted")
+            _save_ledger(
+                ledger_path, [*launches, refused], note=f"pod {pod_id}, deleted"
+            )
             return 3
     launch = replace(
         record,
@@ -698,7 +704,9 @@ def _pod_body(
         "REPO_REF": a.ref,
         "SWEEP_CAP_USD": _floor2(a.pod_cap_usd),
         "SWEEP_GPU_USD_PER_H": repr(gpu.secure_usd_per_h),
-        "SWEEP_MAX_HOURS": _floor2(_max_hours(a.remaining, gpu, a.volume_gb, margin=a.margin)),
+        "SWEEP_MAX_HOURS": _floor2(
+            _max_hours(a.remaining, gpu, a.volume_gb, margin=a.margin)
+        ),
         "SWEEP_STATE_DIR": STATE_DIR_SMOKE if a.smoke else STATE_DIR_FULL,
         "WANDB_PROJECT": WANDB_PROJECT,
     }
@@ -825,7 +833,9 @@ def _candidate_ids(gpu_id: str) -> tuple[str, ...]:
     return (gpu_id, *(g for g in GPU_FALLBACKS if g != gpu_id))
 
 
-def _max_hours(remaining: float, gpu: GpuType, volume_gb: int, *, margin: float) -> float:
+def _max_hours(
+    remaining: float, gpu: GpuType, volume_gb: int, *, margin: float
+) -> float:
     usd_per_h = gpu.secure_usd_per_h + volume_usd_per_h(volume_gb)
     if not usd_per_h > 0:
         raise RunPodError(
@@ -847,13 +857,19 @@ def _print_cost(gpu: GpuType, volume_gb: int) -> None:
     )
 
 
-def _sent_max_hours(remaining: float, gpu: GpuType, volume_gb: int, *, margin: float) -> float:
+def _sent_max_hours(
+    remaining: float, gpu: GpuType, volume_gb: int, *, margin: float
+) -> float:
     """The SWEEP_MAX_HOURS value the pod body carries, as a number (for the ledger floor)."""
     return float(_floor2(_max_hours(remaining, gpu, volume_gb, margin=margin)))
 
 
-def _print_max_hours(remaining: float, gpu: GpuType, volume_gb: int, *, margin: float) -> None:
-    print(f"max_hours={_max_hours(remaining, gpu, volume_gb, margin=margin):.2f} on {gpu.id}")
+def _print_max_hours(
+    remaining: float, gpu: GpuType, volume_gb: int, *, margin: float
+) -> None:
+    print(
+        f"max_hours={_max_hours(remaining, gpu, volume_gb, margin=margin):.2f} on {gpu.id}"
+    )
 
 
 def _floor2(x: float) -> str:

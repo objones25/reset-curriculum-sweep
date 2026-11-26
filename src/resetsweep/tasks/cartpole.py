@@ -58,7 +58,9 @@ def _angle_from_upright(theta: Tensor) -> Tensor:
     return (torch.remainder(theta, 2 * math.pi) - math.pi).abs()
 
 
-_HINGE_COLUMNS = (1,)  # unlimited hinges: the pole hinge; the cart slider is limited and never wrapped
+_HINGE_COLUMNS = (
+    1,
+)  # unlimited hinges: the pole hinge; the cart slider is limited and never wrapped
 
 
 class _Cartpole:
@@ -94,7 +96,9 @@ class _Cartpole:
         )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
-        noise = (torch.rand(n, 4, generator=gen, device=gen.device) * 2 - 1) * _START_NOISE
+        noise = (
+            torch.rand(n, 4, generator=gen, device=gen.device) * 2 - 1
+        ) * _START_NOISE
         return StartStates(
             noise[:, :2], noise[:, 2:], torch.zeros(n, 0, device=gen.device)
         )

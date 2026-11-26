@@ -55,7 +55,10 @@ def _tip_height_m(qpos: Tensor) -> Tensor:
     return -LINK_LENGTH_M * (q1.cos() + (q1 + q2).cos())
 
 
-_HINGE_COLUMNS = (0, 1)  # unlimited hinges: shoulder and elbow (neither `limited` in the MJCF)
+_HINGE_COLUMNS = (
+    0,
+    1,
+)  # unlimited hinges: shoulder and elbow (neither `limited` in the MJCF)
 
 
 class _Acrobot:
@@ -76,7 +79,9 @@ class _Acrobot:
         )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
-        noise = (torch.rand(n, 4, generator=gen, device=gen.device) * 2 - 1) * _START_NOISE
+        noise = (
+            torch.rand(n, 4, generator=gen, device=gen.device) * 2 - 1
+        ) * _START_NOISE
         return StartStates(
             noise[:, :2], noise[:, 2:], torch.zeros(n, 0, device=gen.device)
         )

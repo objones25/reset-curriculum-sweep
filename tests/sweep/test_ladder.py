@@ -23,7 +23,11 @@ ACRO_TRIO = [
     _arm(f"{TASK_A}/point/-"),
     _arm(f"{TASK_A}/walk[p_task=0.5]/rnd"),
 ]
-MAZE_TRIO = [_arm("maze/uniform/-"), _arm("maze/point/-"), _arm("maze/walk[p_task=0.5]/rnd")]
+MAZE_TRIO = [
+    _arm("maze/uniform/-"),
+    _arm("maze/point/-"),
+    _arm("maze/walk[p_task=0.5]/rnd"),
+]
 
 
 def test_acrobot_trio_hand_computed() -> None:

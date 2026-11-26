@@ -266,7 +266,9 @@ class OwnSuccess(MethodBase):
         keep = ((steps >= 0) & (steps <= first)).nonzero(as_tuple=True)[0]
         rows = keep[torch.argsort(steps[keep], stable=True)][-self._m :]
         raw = StartStates(
-            self._ep_qpos[env, rows], self._ep_qvel[env, rows], self._ep_extra[env, rows]
+            self._ep_qpos[env, rows],
+            self._ep_qvel[env, rows],
+            self._ep_extra[env, rows],
         )
         states, valid = prepare_candidates(self.ctx.task, raw)
         # Invalid rows are dropped; the rest keep their time order and steps-to-reward.

@@ -131,7 +131,9 @@ class BudgetGuard:
         that is lower."""
         limit = self.cap_usd - self.margin_usd
         if self._stop_at is not None:
-            limit = min(limit, self._prior + (self._stop_at - self._t0) * self.usd_per_s)
+            limit = min(
+                limit, self._prior + (self._stop_at - self._t0) * self.usd_per_s
+            )
         return limit
 
     def deadline_bound(self) -> bool:

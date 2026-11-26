@@ -50,8 +50,12 @@ class FakeWorld:
     saturate_envs: int = 10**9
     overhead_s: float = 2.0
     fails: Callable[[RunSpec], bool] = lambda spec: False
-    slowdown: Callable[[RunSpec], float] = lambda spec: 1.0  # actual / modelled duration
-    enforce_timeouts: bool = True  # False: a pool that never kills, to test callers' own stops
+    slowdown: Callable[[RunSpec], float] = lambda spec: (
+        1.0
+    )  # actual / modelled duration
+    enforce_timeouts: bool = (
+        True  # False: a pool that never kills, to test callers' own stops
+    )
     submissions: list[Submission] = field(default_factory=list)
     session: int = 0
 
@@ -59,7 +63,9 @@ class FakeWorld:
         return min(spec.num_envs, self.saturate_envs) * 100.0 / math.sqrt(n_workers)
 
     def duration_s(self, spec: RunSpec, n_workers: int) -> float:
-        modelled = spec.step_budget / self.steps_per_s(spec, n_workers) + self.overhead_s
+        modelled = (
+            spec.step_budget / self.steps_per_s(spec, n_workers) + self.overhead_s
+        )
         return modelled * self.slowdown(spec)
 
     def finish(self, spec: RunSpec, n_workers: int, cfg: RunnerConfig) -> RunResult:
@@ -108,7 +114,9 @@ class FakeWorld:
 
 
 class FakePool:
-    def __init__(self, world: FakeWorld, n_workers: int, device: str, cfg: RunnerConfig) -> None:
+    def __init__(
+        self, world: FakeWorld, n_workers: int, device: str, cfg: RunnerConfig
+    ) -> None:
         self._world = world
         self._n = n_workers
         self._device = device

@@ -30,15 +30,21 @@ from resetsweep.launch.launcher import (
 REPO = "https://github.com/example/reset-curriculum-sweep"
 NOW = datetime(2026, 11, 25, 10, 30, tzinfo=UTC)
 SHA = "0123456789abcdef0123456789abcdef01234567"  # what feat/sweep points at on the remote
-HEAD_SHA = "89abcdef0123456789abcdef0123456789abcdef"  # local HEAD (also pushed, on main)
+HEAD_SHA = (
+    "89abcdef0123456789abcdef0123456789abcdef"  # local HEAD (also pushed, on main)
+)
 
 
 class FakeGit:
     """Stands in for `git` (I7): `rev-parse HEAD` and `ls-remote <url>`. Records every call."""
 
-    def __init__(self, refs: dict[str, str] | None = None, *, head: str = HEAD_SHA) -> None:
+    def __init__(
+        self, refs: dict[str, str] | None = None, *, head: str = HEAD_SHA
+    ) -> None:
         self.refs = (
-            {"refs/heads/feat/sweep": SHA, "refs/heads/main": HEAD_SHA} if refs is None else refs
+            {"refs/heads/feat/sweep": SHA, "refs/heads/main": HEAD_SHA}
+            if refs is None
+            else refs
         )
         self.head = head
         self.calls: list[tuple[str, ...]] = []
@@ -53,6 +59,8 @@ class FakeGit:
                 raise GitError("git ls-remote failed (repository not found)")
             return "\n".join(f"{sha}\t{ref}" for ref, sha in self.refs.items())
         raise AssertionError(f"unexpected git call {args}")
+
+
 VOLUME_USD_PER_H = 20 * 0.07 / 730
 
 
@@ -1186,14 +1194,19 @@ def test_billing_that_reads_zero_is_floored_by_the_earlier_pods_max_hours(
     assert code == 0
     assert env["SWEEP_CAP_USD"] == "95.95"
     saved = json.loads(ledger.read_text(encoding="utf-8"))
-    assert saved["launches"][0]["spent_usd"] == pytest.approx(4.0 + 20 * 0.07 / 730 * 25.25)
+    assert saved["launches"][0]["spent_usd"] == pytest.approx(
+        4.0 + 20 * 0.07 / 730 * 25.25
+    )
 
 
 # --- smoke margin (final-review I6) ---------------------------------------------------------------
 
 
 def test_readme_smoke_command_cap_5_is_accepted_with_the_smoke_margin(
-    fake_runpod: FakeRunPod, env_file: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    fake_runpod: FakeRunPod,
+    env_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     # The README's `sweep-launch --cap 5 --smoke`: the smoke margin is 0.50, so
     # max_hours = (5 - 0.5) / (0.69 + 20 * 0.07 / 730) = 6.50.
@@ -1304,7 +1317,14 @@ def test_volume_resume_defaults_to_the_sha_recorded_for_that_volume(
     git = FakeGit()
 
     code = _run(
-        fake_runpod, env_file, tmp_path, "--volume-id", "vol-old", ledger=ledger, git=git, ref=None
+        fake_runpod,
+        env_file,
+        tmp_path,
+        "--volume-id",
+        "vol-old",
+        ledger=ledger,
+        git=git,
+        ref=None,
     )
 
     [pod] = fake_runpod.bodies("POST", "/v2/pods")
@@ -1326,8 +1346,14 @@ def test_volume_resume_with_another_ref_warns_about_exit_4(
     _write_ledger(ledger, [_old_launch() | {"repo_sha": SHA}])
 
     code = _run(
-        fake_runpod, env_file, tmp_path, "--volume-id", "vol-old", "--dry-run",
-        ledger=ledger, ref="main",
+        fake_runpod,
+        env_file,
+        tmp_path,
+        "--volume-id",
+        "vol-old",
+        "--dry-run",
+        ledger=ledger,
+        ref="main",
     )
 
     err = capsys.readouterr().err

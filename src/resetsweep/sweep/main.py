@@ -167,7 +167,9 @@ ETA: Final = 3
 EVALS_PER_RUN: Final = 20  # eval points per run: the AUC's resolution
 POLL_S: Final = 5.0
 STATUS_EVERY_S: Final = 300.0
-JOB_TIMEOUT_FACTOR: Final = 4.0  # absolute ceiling: 4 x the job's estimate (final-review I5)
+JOB_TIMEOUT_FACTOR: Final = (
+    4.0  # absolute ceiling: 4 x the job's estimate (final-review I5)
+)
 HANG_S_DEFAULT: Final = 900.0  # kill a job whose heartbeat has not moved for this long
 JOB_TIMEOUT_FLOOR_S: Final = 900.0
 CALIBRATION_JOB_TIMEOUT_S: Final = 1800.0
@@ -203,7 +205,9 @@ _STOP_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
 def _on_stop_signal(signum: int, frame: FrameType | None) -> NoReturn:
     del frame
-    for sig in _STOP_SIGNALS:  # one stop is enough: ignore repeats while the report is written
+    for sig in (
+        _STOP_SIGNALS
+    ):  # one stop is enough: ignore repeats while the report is written
         signal.signal(sig, signal.SIG_IGN)
     raise SweepTerminated(signum)
 
@@ -280,7 +284,9 @@ def _positive_float(env: Mapping[str, str], name: str) -> float:
     try:
         value = float(raw)
     except ValueError:
-        raise SettingsError(f"{name} must be a finite number > 0") from None  # no value echoed
+        raise SettingsError(
+            f"{name} must be a finite number > 0"
+        ) from None  # no value echoed
     if not (math.isfinite(value) and value > 0):
         raise SettingsError(f"{name} must be a finite number > 0")
     return value
@@ -295,13 +301,19 @@ def _positive_int(env: Mapping[str, str], name: str, default: int | None) -> int
     return int(raw)
 
 
-def _int_list(env: Mapping[str, str], name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+def _int_list(
+    env: Mapping[str, str], name: str, default: tuple[int, ...]
+) -> tuple[int, ...]:
     raw = env.get(name)
     if raw is None or raw == "":
         return default
     parts = [p.strip() for p in raw.split(",")]
-    if not all(p.isdigit() and int(p) >= 1 for p in parts) or len(set(parts)) != len(parts):
-        raise SettingsError(f"{name} must be distinct comma-separated positive integers")
+    if not all(p.isdigit() and int(p) >= 1 for p in parts) or len(set(parts)) != len(
+        parts
+    ):
+        raise SettingsError(
+            f"{name} must be distinct comma-separated positive integers"
+        )
     return tuple(int(p) for p in parts)
 
 
@@ -322,7 +334,9 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
 
     cap_usd = _positive_float(environ, "SWEEP_CAP_USD")
     if cap_usd > CAP_USD_DEFAULT:
-        raise SettingsError(f"SWEEP_CAP_USD must be <= {CAP_USD_DEFAULT} (CAP_USD_DEFAULT)")
+        raise SettingsError(
+            f"SWEEP_CAP_USD must be <= {CAP_USD_DEFAULT} (CAP_USD_DEFAULT)"
+        )
     return Settings(
         cap_usd=cap_usd,
         gpu_usd_per_h=_positive_float(environ, "SWEEP_GPU_USD_PER_H"),
@@ -381,10 +395,14 @@ def _rung_lines(
     fams = {f: plan.for_family(f) for f, n in counts.items() if n > 0}
     share = (
         sum(counts[f] * seeds * mult / fp.steps_per_s for f, fp in fams.items()),
-        sum(counts[f] * seeds * fp.overhead_s for f, fp in fams.items()) / plan.n_workers,
+        sum(counts[f] * seeds * fp.overhead_s for f, fp in fams.items())
+        / plan.n_workers,
     )
     wall = max(
-        ((mult * plan.n_workers / fp.steps_per_s, fp.overhead_s) for fp in fams.values()),
+        (
+            (mult * plan.n_workers / fp.steps_per_s, fp.overhead_s)
+            for fp in fams.values()
+        ),
         default=(0.0, 0.0),
     )
     return share, wall
@@ -394,11 +412,14 @@ def _ladder_lines(
     arms_per_rung: Sequence[Mapping[str, float]], plan: Plan, seeds: Sequence[int]
 ) -> list[tuple[_Line, _Line]]:
     return [
-        _rung_lines(counts, plan, seeds[k], ETA**k) for k, counts in enumerate(arms_per_rung)
+        _rung_lines(counts, plan, seeds[k], ETA**k)
+        for k, counts in enumerate(arms_per_rung)
     ]
 
 
-def _rung_cost_usd(lines: list[tuple[_Line, _Line]], r0: int, usd_per_s: float) -> tuple[float, ...]:
+def _rung_cost_usd(
+    lines: list[tuple[_Line, _Line]], r0: int, usd_per_s: float
+) -> tuple[float, ...]:
     return tuple(max(a * r0 + b for a, b in pair) * usd_per_s for pair in lines)
 
 
@@ -437,13 +458,20 @@ def size_rungs(
     if not (0 < share <= 1) or not (math.isfinite(usd_per_s) and usd_per_s > 0):
         raise ValueError(f"bad share {share} or usd_per_s {usd_per_s}")
     if not arms_per_rung or len(arms_per_rung) > len(seeds_per_rung):
-        raise ValueError(f"need 1..{len(seeds_per_rung)} rungs of arm counts, got {len(arms_per_rung)}")
+        raise ValueError(
+            f"need 1..{len(seeds_per_rung)} rungs of arm counts, got {len(arms_per_rung)}"
+        )
     if not arms_per_rung[0] or any(n < 0 for c in arms_per_rung for n in c.values()):
-        raise ValueError(f"arm counts must be non-negative with a non-empty rung 0: {arms_per_rung}")
+        raise ValueError(
+            f"arm counts must be non-negative with a non-empty rung 0: {arms_per_rung}"
+        )
     budget_s = share * remaining_usd / usd_per_s
     lines = _ladder_lines(arms_per_rung, plan, seeds_per_rung)
     r0 = _max_r0(lines, budget_s)
-    rollout = max(plan.for_family(f).num_envs * plan.for_family(f).rollout_len for f in arms_per_rung[0])
+    rollout = max(
+        plan.for_family(f).num_envs * plan.for_family(f).rollout_len
+        for f in arms_per_rung[0]
+    )
     floor_steps = max(min_r0_steps, rollout)
     if r0 < floor_steps:
         totals = ", ".join(f"{sum(c.values()):.0f}" for c in arms_per_rung)
@@ -456,14 +484,19 @@ def size_rungs(
             f"{tuple(seeds_per_rung[: len(arms_per_rung)])}. Knobs: fewer tasks, fewer arms, fewer "
             "seeds, a higher cap, or a lower SWEEP_MIN_R0_STEPS"
         )
-    return RungSizing(rungs=(r0, ETA * r0, ETA * ETA * r0), cost_usd=_rung_cost_usd(lines, r0, usd_per_s))
+    return RungSizing(
+        rungs=(r0, ETA * r0, ETA * ETA * r0),
+        cost_usd=_rung_cost_usd(lines, r0, usd_per_s),
+    )
 
 
 def ladder_cost_usd(
     arms_per_rung: Sequence[Mapping[str, float]], plan: Plan, r0: int, usd_per_s: float
 ) -> tuple[float, ...]:
     """Projected USD per rung for a given r0 (used to log an `SWEEP_R0_STEPS` override)."""
-    return _rung_cost_usd(_ladder_lines(arms_per_rung, plan, SEEDS_PER_RUNG), r0, usd_per_s)
+    return _rung_cost_usd(
+        _ladder_lines(arms_per_rung, plan, SEEDS_PER_RUNG), r0, usd_per_s
+    )
 
 
 # --- the loop ----------------------------------------------------------------------------------
@@ -536,7 +569,10 @@ class SweepLoop:
         `UNPROBED_FACTOR` for methods without a probe."""
         fp = self._plan.for_task(job.arm.task)
         factor = self._plan.job_factor(fp.family, job.arm.method, unprobed=unprobed)
-        return factor * job.step_budget / (fp.steps_per_s / self._plan.n_workers) + fp.overhead_s
+        return (
+            factor * job.step_budget / (fp.steps_per_s / self._plan.n_workers)
+            + fp.overhead_s
+        )
 
     def _correction(self) -> float:
         if not self._ratios:
@@ -547,7 +583,10 @@ class SweepLoop:
     def _in_flight_left_s(self) -> float:
         """Longest remaining wall clock among the jobs in flight: the pod time already owed."""
         now, c = self._clock(), self._correction()
-        left = [max(0.0, f.est_wall_s * c - (now - f.start_s)) for f in self._inflight.values()]
+        left = [
+            max(0.0, f.est_wall_s * c - (now - f.start_s))
+            for f in self._inflight.values()
+        ]
         return max(left, default=0.0)
 
     # --- results ---
@@ -556,9 +595,15 @@ class SweepLoop:
         key = (result.arm_id, result.seed)
         entry = self._inflight.pop(key, None)
         if result.status == "ok" and not math.isfinite(result.auc):
-            _log.error("run %s: ok result with non-finite auc %s; recorded as failed", key, result.auc)
+            _log.error(
+                "run %s: ok result with non-finite auc %s; recorded as failed",
+                key,
+                result.auc,
+            )
             result = dataclasses.replace(
-                result, status="failed", error=f"ok result with non-finite auc {result.auc}"
+                result,
+                status="failed",
+                error=f"ok result with non-finite auc {result.auc}",
             )
         if entry is not None and result.status == "ok" and entry.est_wall_s > 0:
             self._ratios.append((self._clock() - entry.start_s) / entry.est_wall_s)
@@ -577,9 +622,15 @@ class SweepLoop:
         try:
             self._sched.report(result)
         except ConflictingResultError:
-            _log.warning("conflicting duplicate for run %s; keeping the first result", key, exc_info=True)
+            _log.warning(
+                "conflicting duplicate for run %s; keeping the first result",
+                key,
+                exc_info=True,
+            )
         except ValueError:
-            _log.warning("dropping result for run %s with no running job", key, exc_info=True)
+            _log.warning(
+                "dropping result for run %s with no running job", key, exc_info=True
+            )
 
     def _kill_dead(self) -> None:
         for job in self._pool.running():
@@ -588,7 +639,9 @@ class SweepLoop:
             self._pool.kill(job)
             entry = next(f for f in self._inflight.values() if f.job == job)
             wall = self._clock() - entry.start_s
-            _log.info("killed %s seed %d: arm no longer live", job.arm.label(), job.seed)
+            _log.info(
+                "killed %s seed %d: arm no longer live", job.arm.label(), job.seed
+            )
             self._handle(
                 failed_result(
                     entry.spec,
@@ -600,14 +653,20 @@ class SweepLoop:
     def _kill_all(self) -> None:
         for job in self._pool.running():
             self._pool.kill(job)
-            _log.warning("budget: killed %s seed %d; it reruns on resume", job.arm.label(), job.seed)
+            _log.warning(
+                "budget: killed %s seed %d; it reruns on resume",
+                job.arm.label(),
+                job.seed,
+            )
         self._inflight.clear()
 
     # --- submission ---
 
     def _smoke_rung0_over(self) -> bool:
         self._sched.promotions()
-        return not any(st.status in LIVE_STATUSES and st.rung == 0 for st in self._sched.states())
+        return not any(
+            st.status in LIVE_STATUSES and st.rung == 0 for st in self._sched.states()
+        )
 
     def _submit_free(self) -> bool:
         """Fill free workers; True if the guard refused a job."""
@@ -638,8 +697,12 @@ class SweepLoop:
                     len(self._inflight),
                 )
                 return True
-            ceiling_est = self._raw_wall_s(job, unprobed=UNPROBED_FACTOR) * self._correction()
-            timeout_s = max(JOB_TIMEOUT_FLOOR_S, JOB_TIMEOUT_FACTOR * max(est, ceiling_est))
+            ceiling_est = (
+                self._raw_wall_s(job, unprobed=UNPROBED_FACTOR) * self._correction()
+            )
+            timeout_s = max(
+                JOB_TIMEOUT_FLOOR_S, JOB_TIMEOUT_FACTOR * max(est, ceiling_est)
+            )
             if self._heartbeat_of is None:
                 self._pool.submit(job, spec, timeout_s=timeout_s)
             else:
@@ -650,7 +713,9 @@ class SweepLoop:
                     heartbeat=self._heartbeat_of(spec),
                     hang_s=self._hang_s,
                 )
-            self._inflight[(spec.arm_id(), spec.seed)] = _InFlight(job, spec, self._clock(), raw)
+            self._inflight[(spec.arm_id(), spec.seed)] = _InFlight(
+                job, spec, self._clock(), raw
+            )
         return False
 
     def _live_metrics(self) -> dict[str, float]:
@@ -666,7 +731,9 @@ class SweepLoop:
             "jobs_running": float(len(self._inflight)),
             "jobs_done": float(self._n_results),
         }
-        data.update({f"arms/{status}": float(counts[status]) for status in get_args(Status)})
+        data.update(
+            {f"arms/{status}": float(counts[status]) for status in get_args(Status)}
+        )
         rungs: dict[str, int] = {}
         for st in states:
             if st.status in LIVE_STATUSES:
@@ -732,9 +799,13 @@ class SweepLoop:
                     else "budget: the next job would pass cap - margin"
                 )
             elif not self._pool.running() and not self._sched.done():
-                raise RuntimeError("no job running, none to start, and the scheduler is not done")
+                raise RuntimeError(
+                    "no job running, none to start, and the scheduler is not done"
+                )
         else:
-            raise RuntimeError(f"sweep loop passed its bound of {self._max_iters} iterations")
+            raise RuntimeError(
+                f"sweep loop passed its bound of {self._max_iters} iterations"
+            )
         self.guard.flush()
         self._log_live(force=True)
         _log.info("sweep loop stopped: %s", reason)
@@ -748,7 +819,9 @@ ReportSinkFactory = Callable[[str, str, WandbMode], ReportSink]
 
 
 def _wandb_sweep_sink(project: str, group: str, mode: WandbMode) -> ReportSink:
-    return WandbReportSink(project=project, group=group, mode=mode, config={"sweep_id": group})
+    return WandbReportSink(
+        project=project, group=group, mode=mode, config={"sweep_id": group}
+    )
 
 
 def _sweep_id(state_dir: Path) -> str:
@@ -767,7 +840,9 @@ def _smoke_arms() -> list[Arm]:
     return arms
 
 
-def _defaults(plan: Plan, arm: Arm, step_budget: int, settings: Settings, device: str) -> RunDefaults:
+def _defaults(
+    plan: Plan, arm: Arm, step_budget: int, settings: Settings, device: str
+) -> RunDefaults:
     fp = plan.for_task(arm.task)
     return RunDefaults(
         num_envs=fp.num_envs,
@@ -779,7 +854,9 @@ def _defaults(plan: Plan, arm: Arm, step_budget: int, settings: Settings, device
     )
 
 
-def _calibration_settings(settings: Settings, device: str, cap_usd: float) -> CalibrationSettings:
+def _calibration_settings(
+    settings: Settings, device: str, cap_usd: float
+) -> CalibrationSettings:
     return CalibrationSettings(
         num_envs_grid=settings.num_envs_grid,
         workers_grid=settings.workers_grid,
@@ -795,12 +872,16 @@ def _calibration_settings(settings: Settings, device: str, cap_usd: float) -> Ca
 
 
 META_FILE: Final = "sweep_meta.json"
-SWEEP_METRICS_FILE: Final = "sweep_metrics.jsonl"  # local copy of every live sweep metric
+SWEEP_METRICS_FILE: Final = (
+    "sweep_metrics.jsonl"  # local copy of every live sweep metric
+)
 CALIBRATION_FILE: Final = "calibration.json"
 
 
 def _arms_sha256(arms: list[Arm]) -> str:
-    return hashlib.sha256("\n".join(sorted(a.label() for a in arms)).encode()).hexdigest()
+    return hashlib.sha256(
+        "\n".join(sorted(a.label() for a in arms)).encode()
+    ).hexdigest()
 
 
 def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
@@ -809,7 +890,11 @@ def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
     `sweep_meta.json` records the mode and a hash of the initial arm set on first start; a later
     start with another mode or arm set would resume a different sweep's state. A scheduler
     state without its calibration.json cannot rebuild the arm ids."""
-    meta = {"version": 1, "mode": "smoke" if smoke else "full", "arms_sha256": _arms_sha256(arms)}
+    meta = {
+        "version": 1,
+        "mode": "smoke" if smoke else "full",
+        "arms_sha256": _arms_sha256(arms),
+    }
     path = state / META_FILE
     if path.exists():
         try:
@@ -824,7 +909,10 @@ def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
                 f"this start is {meta['mode']} with arm set {meta['arms_sha256']}; use another "
                 "SWEEP_STATE_DIR or the settings the state was made with"
             )
-    elif any((state / name).exists() for name in (STATE_FILE, CALIBRATION_FILE, "results.jsonl")):
+    elif any(
+        (state / name).exists()
+        for name in (STATE_FILE, CALIBRATION_FILE, "results.jsonl")
+    ):
         return f"{state} holds sweep state but no {META_FILE}; refusing to guess what it is"
     if (state / STATE_FILE).exists() and not (state / CALIBRATION_FILE).exists():
         return f"{state / STATE_FILE} exists but {CALIBRATION_FILE} is missing: arm ids cannot be rebuilt"
@@ -867,9 +955,15 @@ def _plan_rungs(
                 min_r0_steps=settings.min_r0_steps,
             )
         except BudgetTooSmallError as e:
-            _log.error("refusing to start: %s", e)  # obs: allow LOG006 (numbers and knobs; no traceback)
+            _log.error(
+                "refusing to start: %s", e
+            )  # obs: allow LOG006 (numbers and knobs; no traceback)
             return None
-        rungs, cost, source = sizing.rungs, sizing.cost_usd, f"{LADDER_SHARE:.0%} of remaining"
+        rungs, cost, source = (
+            sizing.rungs,
+            sizing.cost_usd,
+            f"{LADDER_SHARE:.0%} of remaining",
+        )
     _log.info(
         "ladder: r0=%d (%s); expected arms per rung %s; projected USD per rung %s, total %.2f "
         "of %.2f remaining",
@@ -962,7 +1056,9 @@ def _sweep(
         return 3
     start_error: Exception | None = None
     try:
-        primary = report_sink_factory(settings.wandb_project, sweep_id, settings.wandb_mode)
+        primary = report_sink_factory(
+            settings.wandb_project, sweep_id, settings.wandb_mode
+        )
     except Exception as e:  # noqa: BLE001 # W&B down at start (any error type): sweep on the JSONL copy
         primary, start_error = NullReportSink(), e
     sink = GuardedSweepSink(primary, JsonlSink(state / SWEEP_METRICS_FILE))
@@ -1006,7 +1102,9 @@ def _run_sweep(
     arms_per_family = Counter(family_of(a.task) for a in arms)
     calib_path = state / CALIBRATION_FILE
     resuming = (state / STATE_FILE).exists()
-    prior_calib = CalibrationRecord.load(calib_path).spent_usd if calib_path.exists() else 0.0
+    prior_calib = (
+        CalibrationRecord.load(calib_path).spent_usd if calib_path.exists() else 0.0
+    )
     calib_cap = min(CALIBRATION_CAP_USD, prior_calib + max(guard.remaining(), 0.0))
     calib_settings = _calibration_settings(settings, device, max(calib_cap, 1e-9))
     try:
@@ -1023,11 +1121,16 @@ def _run_sweep(
                 clock=clock,
                 probe_families=SMOKE_PROBE_FAMILIES if settings.smoke else None,
             )
-        plan = choose_plan(record, arms_per_family=arms_per_family, settings=calib_settings)
+        plan = choose_plan(
+            record, arms_per_family=arms_per_family, settings=calib_settings
+        )
     except CalibrationError:
         _log.exception("calibration gave nothing to size the sweep from")
         return 3
-    sink.log(guard.elapsed_s(), {"calibration_usd": record.spent_usd, "spent_usd": guard.spent()})
+    sink.log(
+        guard.elapsed_s(),
+        {"calibration_usd": record.spent_usd, "spent_usd": guard.spent()},
+    )
     _log.info(
         "plan: %d workers; %s",
         plan.n_workers,
@@ -1039,11 +1142,15 @@ def _run_sweep(
 
     def arm_id_of(arm: Arm, step_budget: int) -> str:
         defaults = _defaults(plan, arm, step_budget, settings, device)
-        return spec_for(arm, seed=0, step_budget=step_budget, defaults=defaults).arm_id()
+        return spec_for(
+            arm, seed=0, step_budget=step_budget, defaults=defaults
+        ).arm_id()
 
     def make_spec(job: Job) -> RunSpec:
         defaults = _defaults(plan, job.arm, job.step_budget, settings, device)
-        return spec_for(job.arm, seed=job.seed, step_budget=job.step_budget, defaults=defaults)
+        return spec_for(
+            job.arm, seed=job.seed, step_budget=job.step_budget, defaults=defaults
+        )
 
     if resuming:
         scheduler = Scheduler.load(state, arm_id_of=arm_id_of)
@@ -1052,7 +1159,9 @@ def _run_sweep(
         rungs = _plan_rungs(settings, arms, plan, guard)
         if rungs is None:
             return 5
-        scheduler = Scheduler(arms=arms, rung_budgets=rungs, state_dir=state, arm_id_of=arm_id_of)
+        scheduler = Scheduler(
+            arms=arms, rung_budgets=rungs, state_dir=state, arm_id_of=arm_id_of
+        )
         _log.info("new scheduler: %d arms, rung budgets %s", len(arms), rungs)
 
     safe = _SignalSafeScheduler(scheduler)
@@ -1105,7 +1214,9 @@ def _run_sweep(
 
 
 def _configure_logging() -> None:
-    root = logging.getLogger()  # obs: allow LOG003 (the entry point configures the root)
+    root = (
+        logging.getLogger()
+    )  # obs: allow LOG003 (the entry point configures the root)
     if not root.handlers:
         logging.basicConfig(
             level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -1135,7 +1246,9 @@ def main(
     try:
         settings = load_settings(env)
     except SettingsError as e:
-        _log.error("bad settings: %s", e)  # obs: allow LOG006 (a clear message; no traceback)
+        _log.error(
+            "bad settings: %s", e
+        )  # obs: allow LOG006 (a clear message; no traceback)
         return 2
     if device is None:
         from resetsweep.device import pick_device
@@ -1196,12 +1309,20 @@ def report_main(argv: list[str] | None = None) -> int:
         _log.error("%s has no %s: nothing to rebuild", state, STATE_FILE)
         return 2
     meta_path = state / META_FILE
-    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    meta = (
+        json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    )
     scheduler = Scheduler.load(state, arm_id_of=_saved_arm_ids(state))
     sweep_id_path = state / "sweep_id.txt"
     extra: dict[str, float | str] = {"stop_reason": "rebuilt offline by sweep-report"}
     if sweep_id_path.exists():
         extra["sweep_id"] = sweep_id_path.read_text(encoding="utf-8").strip()
-    _final_report(scheduler, state, NullReportSink(), smoke=meta.get("mode") == "smoke", extra=extra)
+    _final_report(
+        scheduler,
+        state,
+        NullReportSink(),
+        smoke=meta.get("mode") == "smoke",
+        extra=extra,
+    )
     _log.info("report rebuilt in %s", state / "report.md")
     return 0

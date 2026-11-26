@@ -494,18 +494,26 @@ def test_run_reports_nan_ever_succeeded_share_without_ics() -> None:
     # Final-review I4: reached_reward now comes from eval. Here the trained policy swings an
     # eval episode through upright (eval/return 0.30 at step 128), so it is True; that it
     # matches the eval log is checked in the first-reward tests below.
-    evals = [d["eval/reached_reward"] for _, d in sink.logs if "eval/reached_reward" in d]
+    evals = [
+        d["eval/reached_reward"] for _, d in sink.logs if "eval/reached_reward" in d
+    ]
     assert result.reached_reward is any(share > 0 for share in evals)
 
 
-def test_first_reward_step_is_the_first_eval_where_an_eval_episode_reached_reward() -> None:
+def test_first_reward_step_is_the_first_eval_where_an_eval_episode_reached_reward() -> (
+    None
+):
     # Final-review I4: from eval (task-start states), not from curriculum episodes.
     torch.manual_seed(0)
     sink = _Recorder()
 
     result = run(_spec(task="pendulum_dense"), sink)
 
-    evals = [(step, d["eval/reached_reward"]) for step, d in sink.logs if "eval/reached_reward" in d]
+    evals = [
+        (step, d["eval/reached_reward"])
+        for step, d in sink.logs
+        if "eval/reached_reward" in d
+    ]
     first_hit = next(step for step, share in evals if share > 0)
     assert result.reached_reward is True
     assert result.steps_to_first_reward == first_hit
@@ -522,7 +530,9 @@ def test_reached_reward_ignores_rewards_from_curriculum_starts(
 
     def upright(self: object) -> StartStates:
         del self
-        return StartStates(torch.full((1, 1), math.pi), torch.zeros(1, 1), torch.zeros(1, 0))
+        return StartStates(
+            torch.full((1, 1), math.pi), torch.zeros(1, 1), torch.zeros(1, 0)
+        )
 
     monkeypatch.setattr(pendulum, "canonical_start", upright)
     torch.manual_seed(0)
@@ -618,7 +628,9 @@ def test_vmax_is_rejected_for_a_task_with_no_positive_reward() -> None:
         build_score(spec, task)
 
 
-def test_ic_success_capacity_is_read_after_the_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ic_success_capacity_is_read_after_the_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Final-review minor. phased switches tables when the first reward arrives, inside a
     # rollout; per-IC success must use the table in force after that rollout. pendulum_dense
     # pays reward on the first steps, so the switch happens in iteration 0.

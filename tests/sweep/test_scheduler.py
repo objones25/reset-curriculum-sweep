@@ -1169,7 +1169,10 @@ def test_bounds_match_ucb_of_current_rung_results(tmp_path: Path) -> None:
     lcb, ucb = s.bounds(V00_A)
 
     # IQM of [0.6, 0.7, 0.8] = 0.7 (3 runs keep all); sd = 0.1; half = 2 * 0.1 / sqrt(3)
-    assert (lcb, ucb) == (pytest.approx(0.7 - 0.2 / math.sqrt(3)), pytest.approx(0.7 + 0.2 / math.sqrt(3)))
+    assert (lcb, ucb) == (
+        pytest.approx(0.7 - 0.2 / math.sqrt(3)),
+        pytest.approx(0.7 + 0.2 / math.sqrt(3)),
+    )
 
 
 def test_bounds_are_none_at_rung0(tmp_path: Path) -> None:
@@ -1199,7 +1202,9 @@ def test_promotion_out_of_rung0_adds_no_dense_or_inverted_arms(tmp_path: Path) -
     }
 
 
-def test_promotion_into_final_rung_adds_inverted_and_dense_copies(tmp_path: Path) -> None:
+def test_promotion_into_final_rung_adds_inverted_and_dense_copies(
+    tmp_path: Path,
+) -> None:
     s = _new(tmp_path, [UNIFORM_A, POINT_A, WALK_A])
     _step(s, 100, _by_label({}))
     # Rung 1: 3 seeds each; walk p_task=0.5 is best, so it is the quota winner

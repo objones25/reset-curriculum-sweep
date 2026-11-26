@@ -40,7 +40,9 @@ def _assert_on(states: StartStates, device: torch.device) -> None:
 
 @pytest.mark.parametrize("device", ["cpu", *_ACCELERATORS])
 @pytest.mark.parametrize("name", TASKS.names())
-def test_sample_start_returns_tensors_on_generator_device(name: str, device: str) -> None:
+def test_sample_start_returns_tensors_on_generator_device(
+    name: str, device: str
+) -> None:
     gen = torch.Generator(device=device).manual_seed(0)
 
     states = _make(name).sample_start(N, gen)

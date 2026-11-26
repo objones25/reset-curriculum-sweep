@@ -286,11 +286,20 @@ def test_group_keys_drop_ever_succeeded_when_any_arm_has_no_ics() -> None:
     from resetsweep.sweep.stats import rung0_group_keys
 
     keys = rung0_group_keys(
-        {"uniform": [_run(ever=NAN)], "walk_low": [_run(ever=0.1)], "walk_high": [_run(ever=0.9)]}
+        {
+            "uniform": [_run(ever=NAN)],
+            "walk_low": [_run(ever=0.1)],
+            "walk_high": [_run(ever=0.9)],
+        }
     )
 
     # Same AUC, reward share and steps: without the dropped component all three tie.
-    assert keys["uniform"] == keys["walk_low"] == keys["walk_high"] == (0.0, 0.0, -math.inf)
+    assert (
+        keys["uniform"]
+        == keys["walk_low"]
+        == keys["walk_high"]
+        == (0.0, 0.0, -math.inf)
+    )
 
 
 def test_group_keys_keep_ever_succeeded_when_every_arm_has_it() -> None:

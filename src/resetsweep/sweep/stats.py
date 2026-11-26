@@ -142,7 +142,9 @@ def _has_no_ic_info(results: Sequence[RunResult]) -> bool:
     return all(math.isnan(r.ever_succeeded_share) for r in results if r.status == "ok")
 
 
-def rung0_group_keys[K](groups: Mapping[K, Sequence[RunResult]]) -> dict[K, tuple[float, ...]]:
+def rung0_group_keys[K](
+    groups: Mapping[K, Sequence[RunResult]],
+) -> dict[K, tuple[float, ...]]:
     """`rung0_key` for every arm of one ranking group, compared within the group.
 
     ``ever_succeeded_share`` is NaN for methods without per-IC outcomes (uniform, point,

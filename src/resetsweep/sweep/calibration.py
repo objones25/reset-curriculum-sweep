@@ -71,7 +71,9 @@ WORKERS_GRID: Final = (1, 2, 4)
 ROLLOUT_LEN: Final = 24
 LR_GRID: Final = (1e-3, 3e-4)
 NEAR_BEST: Final = 0.9
-CALIBRATION_JOB_RUNG: Final = -1  # marks calibration jobs; the scheduler never sees them
+CALIBRATION_JOB_RUNG: Final = (
+    -1
+)  # marks calibration jobs; the scheduler never sees them
 CONFIG_STEPS: Final = 10_000_000
 THROUGHPUT_ITERS: Final = 10
 _VERSION: Final = 1
@@ -80,7 +82,10 @@ _DIAG_PREFIXES: Final = ("method/", "method_update/", "ic/")
 # None or "random", so the score itself costs nothing.
 PROBES: Final[Mapping[str, tuple[tuple[str, str], ...]]] = {
     "arm_dense": (("arm_sparse", "visited"), ("arm_sparse", "buffer_scored")),
-    "pendulum_dense": (("pendulum_sparse", "buffer_scored"), ("pendulum_sparse", "walk")),
+    "pendulum_dense": (
+        ("pendulum_sparse", "buffer_scored"),
+        ("pendulum_sparse", "walk"),
+    ),
 }
 
 
@@ -104,7 +109,9 @@ def minibatch_for(num_envs: int, rollout_len: int) -> int:
 
 
 def ppo_for(lr: float, num_envs: int, rollout_len: int) -> PPOConfig:
-    return replace(START_CONFIG, lr=lr, minibatch_size=minibatch_for(num_envs, rollout_len))
+    return replace(
+        START_CONFIG, lr=lr, minibatch_size=minibatch_for(num_envs, rollout_len)
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -156,7 +163,9 @@ class Measurement:
     kl_stopped_rate: float | None
     elapsed_s: float
     overhead_s: float | None
-    diagnostics: dict[str, float | None] = field(default_factory=dict[str, float | None])
+    diagnostics: dict[str, float | None] = field(
+        default_factory=dict[str, float | None]
+    )
 
 
 @dataclass
@@ -183,7 +192,9 @@ class CalibrationRecord:
         return out
 
     def probes(self) -> list[Measurement]:
-        return [m for k, ms in self.batches.items() if k.startswith("probe/") for m in ms]
+        return [
+            m for k, ms in self.batches.items() if k.startswith("probe/") for m in ms
+        ]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -196,9 +207,17 @@ class CalibrationRecord:
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "CalibrationRecord":
         if data.get("version") != _VERSION:
-            raise CalibrationError(f"unsupported calibration.json version {data.get('version')!r}")
-        batches = {k: [Measurement(**m) for m in ms] for k, ms in data["batches"].items()}
-        return cls(batches=batches, spent_usd=float(data["spent_usd"]), capped=bool(data["capped"]))
+            raise CalibrationError(
+                f"unsupported calibration.json version {data.get('version')!r}"
+            )
+        batches = {
+            k: [Measurement(**m) for m in ms] for k, ms in data["batches"].items()
+        }
+        return cls(
+            batches=batches,
+            spent_usd=float(data["spent_usd"]),
+            capped=bool(data["capped"]),
+        )
 
     def save(self, path: Path) -> None:
         tmp = path.with_name(path.name + ".tmp")
@@ -226,7 +245,9 @@ class _Batch:
 
 
 def _uniform_on(family: str) -> Arm:
-    return Arm(task=family, task_kw=(), method="uniform", method_kw=(), score=None, score_kw=())
+    return Arm(
+        task=family, task_kw=(), method="uniform", method_kw=(), score=None, score_kw=()
+    )
 
 
 def _probe_arm(task: str, method: str) -> Arm:
@@ -239,7 +260,13 @@ def _probe_arm(task: str, method: str) -> Arm:
 
 
 def _job(
-    arm: Arm, *, seed: int, num_envs: int, lr: float, budget: int, s: CalibrationSettings
+    arm: Arm,
+    *,
+    seed: int,
+    num_envs: int,
+    lr: float,
+    budget: int,
+    s: CalibrationSettings,
 ) -> tuple[Job, RunSpec, float]:
     defaults = RunDefaults(
         num_envs=num_envs,
@@ -250,11 +277,19 @@ def _job(
         device=s.device,
     )
     spec = spec_for(arm, seed=seed, step_budget=budget, defaults=defaults)
-    return Job(arm=arm, seed=seed, rung=CALIBRATION_JOB_RUNG, step_budget=budget), spec, lr
+    return (
+        Job(arm=arm, seed=seed, rung=CALIBRATION_JOB_RUNG, step_budget=budget),
+        spec,
+        lr,
+    )
 
 
 def chosen_lr(record: CalibrationRecord, family: str) -> float | None:
-    ok = [m for m in record.config(family) if m.status == "ok" and m.final_return is not None]
+    ok = [
+        m
+        for m in record.config(family)
+        if m.status == "ok" and m.final_return is not None
+    ]
     if not ok:
         return None
     return max(ok, key=lambda m: (m.final_return, -m.lr)).lr
@@ -270,7 +305,14 @@ def _planned(
     base = s.base_num_envs
     for fam in families:
         jobs = tuple(
-            _job(_uniform_on(fam), seed=0, num_envs=base, lr=lr, budget=s.config_steps, s=s)
+            _job(
+                _uniform_on(fam),
+                seed=0,
+                num_envs=base,
+                lr=lr,
+                budget=s.config_steps,
+                s=s,
+            )
             for lr in LR_GRID
         )
         yield _Batch(f"config/{fam}", fam, len(jobs), jobs)
@@ -285,7 +327,14 @@ def _planned(
             lr = chosen_lr(record, fam) or START_CONFIG.lr
             budget = s.throughput_iters * n_envs * s.rollout_len
             jobs = tuple(
-                _job(_uniform_on(fam), seed=seed, num_envs=n_envs, lr=lr, budget=budget, s=s)
+                _job(
+                    _uniform_on(fam),
+                    seed=seed,
+                    num_envs=n_envs,
+                    lr=lr,
+                    budget=budget,
+                    s=s,
+                )
                 for seed in range(n)
             )
             yield _Batch(f"throughput/{fam}/{n_envs}/{n}", fam, n, jobs)
@@ -300,16 +349,30 @@ def _planned(
 def _read_log(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
     return [r for r in rows if r.get("type") == "log"]
 
 
 def _finite(value: object) -> float | None:
-    return float(value) if isinstance(value, int | float) and math.isfinite(value) else None
+    return (
+        float(value)
+        if isinstance(value, int | float) and math.isfinite(value)
+        else None
+    )
 
 
 def _measure(
-    batch: _Batch, job: Job, spec: RunSpec, lr: float, result: RunResult, elapsed_s: float, runs_dir: Path
+    batch: _Batch,
+    job: Job,
+    spec: RunSpec,
+    lr: float,
+    result: RunResult,
+    elapsed_s: float,
+    runs_dir: Path,
 ) -> Measurement:
     common: dict[str, Any] = {
         "key": batch.key,
@@ -326,8 +389,13 @@ def _measure(
     if result.status != "ok" or not sps_all:
         error = result.error or "no perf/steps_per_s logged"
         return Measurement(
-            **common, status="failed", error=error, steps_per_s=None, final_return=None,
-            kl_stopped_rate=None, overhead_s=None,
+            **common,
+            status="failed",
+            error=error,
+            steps_per_s=None,
+            final_return=None,
+            kl_stopped_rate=None,
+            overhead_s=None,
         )
     sps = statistics.median(sps_all[1:] if len(sps_all) > 1 else sps_all)
     returns = [v for r in rows if (v := _finite(r.get("eval/return"))) is not None]
@@ -365,7 +433,9 @@ def _run_batch(
         raise ValueError(f"batch budget must be > 0, got {budget_usd} USD")
     timeout_s = min(s.job_timeout_s, budget_s)
     pool = pool_factory(batch.n_workers, s.device, runner_cfg)
-    pending = {(spec.arm_id(), spec.seed): (job, spec, lr) for job, spec, lr in batch.jobs}
+    pending = {
+        (spec.arm_id(), spec.seed): (job, spec, lr) for job, spec, lr in batch.jobs
+    }
     if len(pending) != len(batch.jobs):
         raise RuntimeError(f"batch {batch.key} has duplicate (arm_id, seed) jobs")
     done: dict[tuple[str, int], Measurement] = {}
@@ -394,10 +464,14 @@ def _run_batch(
                 key = (result.arm_id, result.seed)
                 job, spec, lr = pending[key]
                 elapsed = clock() - submitted_at[key]
-                done[key] = _measure(batch, job, spec, lr, result, elapsed, runner_cfg.runs_dir)
+                done[key] = _measure(
+                    batch, job, spec, lr, result, elapsed, runner_cfg.runs_dir
+                )
             guard.heartbeat()
         else:
-            raise RuntimeError(f"calibration batch {batch.key} did not finish in {max_polls} polls")
+            raise RuntimeError(
+                f"calibration batch {batch.key} did not finish in {max_polls} polls"
+            )
     finally:
         pool.close()
     return [done[k] for k in pending]
@@ -420,7 +494,9 @@ def calibrate(
     if not families:
         raise ValueError("no families to calibrate")
     probe_families = families if probe_families is None else probe_families
-    record = CalibrationRecord.load(path) if path.exists() else CalibrationRecord(batches={})
+    record = (
+        CalibrationRecord.load(path) if path.exists() else CalibrationRecord(batches={})
+    )
     record.capped = False
     for batch in _planned(families, settings, record, probe_families):
         if batch.key in record.batches:
@@ -485,12 +561,18 @@ class FamilyPlan:
 
     def __post_init__(self) -> None:
         if not (math.isfinite(self.steps_per_s) and self.steps_per_s > 0):
-            raise ValueError(f"steps_per_s must be finite and > 0, got {self.steps_per_s}")
+            raise ValueError(
+                f"steps_per_s must be finite and > 0, got {self.steps_per_s}"
+            )
         if not (math.isfinite(self.overhead_s) and self.overhead_s >= 0):
-            raise ValueError(f"overhead_s must be finite and >= 0, got {self.overhead_s}")
+            raise ValueError(
+                f"overhead_s must be finite and >= 0, got {self.overhead_s}"
+            )
 
 
-UNPROBED_FACTOR: Final = 3.0  # final-review I5: a method with no probe may run 3x uniform's wall
+UNPROBED_FACTOR: Final = (
+    3.0  # final-review I5: a method with no probe may run 3x uniform's wall
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -503,7 +585,9 @@ class Plan:
         default_factory=dict[tuple[str, str], float]
     )
 
-    def job_factor(self, family: str, method: str, *, unprobed: float = UNPROBED_FACTOR) -> float:
+    def job_factor(
+        self, family: str, method: str, *, unprobed: float = UNPROBED_FACTOR
+    ) -> float:
         """How much longer than `uniform` a job of `method` in `family` is expected to take:
         the probe's measured slowdown when there is one, 1 for uniform, else `unprobed` (3 for
         timeouts; the sweep's budget estimate passes 1 and learns its own correction)."""
@@ -519,7 +603,9 @@ class Plan:
         return self.for_family(family_of(task))
 
 
-def _pick_envs(grid: Mapping[tuple[int, int], float | None], n: int) -> tuple[int, float] | None:
+def _pick_envs(
+    grid: Mapping[tuple[int, int], float | None], n: int
+) -> tuple[int, float] | None:
     at_n = {n_envs: v for (n_envs, w), v in grid.items() if w == n and v is not None}
     if not at_n:
         return None
@@ -592,7 +678,9 @@ def choose_plan(
     )
     for f in arms_per_family:
         if f not in families:
-            _log.warning("family %s has no calibration measurements; using the fallback plan", f)
+            _log.warning(
+                "family %s has no calibration measurements; using the fallback plan", f
+            )
     return Plan(
         n_workers=n_workers,
         families=families,
@@ -601,7 +689,9 @@ def choose_plan(
     )
 
 
-def method_factors(record: CalibrationRecord, *, base_num_envs: int) -> dict[tuple[str, str], float]:
+def method_factors(
+    record: CalibrationRecord, *, base_num_envs: int
+) -> dict[tuple[str, str], float]:
     """(family, method) -> uniform's steps/s at (base N, 1 worker) / the probe's steps/s, at
     least 1 (a probe runs one job at base N, so the two are comparable). Probes that failed or
     lack a uniform reference are left out (they get `UNPROBED_FACTOR`)."""
@@ -611,7 +701,9 @@ def method_factors(record: CalibrationRecord, *, base_num_envs: int) -> dict[tup
         if reference is None:
             continue
         for task, method in probes:
-            ms = record.batches.get(f"probe/{fam}/{_probe_arm(task, method).label()}", [])
+            ms = record.batches.get(
+                f"probe/{fam}/{_probe_arm(task, method).label()}", []
+            )
             sps = [m.steps_per_s for m in ms if m.status == "ok" and m.steps_per_s]
             if sps:
                 out[(fam, method)] = max(1.0, reference / min(sps))

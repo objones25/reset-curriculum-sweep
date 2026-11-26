@@ -30,9 +30,13 @@ from resetsweep.sweep.pool import RunnerConfig
 from resetsweep.sweep.scheduler import ConflictingResultError, Job
 from resetsweep.train import RunResult, RunSpec
 
-ARM_UNIFORM = next(a for a in arm_space("rung0") if a.label() == "pendulum_sparse/uniform/-")
+ARM_UNIFORM = next(
+    a for a in arm_space("rung0") if a.label() == "pendulum_sparse/uniform/-"
+)
 ARM_VISITED = next(
-    a for a in arm_space("rung0") if a.label() == "pendulum_sparse/visited[p_task=0.5]/-"
+    a
+    for a in arm_space("rung0")
+    if a.label() == "pendulum_sparse/visited[p_task=0.5]/-"
 )
 
 
@@ -64,7 +68,9 @@ class RecordingSink:
     def log(self, elapsed_s: float, data: dict[str, float]) -> None:
         self.logs.append((elapsed_s, data))
 
-    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+    def log_table(
+        self, name: str, columns: list[str], rows: list[list[object]]
+    ) -> None:
         self.tables[name] = (columns, rows)
 
     def summary(self, data: dict[str, Any]) -> None:
@@ -74,7 +80,12 @@ class RecordingSink:
         self.closed = True
 
 
-def _run(env: dict[str, str], clock: Any, pool_factory: Any, sink: RecordingSink | None = None) -> int:
+def _run(
+    env: dict[str, str],
+    clock: Any,
+    pool_factory: Any,
+    sink: RecordingSink | None = None,
+) -> int:
     sink = sink or RecordingSink()
     return main(
         [],
@@ -95,11 +106,17 @@ def _sweep_jobs(world: Any, session: int | None = None) -> list[Any]:
 
 
 def _ledger(state_dir: Path) -> list[dict[str, float]]:
-    return [json.loads(line) for line in (state_dir / "ledger.jsonl").read_text().splitlines()]
+    return [
+        json.loads(line)
+        for line in (state_dir / "ledger.jsonl").read_text().splitlines()
+    ]
 
 
 def _results(state_dir: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in (state_dir / "results.jsonl").read_text().splitlines()]
+    return [
+        json.loads(line)
+        for line in (state_dir / "results.jsonl").read_text().splitlines()
+    ]
 
 
 # --- settings ----------------------------------------------------------------------------------
@@ -120,7 +137,9 @@ def test_settings_invalid_price_names_the_variable_not_the_value(
 ) -> None:
     env = _env(tmp_path, SWEEP_GPU_USD_PER_H=value)
 
-    with pytest.raises(SettingsError, match="^SWEEP_GPU_USD_PER_H must be a finite number > 0$"):
+    with pytest.raises(
+        SettingsError, match="^SWEEP_GPU_USD_PER_H must be a finite number > 0$"
+    ):
         load_settings(env)
 
 
@@ -148,7 +167,9 @@ def test_settings_reject_unknown_wandb_mode(tmp_path: Path) -> None:
         load_settings(_env(tmp_path, WANDB_MODE="dryrun"))
 
 
-def test_main_returns_2_on_bad_settings(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+def test_main_returns_2_on_bad_settings(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
     env = _env(tmp_path)
     del env["SWEEP_CAP_USD"]
 
@@ -188,7 +209,11 @@ def test_size_rungs_fits_the_whole_ladder_in_90_percent_of_remaining() -> None:
     #   rung 2 3 * 5 * 2 = 30; total 96 s.
     # Budget 0.9 * 10 USD / 0.01 USD/s = 900 s -> r0 = floor((900 - 96) / 0.272) = 2955.
     sizing = size_rungs(
-        arms_per_rung=COUNTS, plan=PLAN, remaining_usd=10.0, usd_per_s=0.01, min_r0_steps=1000
+        arms_per_rung=COUNTS,
+        plan=PLAN,
+        remaining_usd=10.0,
+        usd_per_s=0.01,
+        min_r0_steps=1000,
     )
 
     assert sizing.rungs == (2955, 8865, 26595)
@@ -201,7 +226,11 @@ def test_size_rungs_charges_a_full_job_wall_when_the_pool_is_not_full() -> None:
     # One arm on 2 workers: the pod bills the whole job wall, r0 / (1000 / 2) + 4 s, not the
     # 1/n_workers share (r0 / 1000 + 2 s). 900 s budget -> r0 = floor((900 - 4) / 0.002).
     sizing = size_rungs(
-        arms_per_rung=({"a": 1.0},), plan=PLAN, remaining_usd=10.0, usd_per_s=0.01, min_r0_steps=1
+        arms_per_rung=({"a": 1.0},),
+        plan=PLAN,
+        remaining_usd=10.0,
+        usd_per_s=0.01,
+        min_r0_steps=1,
     )
 
     assert sizing.rungs[0] == 448_000
@@ -211,10 +240,21 @@ def test_size_rungs_charges_a_full_job_wall_when_the_pool_is_not_full() -> None:
 def test_size_rungs_refuses_r0_below_the_minimum() -> None:
     with pytest.raises(BudgetTooSmallError) as info:
         size_rungs(
-            arms_per_rung=COUNTS, plan=PLAN, remaining_usd=10.0, usd_per_s=0.01, min_r0_steps=3000
+            arms_per_rung=COUNTS,
+            plan=PLAN,
+            remaining_usd=10.0,
+            usd_per_s=0.01,
+            min_r0_steps=3000,
         )
     message = str(info.value)
-    for needle in ("2955", "3000", "SWEEP_MIN_R0_STEPS", "fewer tasks", "fewer arms", "fewer seeds"):
+    for needle in (
+        "2955",
+        "3000",
+        "SWEEP_MIN_R0_STEPS",
+        "fewer tasks",
+        "fewer arms",
+        "fewer seeds",
+    ):
         assert needle in message
 
 
@@ -222,7 +262,11 @@ def test_size_rungs_raises_when_overhead_alone_exceeds_the_budget() -> None:
     # 0.9 * 0.5 / 0.01 = 45 s < 96 s of overhead alone
     with pytest.raises(BudgetTooSmallError, match="r0"):
         size_rungs(
-            arms_per_rung=COUNTS, plan=PLAN, remaining_usd=0.5, usd_per_s=0.01, min_r0_steps=1
+            arms_per_rung=COUNTS,
+            plan=PLAN,
+            remaining_usd=0.5,
+            usd_per_s=0.01,
+            min_r0_steps=1,
         )
 
 
@@ -281,10 +325,16 @@ def test_main_resumes_from_state_dir(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:
     state = tmp_path / "sweep"
-    _run(_env(tmp_path, SWEEP_CAP_USD="20", SWEEP_R0_STEPS="10000000"), clock, pool_factory)
+    _run(
+        _env(tmp_path, SWEEP_CAP_USD="20", SWEEP_R0_STEPS="10000000"),
+        clock,
+        pool_factory,
+    )
     first_done = {(r["arm_id"], r["seed"]) for r in _results(state)}
     first_spent = _ledger(state)[-1]["spent"]
-    budgets = json.loads((state / "scheduler.json").read_text())["config"]["rung_budgets"]
+    budgets = json.loads((state / "scheduler.json").read_text())["config"][
+        "rung_budgets"
+    ]
 
     world.session = 1
     # 9.3 spent + 0.6 restart allowance + 7.83 for the next 4 jobs <= 28 - 5
@@ -303,12 +353,20 @@ def test_main_resume_ledger_counts_first_session(
     tmp_path: Path, clock: Any, pool_factory: Any, world: Any
 ) -> None:
     state = tmp_path / "sweep"
-    _run(_env(tmp_path, SWEEP_CAP_USD="20", SWEEP_R0_STEPS="10000000"), clock, pool_factory)
+    _run(
+        _env(tmp_path, SWEEP_CAP_USD="20", SWEEP_R0_STEPS="10000000"),
+        clock,
+        pool_factory,
+    )
     n_lines = len(_ledger(state))
     first_spent = _ledger(state)[-1]["spent"]
 
     world.session = 1
-    _run(_env(tmp_path, SWEEP_CAP_USD="20", SWEEP_R0_STEPS="10000000"), clock, pool_factory)
+    _run(
+        _env(tmp_path, SWEEP_CAP_USD="20", SWEEP_R0_STEPS="10000000"),
+        clock,
+        pool_factory,
+    )
 
     # session 2 starts from session 1's spend plus the restart allowance and, with the same
     # cap, cannot start any new job
@@ -330,12 +388,18 @@ def test_smoke_mode_runs_uniform_and_visited_on_pendulum_and_uniform_on_maze_tra
 
     code = _run(env, clock, pool_factory, sink)
 
-    r0, r1, r2 = json.loads((state / "scheduler.json").read_text())["config"]["rung_budgets"]
+    r0, r1, r2 = json.loads((state / "scheduler.json").read_text())["config"][
+        "rung_budgets"
+    ]
     sweep = _sweep_jobs(world)
     calib_tasks = {s.spec.task for s in world.submissions if s.job.rung < 0}
     report = json.loads((state / "report.json").read_text())
     assert code == 0
-    probes = {s.spec.method for s in world.submissions if s.job.rung < 0 and s.spec.task == "arm_sparse"}
+    probes = {
+        s.spec.method
+        for s in world.submissions
+        if s.job.rung < 0 and s.spec.task == "arm_sparse"
+    }
     assert sorted(s.job.arm.label() for s in sweep) == sorted(
         [ARM_UNIFORM.label(), ARM_VISITED.label(), "maze_trap/uniform/-"]
     )
@@ -359,7 +423,9 @@ def test_main_logs_report_to_sweep_level_sink(
     assert sink.closed is True
 
 
-def test_main_writes_calibration_json(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+def test_main_writes_calibration_json(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
     _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory)
 
     record = json.loads((tmp_path / "sweep" / "calibration.json").read_text())
@@ -389,7 +455,9 @@ def _spec(job: Job) -> RunSpec:
 class StubScheduler:
     """Hands out `jobs` once; records reports; `live` decides `is_live`."""
 
-    def __init__(self, jobs: list[Job], live: Callable[[Job], bool] = lambda j: True) -> None:
+    def __init__(
+        self, jobs: list[Job], live: Callable[[Job], bool] = lambda j: True
+    ) -> None:
         self._pending = list(jobs)
         self._running: set[Job] = set()
         self.live = live
@@ -425,7 +493,11 @@ class StubScheduler:
 
 
 def _loop(
-    tmp_path: Path, sched: StubScheduler, pool_factory: Any, clock: Any, sink: Any = None
+    tmp_path: Path,
+    sched: StubScheduler,
+    pool_factory: Any,
+    clock: Any,
+    sink: Any = None,
 ) -> SweepLoop:
     guard = BudgetGuard(
         cap_usd=1000.0,
@@ -435,7 +507,9 @@ def _loop(
         ledger_path=tmp_path / "ledger.jsonl",
         clock=clock,
     )
-    cfg = RunnerConfig(project="p", group="g", wandb_mode="disabled", runs_dir=tmp_path / "runs")
+    cfg = RunnerConfig(
+        project="p", group="g", wandb_mode="disabled", runs_dir=tmp_path / "runs"
+    )
     plan = Plan(n_workers=2, families={}, fallback=_family("fallback", 1000.0, 0.0))
     return SweepLoop(
         scheduler=sched,  # type: ignore[arg-type]
@@ -450,7 +524,9 @@ def _loop(
 
 
 def _jobs(n: int, step_budget: int = 100_000) -> list[Job]:
-    return [Job(arm=ARM_UNIFORM, seed=s, rung=0, step_budget=step_budget) for s in range(n)]
+    return [
+        Job(arm=ARM_UNIFORM, seed=s, rung=0, step_budget=step_budget) for s in range(n)
+    ]
 
 
 def test_loop_kills_job_whose_arm_is_no_longer_live_and_reports_it_failed(
@@ -462,7 +538,10 @@ def test_loop_kills_job_whose_arm_is_no_longer_live_and_reports_it_failed(
 
     (result,) = sched.reports
     assert reason == "done"
-    assert (result.status, result.error) == ("failed", "killed: job no longer live (arm pruned, failed or moved rung)")
+    assert (result.status, result.error) == (
+        "failed",
+        "killed: job no longer live (arm pruned, failed or moved rung)",
+    )
     assert math.isnan(result.auc)
 
 
@@ -495,15 +574,22 @@ def test_loop_turns_ok_result_with_nan_auc_into_failed(
 ) -> None:
     sched = StubScheduler(_jobs(1))
     real_finish = world.finish
-    world.finish = lambda spec, n, cfg: dataclasses.replace(real_finish(spec, n, cfg), auc=math.nan)
+    world.finish = lambda spec, n, cfg: dataclasses.replace(
+        real_finish(spec, n, cfg), auc=math.nan
+    )
 
     _loop(tmp_path, sched, pool_factory, clock).run()
 
     (result,) = sched.reports
-    assert (result.status, result.error) == ("failed", "ok result with non-finite auc nan")
+    assert (result.status, result.error) == (
+        "failed",
+        "ok result with non-finite auc nan",
+    )
 
 
-def test_loop_counts_killed_jobs_in_spend(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+def test_loop_counts_killed_jobs_in_spend(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
     sched = StubScheduler(_jobs(1, step_budget=10**6), live=lambda job: False)
     loop = _loop(tmp_path, sched, pool_factory, clock)
     t0 = clock.t
@@ -551,7 +637,9 @@ def test_main_returns_3_when_budget_already_spent(
 
 
 def test_settings_reject_cap_above_the_default_cap(tmp_path: Path) -> None:
-    with pytest.raises(SettingsError, match=r"^SWEEP_CAP_USD must be <= 100.0 \(CAP_USD_DEFAULT\)$"):
+    with pytest.raises(
+        SettingsError, match=r"^SWEEP_CAP_USD must be <= 100.0 \(CAP_USD_DEFAULT\)$"
+    ):
         load_settings(_env(tmp_path, SWEEP_CAP_USD="150"))
 
 
@@ -593,12 +681,16 @@ def test_main_refuses_scheduler_state_without_calibration_json(
     assert len(world.submissions) == n_before
 
 
-def test_main_logs_live_sweep_metrics(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+def test_main_logs_live_sweep_metrics(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
     sink = RecordingSink()
 
     _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory, sink)
 
-    live = [d for _, d in sink.logs if "jobs_done" in d]  # the first log is calibration's
+    live = [
+        d for _, d in sink.logs if "jobs_done" in d
+    ]  # the first log is calibration's
     assert len(live) >= 2
     assert "calibration_usd" in sink.logs[0][1]
     first, last = live[0], live[-1]
@@ -606,7 +698,11 @@ def test_main_logs_live_sweep_metrics(tmp_path: Path, clock: Any, pool_factory: 
     assert keys <= set(first)
     assert (last["jobs_done"], last["jobs_running"]) == (2, 0)
     # after rung 0 both arms are promoted to rung 1 (uniform outside the quota, visited inside)
-    assert (last["arms/promoted"], last["arms/pruned"], last["rung/pendulum_sparse"]) == (2, 0, 1)
+    assert (
+        last["arms/promoted"],
+        last["arms/pruned"],
+        last["rung/pendulum_sparse"],
+    ) == (2, 0, 1)
     assert last["projected_usd"] >= last["spent_usd"]
     elapsed = [t for t, _ in sink.logs]
     assert elapsed == sorted(elapsed)
@@ -636,7 +732,9 @@ class BrokenSink(RecordingSink):
     def log(self, elapsed_s: float, data: dict[str, float]) -> None:
         raise ConnectionError("wandb: network unreachable")
 
-    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+    def log_table(
+        self, name: str, columns: list[str], rows: list[list[object]]
+    ) -> None:
         raise ConnectionError("wandb: network unreachable")
 
 
@@ -654,7 +752,11 @@ def test_main_finishes_when_the_live_sink_raises(
 
     rows = _sweep_metrics(state)
     live = [r for r in rows if r.get("type") == "log" and "jobs_done" in r]
-    errors = [r for r in caplog.records if r.levelname == "ERROR" and "sweep sink" in r.getMessage()]
+    errors = [
+        r
+        for r in caplog.records
+        if r.levelname == "ERROR" and "sweep sink" in r.getMessage()
+    ]
     assert code == 0
     assert (state / "report.md").exists()
     assert live and live[-1]["jobs_done"] == 2
@@ -680,7 +782,9 @@ def test_main_runs_when_the_sweep_sink_cannot_start(
     rows = _sweep_metrics(tmp_path / "sweep")
     assert code == 0
     assert any("jobs_done" in r for r in rows)
-    assert any("timed out" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+    assert any(
+        "timed out" in r.getMessage() for r in caplog.records if r.levelname == "ERROR"
+    )
 
 
 def test_main_exits_4_on_corrupt_sweep_meta(
@@ -699,14 +803,18 @@ def test_main_exits_4_on_corrupt_sweep_meta(
 # --- no CPU fallback on a pod (final-review I1) --------------------------------------------------
 
 
-def test_main_refuses_cpu_device_on_a_runpod_pod(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+def test_main_refuses_cpu_device_on_a_runpod_pod(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
     env = _env(tmp_path, RUNPOD_POD_ID="pod-xyz")
 
     assert _run(env, clock, pool_factory) == 6
     assert not (tmp_path / "sweep" / "ledger.jsonl").exists()
 
 
-def test_main_allows_cpu_device_off_pod(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+def test_main_allows_cpu_device_off_pod(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
     assert _run(_env(tmp_path, SWEEP_SMOKE="1"), clock, pool_factory) == 0
 
 
@@ -717,7 +825,9 @@ def test_settings_read_deadline_and_report_reserve(tmp_path: Path) -> None:
     s = load_settings(_env(tmp_path))
     assert (s.deadline_epoch, s.report_reserve_s) == (None, 300.0)
 
-    s = load_settings(_env(tmp_path, SWEEP_DEADLINE_EPOCH="1800000000", SWEEP_REPORT_RESERVE_S="60"))
+    s = load_settings(
+        _env(tmp_path, SWEEP_DEADLINE_EPOCH="1800000000", SWEEP_REPORT_RESERVE_S="60")
+    )
     assert (s.deadline_epoch, s.report_reserve_s) == (1_800_000_000.0, 60.0)
 
 
@@ -726,7 +836,9 @@ def test_settings_reject_bad_deadline(tmp_path: Path) -> None:
         load_settings(_env(tmp_path, SWEEP_DEADLINE_EPOCH="soon"))
 
 
-def _deadline_run(tmp_path: Path, clock: Any, pool_factory: Any, deadline: float) -> int:
+def _deadline_run(
+    tmp_path: Path, clock: Any, pool_factory: Any, deadline: float
+) -> int:
     # Cap 100: the deadline (about 17 USD of fake pod time away), not cap - margin, binds.
     env = _env(
         tmp_path,
@@ -756,7 +868,9 @@ def test_deadline_refuses_jobs_that_would_run_past_it_and_writes_the_report(
 
     report = json.loads((tmp_path / "sweep" / "report.json").read_text())
     assert code == 0
-    assert report["extra"]["stop_reason"].startswith("deadline: the next job would run past")
+    assert report["extra"]["stop_reason"].startswith(
+        "deadline: the next job would run past"
+    )
     assert clock.t <= deadline - 300.0
     assert (tmp_path / "sweep" / "report.md").exists()
 
@@ -813,8 +927,13 @@ def test_sweep_report_refuses_a_dir_without_state(tmp_path: Path) -> None:
 def test_sweep_report_is_a_console_script() -> None:
     import tomllib
 
-    pyproject = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())
-    assert pyproject["project"]["scripts"]["sweep-report"] == "resetsweep.sweep.main:report_main"
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
+    )
+    assert (
+        pyproject["project"]["scripts"]["sweep-report"]
+        == "resetsweep.sweep.main:report_main"
+    )
 
 
 CHILD = '''
@@ -842,7 +961,9 @@ sys.exit(m.main([], clock=world.clock, device="cpu",
 '''
 
 
-def test_sigterm_kills_workers_saves_state_and_writes_the_report(tmp_path: Path) -> None:
+def test_sigterm_kills_workers_saves_state_and_writes_the_report(
+    tmp_path: Path,
+) -> None:
     import os
     import signal
     import subprocess
@@ -889,7 +1010,9 @@ def test_sweep_jobs_get_per_method_ceilings_and_the_hang_guard(
     # Raw estimate for r0 = 1e7: 1e7 / (51,200 / 4) + 2 = 783.25 s. uniform factor 1;
     # visited has no probe on pendulum -> its step term counts 3x for the ceiling:
     # 3 * 781.25 + 2 = 2345.75 s. Ceiling = 4 x estimate.
-    _run(_env(tmp_path, SWEEP_SMOKE="1", SWEEP_R0_STEPS="10000000"), clock, pool_factory)
+    _run(
+        _env(tmp_path, SWEEP_SMOKE="1", SWEEP_R0_STEPS="10000000"), clock, pool_factory
+    )
 
     sweep = {s.job.arm.method: s for s in _sweep_jobs(world)}
     runs = tmp_path / "sweep" / "runs"
@@ -908,7 +1031,16 @@ def test_settings_hang_s_override(tmp_path: Path) -> None:
 # --- smoke margin (final-review I6) ---------------------------------------------------------------
 
 
-def test_smoke_run_uses_the_50_cent_margin(tmp_path: Path, clock: Any, pool_factory: Any) -> None:
+def test_smoke_run_uses_the_50_cent_margin(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
     # Cap 5: a full run has 5 - 5 = 0 left and refuses; a smoke run has 4.50 to spend.
     assert _run(_env(tmp_path / "full", SWEEP_CAP_USD="5"), clock, pool_factory) == 3
-    assert _run(_env(tmp_path / "smoke", SWEEP_CAP_USD="5", SWEEP_SMOKE="1"), clock, pool_factory) == 0
+    assert (
+        _run(
+            _env(tmp_path / "smoke", SWEEP_CAP_USD="5", SWEEP_SMOKE="1"),
+            clock,
+            pool_factory,
+        )
+        == 0
+    )

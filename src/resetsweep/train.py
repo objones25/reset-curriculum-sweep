@@ -411,13 +411,19 @@ class Evaluator:
                 o = out.outcomes
                 first = ~done[o.env_ids]
                 success[o.env_ids] = torch.where(first, o.success, success[o.env_ids])
-                reached[o.env_ids] = torch.where(first, o.reached_reward, reached[o.env_ids])
+                reached[o.env_ids] = torch.where(
+                    first, o.reached_reward, reached[o.env_ids]
+                )
                 ret[o.env_ids] = torch.where(first, o.ret, ret[o.env_ids])
                 done[o.env_ids] = True
             obs = out.obs
         if not bool(done.all()):
             raise RuntimeError("eval ended with envs that never finished an episode")
-        return float(success.float().mean()), float(ret.mean()), float(reached.float().mean())
+        return (
+            float(success.float().mean()),
+            float(ret.mean()),
+            float(reached.float().mean()),
+        )
 
 
 # --- metrics helpers -------------------------------------------------------------------------
@@ -733,7 +739,11 @@ def run(spec: RunSpec, sink: MetricsSink) -> RunResult:
         curve_success.append(success)
         if reached > 0 and not first_eval_reward:
             first_eval_reward.append(counter.total)
-        return {"eval/success": success, "eval/return": ret, "eval/reached_reward": reached}
+        return {
+            "eval/success": success,
+            "eval/return": ret,
+            "eval/reached_reward": reached,
+        }
 
     sink.log(counter.total, {"env_steps/total": float(counter.total), **evaluate()})
     next_eval = spec.eval_every_steps

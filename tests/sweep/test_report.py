@@ -89,14 +89,20 @@ def _drive(
     raise AssertionError("scheduler did not finish in 50 passes")
 
 
-def _finished(tmp_path: Path, fails: Callable[[Job], bool] = lambda job: False) -> Scheduler:
-    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+def _finished(
+    tmp_path: Path, fails: Callable[[Job], bool] = lambda job: False
+) -> Scheduler:
+    s = Scheduler(
+        arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id
+    )
     _drive(s, fails)
     return s
 
 
 def _write(tmp_path: Path, s: Scheduler, **kw: object) -> dict:
-    return write_report(s, tmp_path / "report.md", tmp_path / "report.json", NullReportSink(), **kw)  # type: ignore[arg-type]
+    return write_report(
+        s, tmp_path / "report.md", tmp_path / "report.json", NullReportSink(), **kw
+    )  # type: ignore[arg-type]
 
 
 class RecordingSink:
@@ -108,7 +114,9 @@ class RecordingSink:
     def log(self, elapsed_s: float, data: dict[str, float]) -> None:
         del elapsed_s, data
 
-    def log_table(self, name: str, columns: list[str], rows: list[list[object]]) -> None:
+    def log_table(
+        self, name: str, columns: list[str], rows: list[list[object]]
+    ) -> None:
         self.tables[name] = (columns, rows)
 
     def summary(self, data: dict[str, float | str]) -> None:
@@ -176,10 +184,15 @@ def test_report_normalises_per_task_between_uniform_and_best(tmp_path: Path) -> 
     }
 
 
-def test_report_overall_is_iqm_of_normalised_scores_across_tasks(tmp_path: Path) -> None:
+def test_report_overall_is_iqm_of_normalised_scores_across_tasks(
+    tmp_path: Path,
+) -> None:
     report = _write(tmp_path, _finished(tmp_path))
 
-    overall = [(row["config"], row["iqm_normalised"], row["n_tasks"]) for row in report["overall"]]
+    overall = [
+        (row["config"], row["iqm_normalised"], row["n_tasks"])
+        for row in report["overall"]
+    ]
 
     # The dense groups that rung 1 adds score DEFAULT_AUC for every arm, uniform included, so
     # best == uniform: they have no scale and stay out of the overall IQM.
@@ -194,7 +207,9 @@ def test_report_overall_is_iqm_of_normalised_scores_across_tasks(tmp_path: Path)
 
 def test_report_counts_seeds_ending_at_zero(tmp_path: Path) -> None:
     AUC_ZERO = {**AUC, f"{TASK_A}/uniform/-": 0.0}
-    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    s = Scheduler(
+        arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id
+    )
     _drive(s, auc=AUC_ZERO)
 
     report = _write(tmp_path, s)
@@ -227,7 +242,9 @@ def test_report_anchorless_group_ranked_by_raw_auc_and_left_out_of_overall(
 
 
 def test_report_rank_rung_zero_ranks_rung0_survivors(tmp_path: Path) -> None:
-    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    s = Scheduler(
+        arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id
+    )
     for job in s.next_jobs(1000):
         s.report(_result(job, AUC.get(job.arm.label(), DEFAULT_AUC)))
     s.promotions()
@@ -248,7 +265,9 @@ def test_report_writes_markdown_and_json(tmp_path: Path) -> None:
     report = _write(tmp_path, s, extra={"spent_usd": 12.5})
 
     md = (tmp_path / "report.md").read_text()
-    assert json.loads((tmp_path / "report.json").read_text()) == json.loads(json.dumps(report))
+    assert json.loads((tmp_path / "report.json").read_text()) == json.loads(
+        json.dumps(report)
+    )
     assert report["extra"] == {"spent_usd": 12.5}
     assert f"| {TASK_A}/visited[p_task=0.0]/- |" in md
     assert "## Unranked arms" in md
@@ -277,10 +296,14 @@ def test_report_group_where_uniform_is_best_has_no_scale(tmp_path: Path) -> None
 
 
 def test_wandb_report_sink_logs_tables_in_disabled_mode(tmp_path: Path) -> None:
-    sink = WandbReportSink(project="p", group="sweep-test", mode="disabled", config={"sweep_id": "x"})
+    sink = WandbReportSink(
+        project="p", group="sweep-test", mode="disabled", config={"sweep_id": "x"}
+    )
     try:
         sink.log(1.0, {"spent_usd": 0.5, "jobs_running": 2.0})
-        report = write_report(_finished(tmp_path), tmp_path / "r.md", tmp_path / "r.json", sink)
+        report = write_report(
+            _finished(tmp_path), tmp_path / "r.md", tmp_path / "r.json", sink
+        )
     finally:
         sink.close()
 
@@ -289,12 +312,16 @@ def test_wandb_report_sink_logs_tables_in_disabled_mode(tmp_path: Path) -> None:
 
 def test_wandb_report_sink_rejects_secret_like_config_keys() -> None:
     with pytest.raises(ValueError, match=r"secret-like keys \['api_key'\]"):
-        WandbReportSink(project="p", group="g", mode="disabled", config={"api_key": "***"})
+        WandbReportSink(
+            project="p", group="g", mode="disabled", config={"api_key": "***"}
+        )
 
 
 def _to_final_rung(tmp_path: Path) -> tuple[Scheduler, list[Job]]:
     """Drive every rung below the last; return the scheduler and its first final-rung jobs."""
-    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    s = Scheduler(
+        arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id
+    )
     for _ in range(50):
         jobs = s.next_jobs(1000)
         final = [j for j in jobs if j.rung == 2]
@@ -321,7 +348,10 @@ def test_report_ranks_on_common_seed_count_after_budget_stop_mid_final_rung(
     report = _write(tmp_path, s)
 
     group_a = next(g for g in report["groups"] if g["task"] == TASK_A)
-    rows = {a["label"]: (a["seeds_ok"], a["seeds_used"], a["iqm_auc"]) for a in group_a["arms"]}
+    rows = {
+        a["label"]: (a["seeds_ok"], a["seeds_used"], a["iqm_auc"])
+        for a in group_a["arms"]
+    }
     assert (group_a["common_seeds"], group_a["insufficient_seeds"]) == (3, False)
     # With all 5 seeds the IQM would be mean(0.1, 0.9, 0.9) = 0.633; on seeds 0-2 it is 0.9.
     assert rows == {
@@ -332,7 +362,9 @@ def test_report_ranks_on_common_seed_count_after_budget_stop_mid_final_rung(
 
 
 def test_report_flags_group_with_fewer_than_two_common_seeds(tmp_path: Path) -> None:
-    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    s = Scheduler(
+        arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id
+    )
     for job in s.next_jobs(1000):
         s.report(_result(job, AUC.get(job.arm.label(), DEFAULT_AUC)))
 
@@ -347,17 +379,39 @@ def test_report_flags_group_with_fewer_than_two_common_seeds(tmp_path: Path) -> 
 def test_report_arm_table_has_mean_ci_bounds_rung_and_status(tmp_path: Path) -> None:
     sink = RecordingSink()
 
-    report = write_report(_finished(tmp_path), tmp_path / "r.md", tmp_path / "r.json", sink)
+    report = write_report(
+        _finished(tmp_path), tmp_path / "r.md", tmp_path / "r.json", sink
+    )
 
     columns, rows = sink.tables["arms"]
     by_arm = {row[0]: dict(zip(columns, row, strict=True)) for row in rows}
     v00 = by_arm[f"{TASK_A}/visited[p_task=0.0]/-"]
     pruned = by_arm[f"{TASK_A}/visited[p_task=0.5]/-"]
-    assert columns == ["arm", "group", "status", "rung", "mean_auc", "ci_low", "ci_high", "lcb", "ucb", "seeds_ok"]
+    assert columns == [
+        "arm",
+        "group",
+        "status",
+        "rung",
+        "mean_auc",
+        "ci_low",
+        "ci_high",
+        "lcb",
+        "ucb",
+        "seeds_ok",
+    ]
     # 5 seeds at 0.9: sd 0 floored at 0.05, half = 2 * 0.05 / sqrt(5)
-    assert (v00["status"], v00["rung"], v00["mean_auc"]) == ("final", 2, pytest.approx(0.9))
+    assert (v00["status"], v00["rung"], v00["mean_auc"]) == (
+        "final",
+        2,
+        pytest.approx(0.9),
+    )
     assert v00["ucb"] == pytest.approx(0.9 + 0.1 / math.sqrt(5))
-    assert (pruned["status"], pruned["rung"], pruned["lcb"], pruned["ucb"]) == ("pruned", 0, None, None)
+    assert (pruned["status"], pruned["rung"], pruned["lcb"], pruned["ucb"]) == (
+        "pruned",
+        0,
+        None,
+        None,
+    )
     assert len(report["arms"]) == len(rows)
 
 
@@ -374,8 +428,12 @@ def test_build_report_calls_tick_for_each_group(tmp_path: Path) -> None:
 PROVISIONAL_1 = "provisional: ranked at rung 1, final rung not reached"
 
 
-def test_report_falls_back_to_highest_rung_with_two_common_seeds(tmp_path: Path) -> None:
-    s, final = _to_final_rung(tmp_path)  # rung 1 done (3 seeds each); no final result yet
+def test_report_falls_back_to_highest_rung_with_two_common_seeds(
+    tmp_path: Path,
+) -> None:
+    s, final = _to_final_rung(
+        tmp_path
+    )  # rung 1 done (3 seeds each); no final result yet
     assert final
     sink = RecordingSink()
 
@@ -385,25 +443,34 @@ def test_report_falls_back_to_highest_rung_with_two_common_seeds(tmp_path: Path)
     assert report["provisional"] == PROVISIONAL_1
     assert {g["common_seeds"] for g in report["groups"]} == {3}
     assert PROVISIONAL_1 in (tmp_path / "report.md").read_text()
-    assert json.loads((tmp_path / "report.json").read_text())["provisional"] == PROVISIONAL_1
+    assert (
+        json.loads((tmp_path / "report.json").read_text())["provisional"]
+        == PROVISIONAL_1
+    )
     assert sink.summaries[-1]["provisional"] == PROVISIONAL_1
 
 
 def test_report_falls_back_to_rung0_ranked_by_rung0_key(tmp_path: Path) -> None:
     # Every rung-0 AUC ties at 0; only visited[0.2] reached any reward, so rung0_key puts it
     # first. The scheduler has not run rung 1 at all.
-    s = Scheduler(arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id)
+    s = Scheduler(
+        arms=ARMS, rung_budgets=BUDGETS, state_dir=tmp_path / "state", arm_id_of=_arm_id
+    )
     v02 = _arm(TASK_A, "visited[p_task=0.2]/-")
     for job in s.next_jobs(1000):
         result = _result(job, 0.0)
         if job.arm == v02:
-            result = dataclasses.replace(result, reached_reward=True, steps_to_first_reward=5)
+            result = dataclasses.replace(
+                result, reached_reward=True, steps_to_first_reward=5
+            )
         s.report(result)
 
     report = _write(tmp_path, s)
 
     assert report["rank_rung"] == 0
-    assert report["provisional"] == "provisional: ranked at rung 0, final rung not reached"
+    assert (
+        report["provisional"] == "provisional: ranked at rung 0, final rung not reached"
+    )
     group_a = next(g for g in report["groups"] if g["task"] == TASK_A)
     assert group_a["arms"][0]["label"] == v02.label()
 

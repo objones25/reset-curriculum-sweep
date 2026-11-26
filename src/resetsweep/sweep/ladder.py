@@ -39,7 +39,9 @@ def _merge(pool: dict[Arm, float], arm: Arm, p: float) -> None:
     pool[arm] = 1.0 - (1.0 - pool.get(arm, 0.0)) * (1.0 - p)
 
 
-def _promote(pool: Mapping[Arm, float], *, eta: int, rung: int, last: int) -> dict[Arm, float]:
+def _promote(
+    pool: Mapping[Arm, float], *, eta: int, rung: int, last: int
+) -> dict[Arm, float]:
     groups: dict[GroupKey, list[Arm]] = defaultdict(list)
     for arm in pool:
         groups[group_of(arm)].append(arm)
@@ -65,7 +67,9 @@ def _promote(pool: Mapping[Arm, float], *, eta: int, rung: int, last: int) -> di
     return nxt
 
 
-def project_ladder(arms: Sequence[Arm], *, eta: int, n_rungs: int = 3) -> LadderProjection:
+def project_ladder(
+    arms: Sequence[Arm], *, eta: int, n_rungs: int = 3
+) -> LadderProjection:
     """Expected arm counts per task at each of `n_rungs` rungs, starting from the rung-0 `arms`."""
     if eta < 2:
         raise ValueError(f"eta must be >= 2, got {eta}")

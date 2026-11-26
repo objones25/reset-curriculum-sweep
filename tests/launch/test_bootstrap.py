@@ -646,7 +646,8 @@ def test_cuda_gate_program_checks_torch_and_warp() -> None:
 
 
 @pytest.mark.skipif(
-    __import__("torch").cuda.is_available(), reason="checks the refusal on a machine without CUDA"
+    __import__("torch").cuda.is_available(),
+    reason="checks the refusal on a machine without CUDA",
 )
 def test_cuda_gate_program_fails_without_cuda() -> None:
     result = subprocess.run(

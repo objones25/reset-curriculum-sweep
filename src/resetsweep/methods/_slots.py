@@ -33,7 +33,9 @@ class ICVersions:
     IC; `drop_stale` and `current_cells` turn their ic id into -1 so scores ignore them.
     """
 
-    def __init__(self, capacity: int, num_envs: int, device: str, *, owner: str) -> None:
+    def __init__(
+        self, capacity: int, num_envs: int, device: str, *, owner: str
+    ) -> None:
         self.capacity = capacity
         self._owner = owner
         self.slot = torch.zeros(capacity, dtype=torch.long, device=device)
@@ -43,7 +45,9 @@ class ICVersions:
 
     def start(self, env_ids: Tensor, ids: Tensor) -> None:
         started = self.slot[ids.clamp(min=0)]
-        self._env[env_ids] = torch.where(ids >= 0, started, torch.full_like(started, -1))
+        self._env[env_ids] = torch.where(
+            ids >= 0, started, torch.full_like(started, -1)
+        )
 
     def bump(self, targets: Tensor) -> None:
         self.slot[targets] += 1

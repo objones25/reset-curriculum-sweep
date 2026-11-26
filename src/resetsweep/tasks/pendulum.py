@@ -70,7 +70,9 @@ class _Pendulum:
         )
 
     def sample_start(self, n: int, gen: torch.Generator) -> StartStates:
-        noise = (torch.rand(n, 2, generator=gen, device=gen.device) * 2 - 1) * _START_NOISE
+        noise = (
+            torch.rand(n, 2, generator=gen, device=gen.device) * 2 - 1
+        ) * _START_NOISE
         return StartStates(
             noise[:, :1], noise[:, 1:], torch.zeros(n, 0, device=gen.device)
         )

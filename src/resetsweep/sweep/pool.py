@@ -177,7 +177,9 @@ def _child_main(runner: Runner, spec: RunSpec, conn: Connection) -> None:
         try:
             message: tuple[str, object] = ("ok", runner(spec))
         except Exception as e:
-            logging.getLogger(__name__).exception("job %s seed %d failed", spec.arm_id(), spec.seed)
+            logging.getLogger(__name__).exception(
+                "job %s seed %d failed", spec.arm_id(), spec.seed
+            )
             message = ("err", repr(e))
         conn.send(message)
     finally:
@@ -190,7 +192,9 @@ def _exit_text(exitcode: int | None) -> str:
     if exitcode < 0:
         try:
             name = signal.Signals(-exitcode).name
-        except ValueError:  # obs: allow LOG007 (not a signal number: fall back to a label)
+        except (
+            ValueError
+        ):  # obs: allow LOG007 (not a signal number: fall back to a label)
             name = "unknown signal"
         return f"exit code {exitcode} ({name})"
     return f"exit code {exitcode}"
@@ -221,7 +225,9 @@ class _Running:
     heartbeat: Path | None = None
     hang_s: float | None = None
     last_mtime_ns: int | None = None
-    progress_s: float = 0.0  # pool-clock time of the last heartbeat change (submit to start)
+    progress_s: float = (
+        0.0  # pool-clock time of the last heartbeat change (submit to start)
+    )
 
 
 class WorkerPool:
@@ -275,7 +281,9 @@ class WorkerPool:
         if self._closed:
             raise RuntimeError("pool is closed")
         if spec.device != self._device:
-            raise ValueError(f"spec.device {spec.device!r} != pool device {self._device!r}")
+            raise ValueError(
+                f"spec.device {spec.device!r} != pool device {self._device!r}"
+            )
         if job.seed != spec.seed or job.step_budget != spec.step_budget:
             raise ValueError(
                 f"job seed {job.seed} != spec seed {spec.seed}"
@@ -284,8 +292,12 @@ class WorkerPool:
             )
         if not (math.isfinite(timeout_s) and timeout_s > 0):
             raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s}")
-        if hang_s is not None and (heartbeat is None or not (math.isfinite(hang_s) and hang_s > 0)):
-            raise ValueError(f"hang_s needs a heartbeat path and must be finite and > 0, got {hang_s}")
+        if hang_s is not None and (
+            heartbeat is None or not (math.isfinite(hang_s) and hang_s > 0)
+        ):
+            raise ValueError(
+                f"hang_s needs a heartbeat path and must be finite and > 0, got {hang_s}"
+            )
         key = (spec.arm_id(), spec.seed)
         if key in self._running:
             raise ValueError(f"run {key} is already running")
@@ -382,8 +394,12 @@ class WorkerPool:
         if not r.conn.poll() and exited:
             reason = _exit_text(r.process.exitcode)
             self._stop(r, expect_exit=True)
-            _log.warning("job %s seed %d: no result (%s)", r.arm_id, r.spec.seed, reason)
-            return failed_result(r.spec, f"worker died without a result: {reason}", wall_s=elapsed)
+            _log.warning(
+                "job %s seed %d: no result (%s)", r.arm_id, r.spec.seed, reason
+            )
+            return failed_result(
+                r.spec, f"worker died without a result: {reason}", wall_s=elapsed
+            )
         if r.conn.poll():
             try:
                 kind, payload = r.conn.recv()
@@ -392,15 +408,30 @@ class WorkerPool:
                 r.process.join(_JOIN_S)
                 reason = _exit_text(r.process.exitcode)
                 self._stop(r, expect_exit=True)
-                _log.warning("job %s seed %d: no result (%s)", r.arm_id, r.spec.seed, reason, exc_info=e)
-                return failed_result(r.spec, f"worker died without a result: {reason}", wall_s=elapsed)
+                _log.warning(
+                    "job %s seed %d: no result (%s)",
+                    r.arm_id,
+                    r.spec.seed,
+                    reason,
+                    exc_info=e,
+                )
+                return failed_result(
+                    r.spec, f"worker died without a result: {reason}", wall_s=elapsed
+                )
             self._stop(r, expect_exit=True)
             return self._checked(r, kind, payload, elapsed)
         if elapsed >= r.timeout_s:
             self._stop(r, expect_exit=False)
-            _log.warning("job %s seed %d timed out after %s s", r.arm_id, r.spec.seed, r.timeout_s)
+            _log.warning(
+                "job %s seed %d timed out after %s s",
+                r.arm_id,
+                r.spec.seed,
+                r.timeout_s,
+            )
             return failed_result(
-                r.spec, f"timed out after {r.timeout_s} s; worker killed", wall_s=elapsed
+                r.spec,
+                f"timed out after {r.timeout_s} s; worker killed",
+                wall_s=elapsed,
             )
         if r.hang_s is not None:
             self._note_progress(r)
@@ -421,11 +452,15 @@ class WorkerPool:
                 )
         return None
 
-    def _checked(self, r: _Running, kind: object, payload: object, elapsed: float) -> RunResult:
+    def _checked(
+        self, r: _Running, kind: object, payload: object, elapsed: float
+    ) -> RunResult:
         if kind == "err":
             return failed_result(r.spec, str(payload), wall_s=elapsed)
         if kind != "ok" or not isinstance(payload, RunResult):
-            return failed_result(r.spec, f"worker sent an unknown message {kind!r}", wall_s=elapsed)
+            return failed_result(
+                r.spec, f"worker sent an unknown message {kind!r}", wall_s=elapsed
+            )
         if (payload.arm_id, payload.seed) != (r.arm_id, r.spec.seed):
             return failed_result(
                 r.spec,
@@ -445,7 +480,9 @@ class WorkerPool:
             r.process.kill()
             r.process.join(_JOIN_S)
         if r.process.is_alive():
-            _log.error("worker pid %s survived SIGKILL for %s s", r.process.pid, _JOIN_S)
+            _log.error(
+                "worker pid %s survived SIGKILL for %s s", r.process.pid, _JOIN_S
+            )
         r.conn.close()
         if r.process.exitcode is not None:
             r.process.close()
@@ -462,7 +499,9 @@ def _mtime_ns(path: Path | None) -> int | None:
 
 def default_pool_factory(n_workers: int, device: str, cfg: RunnerConfig) -> Pool:
     """A real `WorkerPool` running `train_job` with `cfg`."""
-    return WorkerPool(n_workers=n_workers, device=device, runner=functools.partial(train_job, cfg))
+    return WorkerPool(
+        n_workers=n_workers, device=device, runner=functools.partial(train_job, cfg)
+    )
 
 
 __all__ = [
