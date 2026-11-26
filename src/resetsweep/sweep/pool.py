@@ -20,8 +20,9 @@ and checks that no W&B sink is still open; a leaked one ends the worker, which i
 
 Outcomes, all of which end as exactly one `RunResult` from `poll` (except `kill`):
 - the runner returns: its result, checked to belong to the submitted spec;
-- the runner raises: ``RunResult(status="failed", error=repr(exc))``; the worker stays up
-  for the next job;
+- the runner raises: ``RunResult(status="failed", error=repr(exc))``. On CPU the worker
+  stays up for the next job. On CUDA (`recycle_on_error`, default: the device is CUDA) the
+  worker is replaced, since the exception may have left a sticky error in its CUDA context;
 - the worker dies without a result (signal, OOM kill, segfault, `os._exit`): failed, with the
   exit code and signal name; the slot gets a new worker;
 - the job passes its `timeout_s` (the absolute ceiling, from submit): the worker is killed,
@@ -91,9 +92,8 @@ _log = logging.getLogger(__name__)
 
 Runner = Callable[[RunSpec], RunResult]
 _JOIN_S: Final = 10.0
-_STARTUP_S: Final = (
-    600.0  # a worker's imports + Warp init take about a minute on the pod
-)
+# A worker's imports + Warp init take about a minute on the pod.
+_STARTUP_S: Final = 600.0
 _STARTUP_FAILURES_MAX: Final = 3
 _ERROR_MAX_CHARS: Final = 2000
 
@@ -321,6 +321,7 @@ class WorkerPool:
         runner: Runner,
         clock: Callable[[], float] = time.monotonic,
         warm_up: Callable[[], None] = _warm_up,
+        recycle_on_error: bool | None = None,
     ) -> None:
         if n_workers < 1:
             raise ValueError(f"n_workers must be >= 1, got {n_workers}")
@@ -329,6 +330,12 @@ class WorkerPool:
         self._runner = runner
         self._clock = clock
         self._warm_up = warm_up
+        # A runner exception on CUDA can leave the process's CUDA context unusable (a sticky
+        # error), which would fail every later job in that worker; so on CUDA a worker whose
+        # job raised is replaced. None: derive from `device`.
+        self._recycle_on_error = (
+            device.startswith("cuda") if recycle_on_error is None else recycle_on_error
+        )
         self._ctx = multiprocessing.get_context("spawn")
         # Keyed by (arm_id, seed), which identifies a run: two calibration jobs can be equal
         # `Job`s that differ only in their spec's PPO config.
@@ -624,6 +631,13 @@ class WorkerPool:
             if kind == "ready":
                 self._mark_ready(r.slot, slot)
                 continue
+            if kind == "err" and self._recycle_on_error:
+                _log.info(
+                    "job %s seed %d raised; replacing its worker (recycle on error)",
+                    r.arm_id,
+                    r.spec.seed,
+                )
+                self._replace(r.slot)
             return self._checked(r, kind, payload[0] if payload else None, elapsed)
         if exited:
             return self._died(r, elapsed, None)

@@ -576,6 +576,34 @@ def test_the_pool_starts_warm_workers_so_jobs_pay_no_startup() -> None:
     assert job_pids <= set(warmed_at_return)
 
 
+def test_recycle_on_error_runs_the_next_job_on_a_new_worker() -> None:
+    with WorkerPool(
+        n_workers=1, device="cpu", runner=scripted_runner, recycle_on_error=True
+    ) as pool:
+        before = _pid(_run_one(pool, 0))
+        failed = _run_one(pool, SEED_RAISES)
+        after = _pid(_run_one(pool, 1))
+
+    assert failed.error == "FloatingPointError('NaN loss in seed 3')"
+    assert before != after
+
+
+def test_a_cuda_pool_recycles_a_worker_whose_job_raised_by_default() -> None:
+    # The runner never touches CUDA, so this runs anywhere; only the pool's device differs.
+    def cuda(seed: int) -> RunSpec:
+        return dataclasses.replace(_spec(seed), device="cuda:0")
+
+    with WorkerPool(n_workers=1, device="cuda:0", runner=scripted_runner) as pool:
+        results = []
+        for seed in (0, SEED_RAISES, 1):
+            pool.submit(_job(seed), cuda(seed), timeout_s=POLL_LIMIT_S)
+            results += _poll_until(pool, 1)
+
+    before, failed, after = results
+    assert failed.status == "failed"
+    assert _pid(before) != _pid(after)
+
+
 def test_close_leaves_no_live_children() -> None:
     pool = WorkerPool(n_workers=2, device="cpu", runner=scripted_runner)
     _run_one(pool, 0)
