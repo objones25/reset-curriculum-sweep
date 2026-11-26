@@ -15,7 +15,12 @@ Steps:
    `LADDER_SHARE` (90%) of what calibration left, at the calibrated steps/s and worker count;
    r1 = 3 r0, r2 = 9 r0. The projected USD per rung and r0 are logged. If r0 would fall below
    `SWEEP_MIN_R0_STEPS` (default 2,000,000) the sweep refuses to start (exit 5) and logs the
-   numbers and the knobs: a paid run must not produce noise. Smoke mode projects rung 0 only.
+   numbers and the knobs: a paid run must not produce noise. Smoke mode (`size_smoke_rung`)
+   sizes rung 0 only, to cost `SMOKE_SHARE` (50%) of what calibration left, with every job
+   whose (family, method) has no calibration probe (including uniform on a family smoke did
+   not calibrate, e.g. maze_trap) at `UNPROBED_FACTOR` (3x), then clamps r0 into
+   [`SWEEP_SMOKE_MIN_R0_STEPS` (default 100,000), `SWEEP_SMOKE_R0_MAX_STEPS` (default
+   1,000,000)]; below the floor it raises r0 rather than exiting 5.
    On resume the saved budgets are used.
 4. Loop (`SweepLoop`): poll results -> report -> kill jobs whose arm is no longer live ->
    heartbeat -> stop checks -> `next_jobs(1)` -> `can_start` -> submit, until the scheduler is
@@ -75,7 +80,8 @@ Budget handling (spec section 8):
 Tunable sizes for tests and CPU smoke runs (not needed on the pod): `SWEEP_NUM_ENVS_GRID`,
 `SWEEP_WORKERS_GRID`, `SWEEP_ROLLOUT_LEN`, `SWEEP_CALIB_STEPS`, `SWEEP_THROUGHPUT_ITERS`,
 `SWEEP_EVAL_N`, `SWEEP_R0_STEPS` (overrides the rung sizing; the projected cost is still
-logged) and `SWEEP_MIN_R0_STEPS` (the refusal floor above).
+logged), `SWEEP_MIN_R0_STEPS` (the refusal floor above), `SWEEP_SMOKE_MIN_R0_STEPS` and
+`SWEEP_SMOKE_R0_MAX_STEPS` (smoke's r0 clamp).
 """
 
 import argparse
@@ -161,6 +167,12 @@ STATE_DIR_DEFAULT: Final = "/workspace/sweep"
 PROJECT_DEFAULT: Final = "reset-curriculum-sweep"
 LADDER_SHARE: Final = 0.9  # the expected ladder may use 90% of what calibration left
 MIN_R0_STEPS_DEFAULT: Final = 2_000_000
+# Smoke-patch item 1: smoke sizes its one rung to cost half of what calibration left, with every
+# job whose (family, method) has no calibration probe at UNPROBED_FACTOR, then clamps r0 into
+# [SWEEP_SMOKE_MIN_R0_STEPS, SWEEP_SMOKE_R0_MAX_STEPS]. The floor raises r0; it never refuses.
+SMOKE_SHARE: Final = 0.5
+SMOKE_MIN_R0_STEPS_DEFAULT: Final = 100_000
+SMOKE_R0_MAX_STEPS_DEFAULT: Final = 1_000_000
 REPORT_RESERVE_S_DEFAULT: Final = 300.0  # stop this long before SWEEP_DEADLINE_EPOCH
 SEEDS_PER_RUNG: Final = (1, 3, 5)
 ETA: Final = 3
@@ -272,6 +284,8 @@ class Settings:
     eval_n: int
     r0_steps: int | None
     min_r0_steps: int
+    smoke_min_r0_steps: int
+    smoke_r0_max_steps: int
     deadline_epoch: float | None
     report_reserve_s: float
     hang_s: float
@@ -337,6 +351,12 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         raise SettingsError(
             f"SWEEP_CAP_USD must be <= {CAP_USD_DEFAULT} (CAP_USD_DEFAULT)"
         )
+    smoke_min = required_int("SWEEP_SMOKE_MIN_R0_STEPS", SMOKE_MIN_R0_STEPS_DEFAULT)
+    smoke_max = required_int("SWEEP_SMOKE_R0_MAX_STEPS", SMOKE_R0_MAX_STEPS_DEFAULT)
+    if smoke_max < smoke_min:
+        raise SettingsError(
+            "SWEEP_SMOKE_R0_MAX_STEPS must be >= SWEEP_SMOKE_MIN_R0_STEPS"
+        )
     return Settings(
         cap_usd=cap_usd,
         gpu_usd_per_h=_positive_float(environ, "SWEEP_GPU_USD_PER_H"),
@@ -352,6 +372,8 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         eval_n=required_int("SWEEP_EVAL_N", 512),
         r0_steps=_positive_int(environ, "SWEEP_R0_STEPS", None),
         min_r0_steps=required_int("SWEEP_MIN_R0_STEPS", MIN_R0_STEPS_DEFAULT),
+        smoke_min_r0_steps=smoke_min,
+        smoke_r0_max_steps=smoke_max,
         deadline_epoch=(
             _positive_float(environ, "SWEEP_DEADLINE_EPOCH")
             if environ.get("SWEEP_DEADLINE_EPOCH")
@@ -382,26 +404,54 @@ class RungSizing:
 
 
 _Line = tuple[float, float]  # pod-seconds = slope * r0 + intercept
+ArmKey = tuple[str, str]  # (family, method): the unit rung sizing counts arms in
+JobFactor = Callable[[str, str], float]  # (family, method) -> job wall vs uniform's
+
+
+def _unit_factor(family: str, method: str) -> float:
+    del family, method
+    return 1.0
+
+
+def smoke_job_factor(plan: Plan) -> JobFactor:
+    """Smoke sizing's per-job factor: the probe's measured slowdown when (family, method) has
+    one, 1 for uniform on a calibrated family, else `UNPROBED_FACTOR` (3). Uniform on a family
+    smoke never calibrated (maze_trap) counts as unprobed: its fallback speed is a guess."""
+
+    def factor(family: str, method: str) -> float:
+        measured = plan.method_factors.get((family, method))
+        if measured is not None:
+            return measured
+        if method == "uniform" and family in plan.families:
+            return 1.0
+        return UNPROBED_FACTOR
+
+    return factor
 
 
 def _rung_lines(
-    counts: Mapping[str, float], plan: Plan, seeds: int, mult: int
+    counts: Mapping[ArmKey, float],
+    plan: Plan,
+    seeds: int,
+    mult: int,
+    factor: JobFactor,
 ) -> tuple[_Line, _Line]:
     """Two lower bounds on one rung's pod time, as lines in r0. Full pool: a job holds
-    1/n_workers of the pod, so its pod time is ``mult * r0 / steps_per_s_f + overhead_f /
-    n_workers`` (steps_per_s_f is the aggregate over n_workers). Not-full pool (fewer jobs than
-    workers, e.g. smoke): the pod bills at least one whole job wall,
-    ``mult * r0 / (steps_per_s_f / n_workers) + overhead_f``, for the slowest family."""
-    fams = {f: plan.for_family(f) for f, n in counts.items() if n > 0}
+    1/n_workers of the pod, so its pod time is ``x * mult * r0 / steps_per_s_f + overhead_f /
+    n_workers`` (steps_per_s_f is the aggregate over n_workers, x = factor(family, method)).
+    Not-full pool (fewer jobs than workers, e.g. smoke): the pod bills at least one whole job
+    wall, ``x * mult * r0 / (steps_per_s_f / n_workers) + overhead_f``, for the slowest job."""
+    keys = [k for k, n in counts.items() if n > 0]
+    fps = {k: plan.for_family(k[0]) for k in keys}
+    xs = {k: factor(*k) for k in keys}
     share = (
-        sum(counts[f] * seeds * mult / fp.steps_per_s for f, fp in fams.items()),
-        sum(counts[f] * seeds * fp.overhead_s for f, fp in fams.items())
-        / plan.n_workers,
+        sum(counts[k] * seeds * mult * xs[k] / fps[k].steps_per_s for k in keys),
+        sum(counts[k] * seeds * fps[k].overhead_s for k in keys) / plan.n_workers,
     )
     wall = max(
         (
-            (mult * plan.n_workers / fp.steps_per_s, fp.overhead_s)
-            for fp in fams.values()
+            (mult * xs[k] * plan.n_workers / fps[k].steps_per_s, fps[k].overhead_s)
+            for k in keys
         ),
         default=(0.0, 0.0),
     )
@@ -409,12 +459,22 @@ def _rung_lines(
 
 
 def _ladder_lines(
-    arms_per_rung: Sequence[Mapping[str, float]], plan: Plan, seeds: Sequence[int]
+    arms_per_rung: Sequence[Mapping[ArmKey, float]],
+    plan: Plan,
+    seeds: Sequence[int],
+    factor: JobFactor,
 ) -> list[tuple[_Line, _Line]]:
     return [
-        _rung_lines(counts, plan, seeds[k], ETA**k)
+        _rung_lines(counts, plan, seeds[k], ETA**k, factor)
         for k, counts in enumerate(arms_per_rung)
     ]
+
+
+def _rollout_steps(counts: Mapping[ArmKey, float], plan: Plan) -> int:
+    """The largest one-rollout batch among the families in `counts`: the smallest usable r0."""
+    return max(
+        plan.for_family(f).num_envs * plan.for_family(f).rollout_len for f, _ in counts
+    )
 
 
 def _rung_cost_usd(
@@ -439,7 +499,7 @@ def _max_r0(lines: list[tuple[_Line, _Line]], budget_s: float) -> int:
 
 def size_rungs(
     *,
-    arms_per_rung: Sequence[Mapping[str, float]],
+    arms_per_rung: Sequence[Mapping[ArmKey, float]],
     plan: Plan,
     remaining_usd: float,
     usd_per_s: float,
@@ -449,7 +509,8 @@ def size_rungs(
 ) -> RungSizing:
     """(r0, 3 r0, 9 r0) with the whole expected ladder costing `share` of `remaining_usd`.
 
-    `arms_per_rung[k]` maps family -> expected arms at rung k (`ladder.project_ladder`); a
+    `arms_per_rung[k]` maps (family, method) -> expected arms at rung k
+    (`ladder.project_ladder`); a
     rung-k arm costs ``seeds_per_rung[k] * ETA**k`` r0-runs (1, 9, 45). A rung's pod time is
     the larger of its full-pool share and one whole job wall (`_rung_lines`). Raises
     `BudgetTooSmallError` when r0 would be below `min_r0_steps` or one rollout: a paid run must
@@ -466,12 +527,9 @@ def size_rungs(
             f"arm counts must be non-negative with a non-empty rung 0: {arms_per_rung}"
         )
     budget_s = share * remaining_usd / usd_per_s
-    lines = _ladder_lines(arms_per_rung, plan, seeds_per_rung)
+    lines = _ladder_lines(arms_per_rung, plan, seeds_per_rung, _unit_factor)
     r0 = _max_r0(lines, budget_s)
-    rollout = max(
-        plan.for_family(f).num_envs * plan.for_family(f).rollout_len
-        for f in arms_per_rung[0]
-    )
+    rollout = _rollout_steps(arms_per_rung[0], plan)
     floor_steps = max(min_r0_steps, rollout)
     if r0 < floor_steps:
         totals = ", ".join(f"{sum(c.values()):.0f}" for c in arms_per_rung)
@@ -490,12 +548,55 @@ def size_rungs(
     )
 
 
+def size_smoke_rung(
+    *,
+    arms: Mapping[ArmKey, float],
+    plan: Plan,
+    remaining_usd: float,
+    usd_per_s: float,
+    min_r0_steps: int,
+    max_r0_steps: int,
+) -> RungSizing:
+    """Smoke's one rung (smoke-patch item 1): the largest r0 whose projected cost is
+    `SMOKE_SHARE` (50%) of `remaining_usd`, every job weighted by `smoke_job_factor`, then
+    clamped into [max(min_r0_steps, one rollout), max_r0_steps]. Below the floor r0 is raised
+    to it (and may then cost more than half); smoke never refuses with exit 5."""
+    if not arms or any(n < 0 for n in arms.values()):
+        raise ValueError(f"smoke arm counts must be non-negative and non-empty: {arms}")
+    if not (math.isfinite(usd_per_s) and usd_per_s > 0):
+        raise ValueError(f"bad usd_per_s {usd_per_s}")
+    lines = [_rung_lines(arms, plan, 1, 1, smoke_job_factor(plan))]
+    sized = _max_r0(lines, SMOKE_SHARE * remaining_usd / usd_per_s)
+    floor_steps = max(min_r0_steps, _rollout_steps(arms, plan))
+    r0 = min(max_r0_steps, max(sized, floor_steps))
+    if r0 > sized:
+        _log.warning(
+            "smoke r0 raised from %d to the floor %d (SWEEP_SMOKE_MIN_R0_STEPS=%d, one "
+            "rollout=%d): the smoke rung may cost more than %.0f%% of the %.2f USD remaining",
+            sized,
+            r0,
+            min_r0_steps,
+            _rollout_steps(arms, plan),
+            SMOKE_SHARE * 100,
+            remaining_usd,
+        )
+    return RungSizing(
+        rungs=(r0, ETA * r0, ETA * ETA * r0),
+        cost_usd=_rung_cost_usd(lines, r0, usd_per_s),
+    )
+
+
 def ladder_cost_usd(
-    arms_per_rung: Sequence[Mapping[str, float]], plan: Plan, r0: int, usd_per_s: float
+    arms_per_rung: Sequence[Mapping[ArmKey, float]],
+    plan: Plan,
+    r0: int,
+    usd_per_s: float,
+    *,
+    factor: JobFactor = _unit_factor,
 ) -> tuple[float, ...]:
     """Projected USD per rung for a given r0 (used to log an `SWEEP_R0_STEPS` override)."""
     return _rung_cost_usd(
-        _ladder_lines(arms_per_rung, plan, SEEDS_PER_RUNG), r0, usd_per_s
+        _ladder_lines(arms_per_rung, plan, SEEDS_PER_RUNG, factor), r0, usd_per_s
     )
 
 
@@ -921,15 +1022,16 @@ def _check_state(state: Path, *, smoke: bool, arms: list[Arm]) -> str | None:
     return None
 
 
-def _family_counts(arms: list[Arm], *, smoke: bool) -> list[dict[str, float]]:
-    """Expected arms per family at each rung the sweep will run (smoke runs rung 0 only)."""
+def _arm_counts(arms: list[Arm], *, smoke: bool) -> list[dict[ArmKey, float]]:
+    """Expected arms per (family, method) at each rung the sweep will run (smoke: rung 0)."""
     ladder = project_ladder(arms, eta=ETA, n_rungs=1 if smoke else len(SEEDS_PER_RUNG))
-    out: list[dict[str, float]] = []
-    for counts in ladder.per_rung:
-        fams: dict[str, float] = {}
-        for task, n in counts.items():
-            fams[family_of(task)] = fams.get(family_of(task), 0.0) + n
-        out.append(fams)
+    out: list[dict[ArmKey, float]] = []
+    for counts in ladder.per_rung_by_method:
+        keyed: dict[ArmKey, float] = {}
+        for (task, method), n in counts.items():
+            key = (family_of(task), method)
+            keyed[key] = keyed.get(key, 0.0) + n
+        out.append(keyed)
     return out
 
 
@@ -938,13 +1040,28 @@ def _plan_rungs(
 ) -> tuple[int, int, int] | None:
     """Rung budgets for a new sweep, logged with the projected cost per rung; None (after
     logging the numbers and the knobs) when r0 would fall below the minimum."""
-    counts = _family_counts(arms, smoke=settings.smoke)
+    counts = _arm_counts(arms, smoke=settings.smoke)
     remaining = guard.remaining()
     if settings.r0_steps is not None:
         r0 = settings.r0_steps
         rungs = (r0, ETA * r0, ETA * ETA * r0)
-        cost = ladder_cost_usd(counts, plan, r0, guard.usd_per_s)
+        factor = smoke_job_factor(plan) if settings.smoke else _unit_factor
+        cost = ladder_cost_usd(counts, plan, r0, guard.usd_per_s, factor=factor)
         source = "SWEEP_R0_STEPS"
+    elif settings.smoke:
+        sizing = size_smoke_rung(
+            arms=counts[0],
+            plan=plan,
+            remaining_usd=remaining,
+            usd_per_s=guard.usd_per_s,
+            min_r0_steps=settings.smoke_min_r0_steps,
+            max_r0_steps=settings.smoke_r0_max_steps,
+        )
+        rungs, cost = sizing.rungs, sizing.cost_usd
+        source = (
+            f"smoke: {SMOKE_SHARE:.0%} of remaining, unprobed jobs x{UNPROBED_FACTOR:g}, "
+            f"clamped to [{settings.smoke_min_r0_steps}, {settings.smoke_r0_max_steps}]"
+        )
     else:
         try:
             sizing = size_rungs(

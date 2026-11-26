@@ -93,6 +93,10 @@ SHA is recorded in the ledger.
 2. **Smoke run (costs money, not run for this README).** One short GPU run: calibrate the pendulum
    family and run the arm-family probes (`visited` and `buffer_scored` on `arm_sparse`), then
    run `uniform` and `visited` on `pendulum_sparse` and `uniform` on `maze_trap` for one rung.
+   That rung is sized to cost half of what calibration left, counting every job without its
+   own calibration probe (here `visited`, and `maze_trap`, whose family smoke does not
+   calibrate) at 3x uniform's time, with r0 clamped to [100,000, 1,000,000] env steps
+   (`SWEEP_SMOKE_MIN_R0_STEPS`, `SWEEP_SMOKE_R0_MAX_STEPS`). Smoke never exits 5.
 
    ```bash
    uv run sweep-launch --cap 5 --smoke

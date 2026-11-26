@@ -26,9 +26,11 @@ from resetsweep.sweep.scheduler import PROTECTED_METHODS, GroupKey, group_of
 
 @dataclass(frozen=True)
 class LadderProjection:
-    """`per_rung[k]` maps task name -> expected number of arms at rung k."""
+    """`per_rung[k]` maps task name -> expected number of arms at rung k;
+    `per_rung_by_method[k]` splits the same counts by (task, method)."""
 
     per_rung: tuple[Mapping[str, float], ...]
+    per_rung_by_method: tuple[Mapping[tuple[str, str], float], ...]
 
     def totals(self) -> tuple[float, ...]:
         return tuple(sum(counts.values()) for counts in self.per_rung)
@@ -79,11 +81,17 @@ def project_ladder(
         raise ValueError("arms is empty")
     pool: dict[Arm, float] = dict.fromkeys(arms, 1.0)
     per_rung: list[Mapping[str, float]] = []
+    by_method: list[Mapping[tuple[str, str], float]] = []
     for rung in range(n_rungs):
         counts: dict[str, float] = defaultdict(float)
+        split: dict[tuple[str, str], float] = defaultdict(float)
         for arm, p in pool.items():
             counts[arm.task] += p
+            split[(arm.task, arm.method)] += p
         per_rung.append(dict(counts))
+        by_method.append(dict(split))
         if rung + 1 < n_rungs:
             pool = _promote(pool, eta=eta, rung=rung, last=n_rungs - 1)
-    return LadderProjection(per_rung=tuple(per_rung))
+    return LadderProjection(
+        per_rung=tuple(per_rung), per_rung_by_method=tuple(by_method)
+    )

@@ -25,6 +25,7 @@ from resetsweep.sweep.main import (
     load_settings,
     main,
     size_rungs,
+    size_smoke_rung,
 )
 from resetsweep.sweep.pool import RunnerConfig
 from resetsweep.sweep.scheduler import ConflictingResultError, Job
@@ -198,7 +199,9 @@ PLAN = Plan(
 )
 
 
-COUNTS = ({"a": 10.0, "b": 5.0}, {"a": 4.0, "b": 2.0}, {"a": 2.0, "b": 1.0})
+# Keyed (family, method): every arm here is uniform, so each job counts x1.
+A, B = ("a", "uniform"), ("b", "uniform")
+COUNTS = ({A: 10.0, B: 5.0}, {A: 4.0, B: 2.0}, {A: 2.0, B: 1.0})
 
 
 def test_size_rungs_fits_the_whole_ladder_in_90_percent_of_remaining() -> None:
@@ -226,7 +229,7 @@ def test_size_rungs_charges_a_full_job_wall_when_the_pool_is_not_full() -> None:
     # One arm on 2 workers: the pod bills the whole job wall, r0 / (1000 / 2) + 4 s, not the
     # 1/n_workers share (r0 / 1000 + 2 s). 900 s budget -> r0 = floor((900 - 4) / 0.002).
     sizing = size_rungs(
-        arms_per_rung=({"a": 1.0},),
+        arms_per_rung=({A: 1.0},),
         plan=PLAN,
         remaining_usd=10.0,
         usd_per_s=0.01,
@@ -280,10 +283,113 @@ def test_settings_min_r0_default_and_override(tmp_path: Path) -> None:
 def test_main_returns_5_when_r0_would_be_below_the_minimum(
     tmp_path: Path, clock: Any, pool_factory: Any
 ) -> None:
-    env = _env(tmp_path, SWEEP_SMOKE="1", SWEEP_MIN_R0_STEPS="1000000000000")
+    # Smoke-patch item 1: the exit-5 floor is for full runs only.
+    env = _env(tmp_path, SWEEP_MIN_R0_STEPS="1000000000000")
 
     assert _run(env, clock, pool_factory) == 5
     assert not (tmp_path / "sweep" / "scheduler.json").exists()
+
+
+def test_smoke_ignores_the_full_run_floor_and_clamps_r0_to_its_own(
+    tmp_path: Path, clock: Any, pool_factory: Any
+) -> None:
+    # Smoke uses SWEEP_SMOKE_MIN_R0_STEPS (not SWEEP_MIN_R0_STEPS) as a floor it raises r0 to,
+    # never an exit-5 refusal. A cap of 2 USD leaves too little for a 300k-step smoke rung.
+    env = _env(
+        tmp_path,
+        SWEEP_SMOKE="1",
+        SWEEP_CAP_USD="2",
+        SWEEP_MIN_R0_STEPS="1000000000000",
+        SWEEP_SMOKE_MIN_R0_STEPS="300000",
+    )
+
+    assert _run(env, clock, pool_factory) == 0
+    budgets = json.loads((tmp_path / "sweep" / "scheduler.json").read_text())["config"][
+        "rung_budgets"
+    ]
+    assert budgets[0] == 300_000
+
+
+def test_settings_smoke_sizing_defaults_and_overrides(tmp_path: Path) -> None:
+    s = load_settings(_env(tmp_path))
+    assert (s.smoke_min_r0_steps, s.smoke_r0_max_steps) == (100_000, 1_000_000)
+    s = load_settings(
+        _env(
+            tmp_path,
+            SWEEP_SMOKE_MIN_R0_STEPS="5000",
+            SWEEP_SMOKE_R0_MAX_STEPS="70000",
+        )
+    )
+    assert (s.smoke_min_r0_steps, s.smoke_r0_max_steps) == (5000, 70_000)
+    with pytest.raises(SettingsError, match="SWEEP_SMOKE_R0_MAX_STEPS"):
+        load_settings(
+            _env(
+                tmp_path,
+                SWEEP_SMOKE_MIN_R0_STEPS="5000",
+                SWEEP_SMOKE_R0_MAX_STEPS="4000",
+            )
+        )
+
+
+# Smoke sizing (smoke-patch item 1). Counts are keyed (family, method). PLAN has a and b
+# calibrated; "c" is not, so it runs on the fallback (500 steps/s, 4 s overhead).
+SMOKE_PLAN = dataclasses.replace(PLAN, method_factors={("a", "walk"): 2.0})
+SMOKE_COUNTS = {
+    ("a", "uniform"): 1.0,  # calibrated family, uniform: x1
+    ("a", "walk"): 1.0,  # measured probe: x2
+    ("a", "visited"): 1.0,  # no probe: x3
+    ("c", "uniform"): 1.0,  # family not calibrated: x3
+}
+
+
+def test_smoke_sizing_spends_half_of_remaining_with_unprobed_jobs_at_3x() -> None:
+    # Pod-s per r0 step, full pool (2 workers, aggregate steps/s):
+    #   (1 + 2 + 3) / 1000 + 3 / 500 = 0.012; overhead 4 jobs * 4 s / 2 workers = 8 s.
+    # One job wall (the slowest): c/uniform 3 * 2 / 500 = 0.012 per step + 4 s.
+    # Budget 0.5 * 10 USD / 0.01 USD/s = 500 s:
+    #   full pool (500 - 8) / 0.012 = 41000; wall (500 - 4) / 0.012 = 41333.3 -> r0 = 41000.
+    sizing = size_smoke_rung(
+        arms=SMOKE_COUNTS,
+        plan=SMOKE_PLAN,
+        remaining_usd=10.0,
+        usd_per_s=0.01,
+        min_r0_steps=1000,
+        max_r0_steps=1_000_000,
+    )
+
+    assert sizing.rungs == (41_000, 123_000, 369_000)
+    # max(41000 * 0.012 + 8, 41000 * 0.012 + 4) * 0.01 = 5.00 = half of 10 USD
+    assert sizing.cost_usd == pytest.approx((5.0,))
+
+
+def test_smoke_sizing_caps_r0_at_the_maximum() -> None:
+    sizing = size_smoke_rung(
+        arms=SMOKE_COUNTS,
+        plan=SMOKE_PLAN,
+        remaining_usd=10.0,
+        usd_per_s=0.01,
+        min_r0_steps=1000,
+        max_r0_steps=20_000,
+    )
+
+    assert sizing.rungs[0] == 20_000
+    # max(20000 * 0.012 + 8, 20000 * 0.012 + 4) * 0.01 = 2.48
+    assert sizing.cost_usd == pytest.approx((2.48,))
+
+
+def test_smoke_sizing_raises_r0_to_the_floor_instead_of_refusing() -> None:
+    # 0.5 * 0.5 / 0.01 = 25 s: wall (25 - 4) / 0.012 = 1750 < the 100k floor.
+    sizing = size_smoke_rung(
+        arms=SMOKE_COUNTS,
+        plan=SMOKE_PLAN,
+        remaining_usd=0.5,
+        usd_per_s=0.01,
+        min_r0_steps=100_000,
+        max_r0_steps=1_000_000,
+    )
+
+    assert sizing.rungs[0] == 100_000
+    assert sizing.cost_usd == pytest.approx(((100_000 * 0.012 + 8) * 0.01,))
 
 
 # --- the main loop -----------------------------------------------------------------------------
@@ -379,10 +485,12 @@ def test_smoke_mode_runs_uniform_and_visited_on_pendulum_and_uniform_on_maze_tra
 ) -> None:
     """Final-review I8 adds the maze_trap uniform run and the arm-family probes.
 
-    r0 is fixed: maze_trap's family is not calibrated in smoke, and the fallback plan (the
-    slowest measured steps/s, at base N=128) is twice as fast as this fake world runs N=128,
-    so a 90%-of-budget r0 would hit the cap mid-job (a known limit of the fallback plan)."""
-    env = _env(tmp_path, SWEEP_SMOKE="1", SWEEP_R0_STEPS="1000000")
+    r0 is sized automatically (smoke-patch item 1): maze_trap's family is not calibrated in
+    smoke, and the fallback plan (the slowest measured steps/s, at base N=128) is twice as fast
+    as this fake world runs N=128, so sizing must leave room (50% of remaining, unprobed jobs
+    at 3x) for every smoke job to finish. The cap is low enough that the sizing, not the
+    SWEEP_SMOKE_R0_MAX_STEPS cap, sets r0."""
+    env = _env(tmp_path, SWEEP_SMOKE="1", SWEEP_CAP_USD="5")
     state = tmp_path / "sweep"
     sink = RecordingSink()
 
@@ -409,6 +517,10 @@ def test_smoke_mode_runs_uniform_and_visited_on_pendulum_and_uniform_on_maze_tra
     assert probes == {"visited", "buffer_scored"}
     assert sorted(len(g["arms"]) for g in report["groups"]) == [1, 2]
     assert "per_task" in sink.tables
+    # every smoke job finished ok under the automatic r0, and the sizing (not a cap) set r0
+    assert sorted(r["status"] for r in _results(state)) == ["ok", "ok", "ok"]
+    assert 100_000 <= r0 < 1_000_000
+    assert _ledger(state)[-1]["spent"] <= 5.0 - 0.5 + 1e-9
 
 
 def test_main_logs_report_to_sweep_level_sink(
@@ -696,13 +808,16 @@ def test_main_logs_live_sweep_metrics(
     first, last = live[0], live[-1]
     keys = {"spent_usd", "projected_usd", "remaining_usd", "jobs_running", "jobs_done"}
     assert keys <= set(first)
-    assert (last["jobs_done"], last["jobs_running"]) == (2, 0)
-    # after rung 0 both arms are promoted to rung 1 (uniform outside the quota, visited inside)
+    # all three smoke jobs finish (smoke-patch item 1: the maze_trap run no longer overruns)
+    assert (last["jobs_done"], last["jobs_running"]) == (3, 0)
+    # after rung 0 both pendulum arms are promoted to rung 1 (uniform outside the quota,
+    # visited inside), and so is maze_trap's protected uniform
     assert (
         last["arms/promoted"],
         last["arms/pruned"],
         last["rung/pendulum_sparse"],
-    ) == (2, 0, 1)
+        last["rung/maze_trap"],
+    ) == (3, 0, 1, 1)
     assert last["projected_usd"] >= last["spent_usd"]
     elapsed = [t for t, _ in sink.logs]
     assert elapsed == sorted(elapsed)
@@ -759,7 +874,9 @@ def test_main_finishes_when_the_live_sink_raises(
     ]
     assert code == 0
     assert (state / "report.md").exists()
-    assert live and live[-1]["jobs_done"] == 2
+    assert (
+        live and live[-1]["jobs_done"] == 3
+    )  # all three smoke jobs (smoke-patch item 1)
     assert live[-1]["sink_errors"] >= 1
     assert errors and "network unreachable" in errors[0].getMessage()
 
