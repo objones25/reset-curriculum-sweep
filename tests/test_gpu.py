@@ -4,13 +4,19 @@
 - G3: CPU vs CUDA dynamics agreement for the substep-graph + applied-force path (maze_trap)
   and the contact-heavy arm (arm_sparse).
 - G4: the worker pool on CUDA with two concurrent jobs.
+- G6: one CUDA worker reused across jobs: the same job twice on one worker gives the same
+  result, and a job that raises replaces the worker (recycle on error) for the next job.
 
 Each GPU test has a CPU twin that runs the same harness here, so the harness itself is tested
 on a machine without CUDA. G1 is in tests/tasks/test_sample_start_device.py, G5 in
 tests/launch/test_bootstrap.py.
 """
 
+import dataclasses
 import functools
+import logging
+import math
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -234,3 +240,112 @@ def test_g4_worker_pool_runs_two_jobs_on_cuda(tmp_path: Path) -> None:
     assert sorted((r.seed, r.status) for r in results) == [(0, "ok"), (1, "ok")], (
         results
     )
+
+
+# --- G6: one CUDA worker reused across jobs ----------------------------------------------------
+
+G6_RAISE_SEED = 99
+
+
+class _G6RaisingSink(NullSink):
+    def log(self, step: int, data: dict[str, float]) -> None:
+        raise RuntimeError(f"injected failure at step {step} (G6)")
+
+
+def g6_runner(cfg: RunnerConfig, spec: RunSpec) -> RunResult:
+    """`train_job`, with the worker's pid in `env_steps_extra`. Seed G6_RAISE_SEED builds its
+    sim on the device and runs until its first metrics log (step 0), then raises."""
+    if spec.seed == G6_RAISE_SEED:
+        return run(spec, _G6RaisingSink())
+    result = train_job(cfg, spec)
+    extra = {**result.env_steps_extra, "worker_pid": os.getpid()}
+    return dataclasses.replace(result, env_steps_extra=extra)
+
+
+def g6_reuse_sequence(
+    device: str, runs_dir: Path, *, recycle_on_error: bool | None = None
+) -> list[RunResult]:
+    """On one worker, in order: job A (seed 0), job A again, a job that raises, job B (seed 1)."""
+    cfg = RunnerConfig(
+        project="g6", group="g6", wandb_mode="disabled", runs_dir=runs_dir
+    )
+    (job_a, spec_a), (job_b, spec_b) = _g4_jobs(device)
+    job_x = dataclasses.replace(job_a, seed=G6_RAISE_SEED)
+    spec_x = dataclasses.replace(spec_a, seed=G6_RAISE_SEED)
+    results: list[RunResult] = []
+    with WorkerPool(
+        n_workers=1,
+        device=device,
+        runner=functools.partial(g6_runner, cfg),
+        recycle_on_error=recycle_on_error,
+    ) as pool:
+        for job, spec in (
+            (job_a, spec_a),
+            (job_a, spec_a),
+            (job_x, spec_x),
+            (job_b, spec_b),
+        ):
+            pool.submit(job, spec, timeout_s=G4_POLL_LIMIT_S)
+            deadline = time.monotonic() + G4_POLL_LIMIT_S
+            got: list[RunResult] = []
+            while not got and time.monotonic() < deadline:
+                got = pool.poll(timeout_s=5.0)
+            assert len(got) == 1, (
+                f"no result for seed {spec.seed} in {G4_POLL_LIMIT_S} s"
+            )
+            results += got
+    return results
+
+
+def _g6_fields(result: RunResult) -> dict[str, object]:
+    """Every field but `wall_s`, with NaN (no start state ever succeeded) spelled "nan" so
+    that equal results compare equal."""
+    fields = dataclasses.asdict(result)
+    del fields["wall_s"]
+    return {
+        k: "nan" if isinstance(v, float) and math.isnan(v) else v
+        for k, v in fields.items()
+    }
+
+
+def _g6_check(results: list[RunResult], caplog: pytest.LogCaptureFixture) -> None:
+    first, again, raised, after = results
+    assert (first.status, again.status, after.status) == ("ok", "ok", "ok"), results
+    assert raised.status == "failed"
+    assert raised.error is not None and "injected failure" in raised.error
+    # Exact equality (no tolerance). The scores are success shares and step counts, not raw
+    # floats, so CUDA rounding differences cannot move them by a little; at this 1024-step
+    # budget they are 0 / NaN on CPU (no start state succeeds). A difference means the reused
+    # worker ran the job differently, e.g. leaked state.
+    assert _g6_fields(first) == _g6_fields(again)
+    assert first.env_steps_extra["worker_pid"] == again.env_steps_extra["worker_pid"]
+    assert after.env_steps_extra["worker_pid"] != first.env_steps_extra["worker_pid"]
+    pool_warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "resetsweep.sweep.pool" and r.levelno >= logging.WARNING
+    ]
+    assert pool_warnings == []  # no worker died on its own
+
+
+@pytest.mark.slow
+def test_g6_one_worker_reused_across_jobs_on_cpu(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="resetsweep.sweep.pool")
+    # CPU keeps a worker after a failed job by default; turn recycling on to run the CUDA path.
+    results = g6_reuse_sequence("cpu", tmp_path, recycle_on_error=True)
+
+    _g6_check(results, caplog)
+
+
+@pytest.mark.gpu
+def test_g6_one_worker_reused_across_jobs_on_cuda(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="resetsweep.sweep.pool")
+    results = g6_reuse_sequence(
+        "cuda:0", tmp_path
+    )  # recycle on error: the CUDA default
+
+    _g6_check(results, caplog)
